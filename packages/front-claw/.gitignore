@@ -1,0 +1,23 @@
+node_modules/
+dist/
+coverage/
+.local/
+data/
+pg-temp/
+test-output/
+tmp/
+.env
+.env.*
+*.log
+*.sqlite
+*.sqlite-*
+*.pem
+*.key
+# 评测留出集与复审材料不进仓库
+*blind*
+*-ctx/
+*-d139/
+RESUME.md
+REVIEW*.md
+independent-scores*
+.e2e-records/

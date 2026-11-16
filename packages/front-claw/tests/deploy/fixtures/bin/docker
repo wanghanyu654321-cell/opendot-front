@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -eu
+if [[ "$*" = 'version --format {{.Server.Version}}' ]]; then
+  printf '%s\n' "${TEST_DOCKER_VERSION:-}"
+elif [[ "$*" = 'compose version --short' ]]; then
+  printf '%s\n' "${TEST_COMPOSE_VERSION:-}"
+else
+  echo 'unexpected host mutation' >&2
+  exit 99
+fi

@@ -1,0 +1,33 @@
+{
+  "name": "front-dot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:pg": "vitest run --config vitest.integration.config.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "demo": "npm run build && node examples/local-identity.mjs",
+    "demo:report": "npm run build && node examples/local-report.mjs",
+    "demo:delivery": "npm run build && node examples/local-delivery.mjs",
+    "demo:operations": "npm run build && node examples/local-operations.mjs",
+    "demo:tasks": "npm run build && node examples/local-tasks.mjs",
+    "benchmark:local": "npm run build && node examples/local-performance.mjs",
+    "test:ci": "vitest run --exclude tests/native/live-model-smoke.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/pg": "8.11.11",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "1.0.7",
+    "adm-zip": "0.6.1",
+    "pg": "8.13.1"
+  }
+}

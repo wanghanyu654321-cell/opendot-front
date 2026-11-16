@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Model entry boundary and deployment contracts
+        run: npx vitest run tests/e2e tests/deploy
+      # 单元测试；live-model-smoke 依赖真实模型宿主环境，CI 跳过。不需要任何密钥。
+      - run: npm run test:ci
+
+  # PG 集成测试（tests/**/*.integration.test.ts）。大部分测试自己用 initdb 起临时集群、
+  # 随机端口、跑完即删；tests/audit/* 改用本 job 自己起的一次性集群（见下）。都不连任何常驻库，
+  # 所以这里不需要 postgres service 容器，也不需要任何密钥。
+  # 版本与线上一致定为 PostgreSQL 17（大版本），来自 PGDG 官方 apt 源。
+  # initdb 不能以 root 运行；GitHub 托管 runner 的默认用户是非 root 的 runner（有免密 sudo），
+  # 所以测试步骤直接以默认用户跑，不需要额外切换用户。下面有一步显式断言这一点。
+  pg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      FRONT_CLAW_PG_BIN: /usr/lib/postgresql/17/bin
+      # tests/audit/* 的 6 条只有设了这两个变量才跑；URL 在下面起好一次性集群后写入 $GITHUB_ENV。
+      AUDIT_PG_ALLOW: isolated-synthetic
+      AUDIT_PG_PORT: "55439"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install PostgreSQL 17 from PGDG
+        # 官方写法：https://www.postgresql.org/download/linux/ubuntu/ （Automated Repository Configuration）
+        # -y 让脚本不等待确认。只装服务端二进制，测试自己 initdb，不使用包自带的集群。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-17
+          # 装包会自动建并启动 17/main，测试不用它，停掉省资源（失败不影响）。
+          sudo pg_ctlcluster 17 main stop || true
+      - name: Check PG binaries and non-root user
+        run: |
+          id
+          test "$(id -u)" -ne 0
+          "$FRONT_CLAW_PG_BIN/initdb" --version
+          "$FRONT_CLAW_PG_BIN/postgres" --version
+          "$FRONT_CLAW_PG_BIN/initdb" --version | grep -E ' 17\.'
+      - run: npm ci
+      - run: npm run build
+      - name: Start disposable audit PG cluster
+        # 给 tests/audit/* 用的一次性合成集群：默认非 root 用户 initdb，数据在 $RUNNER_TEMP，
+        # 只监听 127.0.0.1，pg_hba 只有一行 127.0.0.1/32 trust（unix socket 没有放行规则）。
+        # audit 用例会在里面建 audit_f_*/audit_stale_* 库并保留供检查；集群随 job 结束丢弃。
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/audit-pg"
+          mkdir -p "$root/run"
+          "$FRONT_CLAW_PG_BIN/initdb" -D "$root/data" -U frontclaw --auth=trust --no-sync --encoding=UTF8 > "$root/initdb.log"
+          echo "host all all 127.0.0.1/32 trust" > "$root/data/pg_hba.conf"
+          "$FRONT_CLAW_PG_BIN/pg_ctl" -D "$root/data" -l "$root/postgres.log" -w -t 60 \
+            -o "-c listen_addresses=127.0.0.1 -c port=$AUDIT_PG_PORT -c unix_socket_directories=$root/run -c fsync=off" start
+          psql "postgres://frontclaw@127.0.0.1:$AUDIT_PG_PORT/postgres" -Atc 'select version()'
+          echo "AUDIT_PG_URL=postgres://frontclaw@127.0.0.1:$AUDIT_PG_PORT/postgres" >> "$GITHUB_ENV"
+      - name: PG integration tests (full suite)
+        run: npm run test:pg
+      - name: Concurrent employee confirmation repeated five times
+        # 并发重复回「对」只入账一笔、只回一次「已入账」。单独循环五次，任何一次失败即失败。
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            echo "::group::employee confirmation run $i/5"
+            npm run test:pg -- tests/role-eval/employee-loop-pg-m02.integration.test.ts
+            echo "::endgroup::"
+          done
+      - name: Stop disposable audit PG cluster
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/audit-pg/data/postmaster.pid" ]; then
+            "$FRONT_CLAW_PG_BIN/pg_ctl" -D "$RUNNER_TEMP/audit-pg/data" -m fast -w stop
+          fi

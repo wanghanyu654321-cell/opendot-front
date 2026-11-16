@@ -1,0 +1,12 @@
+# gitleaks 配置：默认规则 + 测试里明确标注为合成的假口令。
+title = "front-dot"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "测试用合成口令（不是真实凭据）"
+regexes = [
+  '''SYNTHETIC-PW-[0-9a-f]+''',
+  '''super-secret-not-logged''',
+]

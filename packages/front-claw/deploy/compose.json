@@ -1,0 +1,148 @@
+{
+  "name": "front-dot",
+  "services": {
+    "pg": {
+      "image": "postgres:17.6-bookworm",
+      "environment": {
+        "POSTGRES_DB": "front_dot",
+        "POSTGRES_USER": "postgres",
+        "POSTGRES_PASSWORD": "${PG_ADMIN_PASSWORD:?required}"
+      },
+      "command": [
+        "postgres",
+        "-c",
+        "shared_buffers=128MB",
+        "-c",
+        "work_mem=4MB",
+        "-c",
+        "maintenance_work_mem=64MB",
+        "-c",
+        "max_connections=30",
+        "-c",
+        "wal_keep_size=64MB"
+      ],
+      "volumes": [
+        "pgdata:/var/lib/postgresql/data"
+      ],
+      "networks": [
+        "private"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d front_dot"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 30
+      },
+      "mem_limit": "512m",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      },
+      "restart": "unless-stopped"
+    },
+    "core": {
+      "image": "front-dot:${FRONT_DOT_SHA:?required}",
+      "build": {
+        "context": "..",
+        "dockerfile": "deploy/Dockerfile"
+      },
+      "environment": {
+        "FRONT_DOT_CHANNEL": "wecom"
+      },
+      "depends_on": {
+        "pg": {
+          "condition": "service_healthy"
+        }
+      },
+      "networks": [
+        "private",
+        "outbound"
+      ],
+      "deploy": {
+        "replicas": 1
+      },
+      "init": true,
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "3s",
+        "timeout": "5s",
+        "retries": 20
+      },
+      "stop_grace_period": "30s",
+      "mem_limit": "384m",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      },
+      "restart": "unless-stopped",
+      "env_file": [
+        "${CORE_ENV_FILE:?required}"
+      ],
+      "tmpfs": [
+        "/tmp"
+      ]
+    },
+    "admin": {
+      "image": "front-dot:${FRONT_DOT_SHA:?required}",
+      "profiles": [
+        "tools"
+      ],
+      "environment": {
+        "DATABASE_ADMIN_URL": "${DATABASE_ADMIN_URL:?required}",
+        "APP_DB_PASSWORD": "${APP_DB_PASSWORD:?required}",
+        "READONLY_DB_PASSWORD": "${READONLY_DB_PASSWORD:?required}"
+      },
+      "networks": [
+        "private"
+      ],
+      "entrypoint": [
+        "node",
+        "dist/standalone/admin.js"
+      ],
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      },
+      "read_only": true,
+      "tmpfs": [
+        "/tmp"
+      ],
+      "env_file": [
+        "${ADMIN_ENV_FILE:?required}"
+      ]
+    }
+  },
+  "networks": {
+    "private": {
+      "internal": true
+    },
+    "outbound": {}
+  },
+  "volumes": {
+    "pgdata": {}
+  }
+}
