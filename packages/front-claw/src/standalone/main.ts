@@ -20,7 +20,7 @@ async function assembleStandalone(env: Readonly<Record<string, string | undefine
   let channel = createOfflineChannel();
   const runtimeEnv = offline
     ? Object.freeze({ FRONT_CLAW_OPENDOT_ADAPTER: '1', FRONT_CLAW_NOTIFY_DISPATCH: '0' })
-    : Object.freeze({ ...options.channelEnv, FRONT_CLAW_OPENDOT_ADAPTER: '1', FRONT_CLAW_NOTIFY_DISPATCH: '0',
+    : Object.freeze({ ...options.channelEnv, FRONT_CLAW_OPENDOT_ADAPTER: '1', FRONT_CLAW_NOTIFY_DISPATCH: env.FRONT_CLAW_NOTIFY_DISPATCH ?? '0',
       FRONT_CLAW_OPENDOT_CAPABILITIES: env.FRONT_CLAW_OPENDOT_CAPABILITIES, FRONT_CLAW_MEM0: env.FRONT_CLAW_MEM0 });
   const modelConfig = offline ? undefined : loadModelRuntimeConfig(null, env);
   const modelClassify = offline ? createSyntheticModel() : standaloneModelClassifier(env);

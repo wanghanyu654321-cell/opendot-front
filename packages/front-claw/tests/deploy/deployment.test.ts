@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -120,10 +120,16 @@ describe('deployment contract', () => {
     }
   });
   it('refuses tagging a dirty tree and supports an explicit preview override', async () => {
-    await expect(exec('bash', ['scripts/deploy/deploy.sh'])).rejects.toThrow();
-    const result = await exec('bash', ['scripts/deploy/deploy.sh', '--allow-dirty', '--allow-non-main']);
-    expect(result.stdout).toMatch(/front-dot:[a-f0-9]{40}/);
-    expect(result.stdout).toContain('dry-run');
+    const probe = 'scripts/deploy/.dirty-probe-tmp';
+    writeFileSync(probe, 'dirty\n');
+    try {
+      await expect(exec('bash', ['scripts/deploy/deploy.sh'])).rejects.toThrow();
+      const result = await exec('bash', ['scripts/deploy/deploy.sh', '--allow-dirty', '--allow-non-main']);
+      expect(result.stdout).toMatch(/front-dot:[a-f0-9]{40}/);
+      expect(result.stdout).toContain('dry-run');
+    } finally {
+      rmSync(probe, { force: true });
+    }
   });
   it('rejects non-main and dirty image tags unless each exception is explicit', async () => {
     const { assertImageVersion } = await import('../../scripts/deploy/image-version.mjs');

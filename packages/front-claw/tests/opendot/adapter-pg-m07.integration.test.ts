@@ -141,24 +141,32 @@ it('真实PG（R1 fencing）：时钟偏差双消费者同时收到同一「对�
 it('真实PG竞态：「对」与撤权同时发生 —— 配置争用 NOWAIT 拒绝、零入账；撤权提交后仍拒绝', async () => {
   const url = await seeded();
   const a = await adapter(url, 'A');
-  expect(await say(a, 'm-zhao', SHEET, 'rv-1')).toContain('560');
-  const admin = await rawClient(url);
-  await admin.query('BEGIN');
-  await admin.query(`SELECT value FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  a.channels.send('m-zhao', '对', 'rv-2');
-  await a.service.idle();
-  expect(a.channels.replies().at(-1)).toContain('争用已回滚');
-  expect(await entries560(url)).toBe(0);
-  const members = membersM05(); members['p-zhao'] = { ...members['p-zhao']!, status: 'suspended' };
-  await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(policyM05(2, members)), ACCESS_POLICY_KEY]);
-  await admin.query('COMMIT'); await admin.end();
-  await a.service.idle();
-  const reply = a.channels.replies().at(-1) ?? '';
-  expect(reply).not.toContain('已入账');
-  expect(await entries560(url)).toBe(0);
-  expect(await say(a, 'm-zhao', '对', 'rv-3')).toBe(ACCESS_DENIED);
-  expect(await entries560(url)).toBe(0);
-  await a.service.close();
+  let admin: Client | undefined;
+  try {
+    expect(await say(a, 'm-zhao', SHEET, 'rv-1')).toContain('560');
+    admin = await rawClient(url);
+    await admin.query('BEGIN');
+    await admin.query(`SELECT value FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
+    a.channels.send('m-zhao', '对', 'rv-2');
+    await a.service.idle();
+    expect(a.channels.replies().at(-1)).toContain('争用已回滚');
+    expect(await entries560(url)).toBe(0);
+    const members = membersM05(); members['p-zhao'] = { ...members['p-zhao']!, status: 'suspended' };
+    await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(policyM05(2, members)), ACCESS_POLICY_KEY]);
+    await admin.query('COMMIT');
+    await a.service.idle();
+    const reply = a.channels.replies().at(-1) ?? '';
+    expect(reply).not.toContain('已入账');
+    expect(await entries560(url)).toBe(0);
+    expect(await say(a, 'm-zhao', '对', 'rv-3')).toBe(ACCESS_DENIED);
+    expect(await entries560(url)).toBe(0);
+  } finally {
+    if (admin) {
+      await admin.query('ROLLBACK').catch(() => {});
+      await admin.end().catch(() => {});
+    }
+    await a.service.close();
+  }
 }, 30_000);
 
 it('PG binding: NOWAIT refuses a busy binding before any business settlement', async () => {
