@@ -61,10 +61,12 @@ services:
       FRONT_CLAW_WECOM_INPROCESS_SANDBOX: "1"
       FRONT_CLAW_OPENDOT_ADAPTER: "1"
       FRONT_CLAW_WECOM_WORKSPACE_JID: web:wecom-front-claw
+      FRONT_CLAW_DATABASE_URL_FILE: /run/secrets/front_claw_db_url
     env_file:
       - ${CORE_ENV_FILE:?required}
     volumes:
       - opendot_data:/app/data
+      - ${FRONT_CLAW_DB_URL_FILE:?required}:/run/secrets/front_claw_db_url:ro
     tmpfs:
       - /tmp
     healthcheck:

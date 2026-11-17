@@ -167,6 +167,7 @@ jobs:
           printf 'PG_ADMIN_PASSWORD=ci\nDATABASE_ADMIN_URL=postgres://postgres:ci@pg:5432/front_dot\nAPP_DB_PASSWORD=ci\nREADONLY_DB_PASSWORD=ci\n' > "$RUNNER_TEMP/admin.env"
           CORE_ENV_FILE="$RUNNER_TEMP/core.env" \
           ADMIN_ENV_FILE="$RUNNER_TEMP/admin.env" \
+          FRONT_CLAW_DB_URL_FILE=/dev/null \
           PG_ADMIN_PASSWORD=ci \
           DATABASE_ADMIN_URL=postgres://postgres:ci@pg:5432/front_dot \
           APP_DB_PASSWORD=ci \
@@ -182,3 +183,103 @@ jobs:
             tests/reproducible-build-contract.test.ts \
             tests/graceful-shutdown-order.test.ts \
             tests/channel-account-startup-contract.test.ts
+
+      - name: Single-container Docker Compose production smoke (NODE_ENV=production)
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="$(mktemp -d /tmp/opendot-compose-smoke.XXXXXX)"
+          export OPENDOT_IMAGE_TAG="ci-smoke-${GITHUB_RUN_ID:-local}"
+          export PG_ADMIN_PASSWORD="$(openssl rand -hex 20)"
+          export APP_DB_PASSWORD="$(openssl rand -hex 20)"
+          export READONLY_DB_PASSWORD="$(openssl rand -hex 20)"
+          export DATABASE_ADMIN_URL="postgres://postgres:${PG_ADMIN_PASSWORD}@pg:5432/front_dot"
+          ADMIN_USER_PW="$(openssl rand -hex 16)"
+          SESSION_SECRET="$(openssl rand -hex 24)"
+
+          cat > "$SMOKE_DIR/admin.env" <<EOF
+          PG_ADMIN_PASSWORD=${PG_ADMIN_PASSWORD}
+          DATABASE_ADMIN_URL=${DATABASE_ADMIN_URL}
+          APP_DB_PASSWORD=${APP_DB_PASSWORD}
+          READONLY_DB_PASSWORD=${READONLY_DB_PASSWORD}
+          FRONT_CLAW_WECOM_BOT_ID=ci-smoke-bot
+          PILOT_MEMBER_ID=ci-pilot-member
+          PILOT_CORP_ID=ci-pilot-corp
+          PILOT_DISPLAY_NAME=CI Pilot Manager
+          PILOT_STORE_ID=store-ci-01
+          PILOT_STORE_NAME=CI Store 01
+          PILOT_ROLE=manager
+          EOF
+
+          cat > "$SMOKE_DIR/core.env" <<EOF
+          FRONT_CLAW_WECOM_BOT_ID=ci-smoke-bot
+          FRONT_CLAW_WECOM_BOT_SECRET=ci-smoke-synthetic-secret-placeholder
+          FRONT_CLAW_DATABASE_URL_FILE=/run/secrets/front_claw_db_url
+          FRONT_CLAW_NOTIFY_DISPATCH=0
+          WEB_SESSION_SECRET=${SESSION_SECRET}
+          FC_MODEL_MODE=stub
+          WEB_PORT=3000
+          EOF
+
+          printf 'postgres://front_app:%s@pg:5432/front_dot' "$APP_DB_PASSWORD" > "$SMOKE_DIR/front_claw_db_url"
+          chmod 600 "$SMOKE_DIR/admin.env" "$SMOKE_DIR/core.env" "$SMOKE_DIR/front_claw_db_url"
+
+          export CORE_ENV_FILE="$SMOKE_DIR/core.env"
+          export ADMIN_ENV_FILE="$SMOKE_DIR/admin.env"
+          export FRONT_CLAW_DB_URL_FILE="$SMOKE_DIR/front_claw_db_url"
+
+          cleanup() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "=== Compose smoke failed (exit $rc); dumping service logs ==="
+              docker compose -f deploy/docker-compose.yml logs --tail=200 core pg || true
+            fi
+            docker compose -f deploy/docker-compose.yml --profile tools down -v --remove-orphans || true
+            docker image rm "opendot-front:${OPENDOT_IMAGE_TAG}" >/dev/null 2>&1 || true
+            sudo rm -rf "$SMOKE_DIR" || rm -rf "$SMOKE_DIR" || true
+            exit "$rc"
+          }
+          trap cleanup EXIT
+
+          docker compose -f deploy/docker-compose.yml build core
+          NODE_UID="$(docker run --rm --entrypoint id "opendot-front:${OPENDOT_IMAGE_TAG}" -u node)"
+          echo "Container node uid: ${NODE_UID}"
+          test "$NODE_UID" = "1000"
+          sudo chown "${NODE_UID}:${NODE_UID}" "$SMOKE_DIR/front_claw_db_url"
+
+          docker compose -f deploy/docker-compose.yml up -d --wait pg
+          docker compose -f deploy/docker-compose.yml --profile tools run --rm admin migrate
+          docker compose -f deploy/docker-compose.yml --profile tools run --rm admin seed-pilot
+          docker compose -f deploy/docker-compose.yml run --rm --no-deps core node dist/reset-admin.js admin "$ADMIN_USER_PW"
+
+          docker compose -f deploy/docker-compose.yml up -d core
+
+          HEALTH_OK=0
+          for _ in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
+              if docker compose -f deploy/docker-compose.yml logs core 2>&1 | grep -q "WeCom Front Claw native runtime started"; then
+                HEALTH_OK=1
+                break
+              fi
+            fi
+            sleep 1.5
+          done
+          test "$HEALTH_OK" = "1"
+          echo "Health response: $(curl -fsS http://127.0.0.1:3000/api/health)"
+
+          CORE_LOGS="$(docker compose -f deploy/docker-compose.yml logs core 2>&1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g')"
+          if echo "$CORE_LOGS" | grep -qE "FRONT_CLAW_CREDENTIAL_ENV_URL_FORBIDDEN|Failed to start WeCom Front Claw native runtime|consumer_lease_not_acquired"; then
+            echo "Forbidden error detected in core logs"
+            exit 1
+          fi
+          echo "$CORE_LOGS" | grep -E "WeCom Front Claw native runtime started"
+          echo "$CORE_LOGS" | grep -qE 'driver:\s*"?postgres"?|"driver":"postgres"'
+          echo "$CORE_LOGS" | grep -qE 'leaseHeld:\s*true|"leaseHeld":true'
+
+          LEASE_ROW="$(docker compose -f deploy/docker-compose.yml exec -T pg psql -U postgres -d front_dot -tAc "SELECT value FROM front_claw_perf.performance_config WHERE key='front-claw-opendot-consumer'")"
+          echo "Active ConsumerLease row while core running: $LEASE_ROW"
+          echo "$LEASE_ROW" | grep -qv '"owner":null'
+
+          docker compose -f deploy/docker-compose.yml stop core
+          VERIFY_OUT="$(docker compose -f deploy/docker-compose.yml --profile tools run --rm admin verify-consumer)"
+          echo "verify-consumer after core stop: $VERIFY_OUT"
+          echo "$VERIFY_OUT" | grep -q '"consumerAbsent":true'

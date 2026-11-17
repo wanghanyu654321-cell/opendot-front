@@ -499,8 +499,8 @@ import {
 import { getMergedTaskRunHistory } from './task-run-history.js';
 import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
 import {
-  WECOM_MANAGED_WORKSPACE_FOLDER,
   type WeComFrontClawRuntimeHandle,
+  isWeComManagedWorkspaceFolder,
   startWeComFrontClawRuntime,
 } from './wecom-front-claw-runtime.js';
 import { SAFE_MARKETING_DISALLOWED_TOOLS } from './wecom-front-claw-bridge.js';
@@ -9665,7 +9665,7 @@ async function runAgent(
   const rawContainerAgentProfile =
     toContainerAgentProfile(resolvedAgentProfile);
   const isWeComRestrictedTurn =
-    group.folder === WECOM_MANAGED_WORKSPACE_FOLDER ||
+    isWeComManagedWorkspaceFolder(group.folder) ||
     currentSourceJid?.startsWith('wecom:') === true ||
     chatJid.startsWith('wecom:');
   const containerAgentProfile =

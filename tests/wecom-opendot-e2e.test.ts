@@ -96,6 +96,7 @@ vi.mock('../src/logger.js', () => ({ logger: log }));
 import { DATA_DIR as tmp } from '../src/config.js';
 
 import * as db from '../src/db.js';
+import { resolveStickyChannelOwner } from '../src/channel-session-owner.js';
 import { IMConnectionManager } from '../src/im-manager.js';
 import { runHostAgent } from '../src/container-runner.js';
 import type { RegisteredGroup } from '../src/types.js';
@@ -113,6 +114,9 @@ import {
 import {
   WECOM_MANAGED_WORKSPACE_FOLDER,
   WECOM_MANAGED_WORKSPACE_JID,
+  WECOM_SAFE_PROFILE_NAME,
+  deriveEmployeeWeComWorkspace,
+  isWeComManagedWorkspaceFolder,
   startWeComFrontClawRuntime,
 } from '../src/wecom-front-claw-runtime.js';
 import {
@@ -505,7 +509,14 @@ function resetOpenDotSqliteState() {
   for (const jid of Object.keys(existingGroups)) {
     db.deleteRegisteredGroup(jid);
   }
-  if (!db.getUserById('admin-e2e')) {
+  const existingUsers = db.listUsers({ pageSize: 100 }).users;
+  for (const u of existingUsers) {
+    if (u.id !== 'admin-e2e' && u.status !== 'deleted') {
+      db.deleteUser(u.id);
+    }
+  }
+  const adminE2e = db.getUserById('admin-e2e');
+  if (!adminE2e) {
     db.createUser({
       id: 'admin-e2e',
       username: 'admin-e2e',
@@ -516,6 +527,13 @@ function resetOpenDotSqliteState() {
       permissions: [],
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+    });
+  } else if (adminE2e.status !== 'active') {
+    db.updateUserFields('admin-e2e', {
+      status: 'active',
+      role: 'admin',
+      deleted_at: null,
+      disable_reason: null,
     });
   }
 }
@@ -917,8 +935,19 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(sends).toHaveLength(1);
     expect(JSON.stringify(sends[0]!.body)).toContain('受控营销助手回复');
 
-    // Verify pass message landed in OpenDot SQLite under web:wecom-front-claw
-    const savedPassMessages = db.getMessagesSince(WECOM_MANAGED_WORKSPACE_JID, {
+    // Verify pass message landed in OpenDot SQLite under isolated per-employee workspace (not shared web:wecom-front-claw)
+    const zhaoWorkspace = deriveEmployeeWeComWorkspace({
+      corpId: CORP_ID,
+      botId: BOT_ID,
+      memberId: 'm-zhao',
+    });
+    expect(
+      db.getMessagesSince(WECOM_MANAGED_WORKSPACE_JID, {
+        timestamp: '',
+        id: '',
+      }),
+    ).toHaveLength(0);
+    const savedPassMessages = db.getMessagesSince(zhaoWorkspace.jid, {
       timestamp: '',
       id: '',
     });
@@ -1008,6 +1037,355 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         ),
       ),
     ).toBe(false);
+  });
+
+  test('Cold-start requires persisted active user and self-heals historical front-claw-system workspaces/routes on restart', async () => {
+    let nowMs = Date.UTC(2026, 10, 12, 6, 0, 0);
+    const now = () => new Date(nowMs);
+    const world = await createSeededMemoryWorld(now);
+
+    // Simulate empty user DB on cold start
+    for (const u of db.listUsers({ status: 'active', pageSize: 100 }).users) {
+      db.deleteUser(u.id);
+    }
+    try {
+      const legacyShared: RegisteredGroup = {
+        name: '企微内容营销工作区',
+        folder: WECOM_MANAGED_WORKSPACE_FOLDER,
+        added_at: '2026-11-12T00:00:00.000Z',
+        created_by: 'front-claw-system',
+        is_home: false,
+        executionMode: 'container',
+      };
+      const legacyC2c: RegisteredGroup = {
+        name: '小赵企微会话',
+        folder: WECOM_MANAGED_WORKSPACE_FOLDER,
+        added_at: '2026-11-12T00:00:00.000Z',
+        created_by: 'front-claw-system',
+        target_main_jid: WECOM_MANAGED_WORKSPACE_JID,
+        is_home: false,
+        executionMode: 'container',
+      };
+      db.setRegisteredGroup(WECOM_MANAGED_WORKSPACE_JID, legacyShared);
+      const legacyC2cJid = `wecom:c2c:${CORP_ID}:m-zhao`;
+      db.setRegisteredGroup(legacyC2cJid, legacyC2c);
+
+      const coldGroups: Record<string, RegisteredGroup> = {
+        [WECOM_MANAGED_WORKSPACE_JID]: legacyShared,
+        [legacyC2cJid]: legacyC2c,
+      };
+      const { ownerUserId: _omittedOwner, ...coldHarness } =
+        createRuntimeWiringHarness(coldGroups);
+      const coldImManager = new IMConnectionManager();
+      const coldOffline = createOfflineWsClient();
+
+      const coldRuntime = await startWeComFrontClawRuntime({
+        env: {
+          FRONT_CLAW_WECOM_ENABLED: '1',
+          FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+          FRONT_CLAW_WECOM_BOT_SECRET: 'secret-cold',
+          FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        },
+        imManager: coldImManager,
+        ...coldHarness,
+        startMaintenance: false,
+        wecomConnection: { client: coldOffline.client, leaseCheckIntervalMs: 50 },
+        bridgeOptions: {
+          now,
+          open: world.open,
+          lease: { enabled: true, owner: 'node-cold', ttlMs: 5000, renewMs: 1000 },
+        },
+      });
+      expect(coldRuntime).toBeNull();
+      expect(
+        coldImManager.isChannelAccountConnected(
+          'front-claw-system',
+          'wecom',
+          BOT_ID,
+        ),
+      ).toBe(false);
+      expect(
+        log.error.mock.calls.some((call) =>
+          JSON.stringify(call).includes('reset-admin.js'),
+        ),
+      ).toBe(true);
+      const leaseAfterColdReject = await world.store.getConfig(CONSUMER_LEASE_KEY);
+      expect(parseLeaseRecord(leaseAfterColdReject)?.owner ?? null).toBeNull();
+
+      // Initialize real admin user and restart -> historical front-claw-system records self-heal
+      db.createUser({
+        id: 'admin-cold-healed',
+        username: 'admin-cold-healed',
+        password_hash: 'hash',
+        display_name: 'Cold Healed Admin',
+        role: 'admin',
+        status: 'active',
+        permissions: [],
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+
+      const healedOffline = createOfflineWsClient();
+      const healedRuntime = await startWeComFrontClawRuntime({
+        env: {
+          FRONT_CLAW_WECOM_ENABLED: '1',
+          FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+          FRONT_CLAW_WECOM_BOT_SECRET: 'secret-healed',
+          FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        },
+        imManager: coldImManager,
+        ...coldHarness,
+        startMaintenance: false,
+        wecomConnection: { client: healedOffline.client, leaseCheckIntervalMs: 50 },
+        bridgeOptions: {
+          now,
+          open: world.open,
+          lease: { enabled: true, owner: 'node-healed', ttlMs: 5000, renewMs: 1000 },
+        },
+      });
+      expect(healedRuntime).not.toBeNull();
+      activeCleanups.push(async () => {
+        await healedRuntime!.close();
+        await coldImManager.disconnectAll();
+      });
+      expect(healedRuntime!.ownerUserId).toBe('admin-cold-healed');
+      expect(
+        coldImManager.isChannelAccountConnected(
+          'admin-cold-healed',
+          'wecom',
+          BOT_ID,
+        ),
+      ).toBe(true);
+
+      const healedShared = db.getRegisteredGroup(WECOM_MANAGED_WORKSPACE_JID);
+      expect(healedShared?.created_by).toBe('admin-cold-healed');
+      expect(
+        db.getAgentProfileForWorkspace(
+          WECOM_MANAGED_WORKSPACE_FOLDER,
+          'admin-cold-healed',
+        )?.name,
+      ).toBe(WECOM_SAFE_PROFILE_NAME);
+
+      const zhaoWs = deriveEmployeeWeComWorkspace({
+        corpId: CORP_ID,
+        botId: BOT_ID,
+        memberId: 'm-zhao',
+      });
+      const healedZhaoWs = db.getRegisteredGroup(zhaoWs.jid);
+      expect(healedZhaoWs).toMatchObject({
+        folder: zhaoWs.folder,
+        created_by: 'admin-cold-healed',
+        is_home: false,
+        executionMode: 'container',
+      });
+      expect(
+        db.getAgentProfileForWorkspace(zhaoWs.folder, 'admin-cold-healed')?.name,
+      ).toBe(WECOM_SAFE_PROFILE_NAME);
+
+      const healedC2c = db.getRegisteredGroup(legacyC2cJid);
+      expect(healedC2c).toMatchObject({
+        created_by: 'admin-cold-healed',
+        folder: zhaoWs.folder,
+        target_main_jid: zhaoWs.jid,
+        is_home: false,
+        executionMode: 'container',
+      });
+    } finally {
+      resetOpenDotSqliteState();
+    }
+  });
+
+  test('Multi-employee pass isolation: Employee A and B route to isolated workspaces and sticky owners never cross-talk or leak', async () => {
+    let nowMs = Date.UTC(2026, 10, 12, 6, 0, 0);
+    const now = () => new Date(nowMs);
+    const world = await createSeededMemoryWorld(now);
+    const linPerson = await world.store.getPerson('p-lin');
+    expect(linPerson).toBeTruthy();
+    await world.store.savePerson({
+      ...linPerson!,
+      roles: ['marketing'],
+    });
+    const basePolicy = buildPolicy(1);
+    const isoPolicy = await updateAccessPolicy(world.store, {
+      expectedVersion: 1,
+      next: {
+        ...basePolicy,
+        version: 2,
+        members: {
+          ...basePolicy.members,
+          'p-lin': {
+            ...basePolicy.members['p-lin']!,
+            capabilities: ['marketing'],
+          },
+        },
+      },
+      actor: 'e2e-admin',
+      reason: 'enable-marketing-for-employee-b',
+      at: now().toISOString(),
+    });
+    expect(isoPolicy.ok).toBe(true);
+    const offline = createOfflineWsClient();
+    const imManager = new IMConnectionManager();
+    const groupsMap: Record<string, RegisteredGroup> = {};
+    const wiring = createRuntimeWiringHarness(groupsMap);
+
+    const stickyOwnerByFolder = new Map<string, string | null>();
+    const replyPromises: Promise<void>[] = [];
+
+    const runtime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-iso',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+      },
+      imManager,
+      ...wiring,
+      startMaintenance: false,
+      onMessage: (chatJid, text) => {
+        const effective = wiring.resolveEffectiveChatJid(chatJid);
+        if (!effective) return;
+        const effectiveGroup = wiring.getGroup(effective.effectiveJid);
+        if (!effectiveGroup) return;
+        const owner = resolveStickyChannelOwner(
+          stickyOwnerByFolder.get(effectiveGroup.folder) ?? null,
+          chatJid,
+        );
+        stickyOwnerByFolder.set(effectiveGroup.folder, owner);
+        const replyTarget = owner ?? chatJid;
+        replyPromises.push(
+          (async () => {
+            await new Promise((r) =>
+              setTimeout(r, chatJid.includes('m-zhao') ? 50 : 10),
+            );
+            await imManager.sendMessage(
+              replyTarget,
+              `[受控回复:${effectiveGroup.folder}] ${text}`,
+            );
+          })(),
+        );
+      },
+      wecomConnection: { client: offline.client, leaseCheckIntervalMs: 50 },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-iso', ttlMs: 5000, renewMs: 1000 },
+        modelClassify: async () => ({
+          intent: 'marketing',
+          object: null,
+          action: null,
+          slots: {},
+          confidence: 0.98,
+          uncertain: false,
+        }),
+      },
+    });
+    expect(runtime).not.toBeNull();
+    activeCleanups.push(async () => {
+      await runtime!.close();
+      await imManager.disconnectAll();
+    });
+
+    offline.emitInboundText({
+      reqId: 'req-iso-zhao-1',
+      msgid: 'msg-iso-zhao-1',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '帮小赵写防晒小红书文案',
+    });
+    offline.emitInboundText({
+      reqId: 'req-iso-lin-1',
+      msgid: 'msg-iso-lin-1',
+      userid: 'm-lin',
+      corpid: CORP_ID,
+      content: '帮小林写补水线下海报文案',
+    });
+
+    await waitUntil(
+      () =>
+        offline.sent.filter((f) => f.cmd === WsCmd.SEND_MSG).length === 2,
+      3000,
+      15,
+      () => JSON.stringify({ sent: offline.sent }),
+    );
+    await Promise.all(replyPromises);
+
+    const zhaoWs = deriveEmployeeWeComWorkspace({
+      corpId: CORP_ID,
+      botId: BOT_ID,
+      memberId: 'm-zhao',
+    });
+    const linWs = deriveEmployeeWeComWorkspace({
+      corpId: CORP_ID,
+      botId: BOT_ID,
+      memberId: 'm-lin',
+    });
+    expect(zhaoWs.jid).not.toBe(linWs.jid);
+    expect(zhaoWs.folder).not.toBe(linWs.folder);
+    expect(isWeComManagedWorkspaceFolder(zhaoWs.folder)).toBe(true);
+    expect(isWeComManagedWorkspaceFolder(linWs.folder)).toBe(true);
+
+    const zhaoC2c = `wecom:c2c:${CORP_ID}:m-zhao`;
+    const linC2c = `wecom:c2c:${CORP_ID}:m-lin`;
+    expect(db.getRegisteredGroup(zhaoC2c)).toMatchObject({
+      target_main_jid: zhaoWs.jid,
+      folder: zhaoWs.folder,
+    });
+    expect(db.getRegisteredGroup(linC2c)).toMatchObject({
+      target_main_jid: linWs.jid,
+      folder: linWs.folder,
+    });
+
+    // Separate sticky owners per workspace folder (zero cross-employee sticky lock)
+    expect(stickyOwnerByFolder.get(zhaoWs.folder)).toBe(zhaoC2c);
+    expect(stickyOwnerByFolder.get(linWs.folder)).toBe(linC2c);
+
+    // SQLite message histories remain strictly isolated per employee
+    const zhaoMsgs = db
+      .getMessagesSince(zhaoWs.jid, { timestamp: '', id: '' })
+      .map((m) => m.content);
+    const linMsgs = db
+      .getMessagesSince(linWs.jid, { timestamp: '', id: '' })
+      .map((m) => m.content);
+    expect(zhaoMsgs).toContain('帮小赵写防晒小红书文案');
+    expect(zhaoMsgs).not.toContain('帮小林写补水线下海报文案');
+    expect(linMsgs).toContain('帮小林写补水线下海报文案');
+    expect(linMsgs).not.toContain('帮小赵写防晒小红书文案');
+    expect(
+      db.getMessagesSince(WECOM_MANAGED_WORKSPACE_JID, {
+        timestamp: '',
+        id: '',
+      }),
+    ).toHaveLength(0);
+
+    // Outbound WsCmd.SEND_MSG goes strictly to each sender
+    const outboundSends = offline.sent.filter((f) => f.cmd === WsCmd.SEND_MSG);
+    const sendToZhao = outboundSends.find((f) => f.body.chatid === 'm-zhao');
+    const sendToLin = outboundSends.find((f) => f.body.chatid === 'm-lin');
+    expect(JSON.stringify(sendToZhao?.body)).toContain('防晒小红书文案');
+    expect(JSON.stringify(sendToZhao?.body)).not.toContain('补水线下海报文案');
+    expect(JSON.stringify(sendToLin?.body)).toContain('补水线下海报文案');
+    expect(JSON.stringify(sendToLin?.body)).not.toContain('防晒小红书文案');
+
+    // Both derived workspaces bind active SafeMarketingProfile passing fail-closed validation
+    for (const ws of [zhaoWs, linWs]) {
+      const profile = db.getAgentProfileForWorkspace(ws.folder, 'admin-e2e');
+      expect(profile?.name).toBe(WECOM_SAFE_PROFILE_NAME);
+      const check = validateTargetAgentProfile({
+        profileId: profile!.id,
+        workspaceJid: ws.jid,
+        status: profile!.status,
+        executionMode: 'container',
+        contextSource: profile!.runtime_policy.context.source,
+        hostSkillsMode: profile!.runtime_policy.skills.host?.mode ?? 'disabled',
+        runtimePolicy: {
+          context: profile!.runtime_policy.context,
+          skills: profile!.runtime_policy.skills,
+        },
+        disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
+      });
+      expect(check.ok).toBe(true);
+    }
   });
 
   test('Gate 5 (Sandbox & Guardrails): blocks host/host_claude/secret-leak profiles and strips DB/PG/Shell capabilities in OpenDot runner', async () => {

@@ -710,6 +710,7 @@ export function createWeComConnection(
   let sender: ReturnType<typeof createBotSender> | null = null;
   let textListener: ((frame: unknown) => void) | null = null;
   let readyListener: (() => void) | null = null;
+  let errorListener: ((err: unknown) => void) | null = null;
   let leaseCheckTimer: ReturnType<typeof setInterval> | null = null;
   let leaseRenewTimer: ReturnType<typeof setInterval> | null = null;
   let stopping = false;
@@ -734,16 +735,25 @@ export function createWeComConnection(
     const activeClient = client;
     const activeListener = textListener;
     const activeReadyListener = readyListener;
+    const activeErrorListener = errorListener;
     const activeSender = sender;
     const activeSdk = sdk;
 
     client = null;
     textListener = null;
     readyListener = null;
+    errorListener = null;
     sender = null;
     sdk = null;
 
     if (activeClient) {
+      if (activeErrorListener) {
+        try {
+          activeClient.off('error', activeErrorListener as never);
+        } catch {
+          /* ignore */
+        }
+      }
       try {
         activeClient.on('error', lateErrorSink);
       } catch {
@@ -1184,6 +1194,11 @@ export function createWeComConnection(
         };
         readyListener = fireReady;
         wsClient.on('authenticated', fireReady);
+
+        errorListener = (err: unknown) => {
+          logger.warn({ err, botId }, 'WeCom WSClient error');
+        };
+        wsClient.on('error', errorListener as never);
 
         textListener = (frame: unknown) => {
           void handleInboundFrame(frame, opts).catch((err) => {

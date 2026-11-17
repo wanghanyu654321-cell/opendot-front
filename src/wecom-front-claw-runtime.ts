@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { applyChannelAccountRegistrationFallback } from './channel-account-routing.js';
@@ -6,16 +7,19 @@ import { GROUPS_DIR } from './config.js';
 import {
   assignWorkspaceAgentProfile,
   createAgentProfile,
-  getAgentProfileForWorkspace,
+  getAgentProfile,
+  getAllRegisteredGroups,
   getEarliestActiveAdmin,
+  getWorkspaceAgentProfileId,
   listAgentProfilesForUser,
   listUsers,
+  getAgentProfileForWorkspace,
 } from './db.js';
 import type { WeComConnectConfig } from './im-manager.js';
 import { IMConnectionManager } from './im-manager.js';
 import { logger } from './logger.js';
 import { getContainerEnvConfig } from './runtime-config.js';
-import { RegisteredGroup } from './types.js';
+import { type AgentProfile, RegisteredGroup } from './types.js';
 import {
   SAFE_MARKETING_DISALLOWED_TOOLS,
   type TargetAgentProfileSnapshot,
@@ -26,15 +30,71 @@ import {
 
 export const WECOM_MANAGED_WORKSPACE_JID = 'web:wecom-front-claw';
 export const WECOM_MANAGED_WORKSPACE_FOLDER = 'wecom-front-claw';
+export const WECOM_MANAGED_WORKSPACE_JID_PREFIX = `${WECOM_MANAGED_WORKSPACE_JID}:`;
+export const WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX = `${WECOM_MANAGED_WORKSPACE_FOLDER}-`;
 export const WECOM_SAFE_PROFILE_NAME = 'Front Claw Safe Marketing';
 
 const SYSTEM_WECOM_OWNER_ID = 'front-claw-system';
 const DEFAULT_LEASE_CHECK_INTERVAL_MS = 1000;
 
+export function deriveEmployeeWeComWorkspace(ctx: {
+  corpId: string;
+  botId: string;
+  memberId: string;
+}): { jid: string; folder: string } {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([ctx.corpId, ctx.botId, ctx.memberId]))
+    .digest('hex')
+    .slice(0, 16);
+  return {
+    jid: `${WECOM_MANAGED_WORKSPACE_JID_PREFIX}${digest}`,
+    folder: `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${digest}`,
+  };
+}
+
+export function isWeComManagedWorkspaceFolder(
+  folder: string | undefined,
+): boolean {
+  return (
+    folder === WECOM_MANAGED_WORKSPACE_FOLDER ||
+    Boolean(
+      folder &&
+        folder.startsWith(WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX) &&
+        folder.length > WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX.length,
+    )
+  );
+}
+
+export function isWeComManagedWorkspaceJid(jid: string | undefined): boolean {
+  return (
+    jid === WECOM_MANAGED_WORKSPACE_JID ||
+    Boolean(
+      jid &&
+        jid.startsWith(WECOM_MANAGED_WORKSPACE_JID_PREFIX) &&
+        jid.length > WECOM_MANAGED_WORKSPACE_JID_PREFIX.length,
+    )
+  );
+}
+
+function parseWeComC2cJid(
+  baseJid: string,
+): { corpId: string; memberId: string } | null {
+  const prefix = 'wecom:c2c:';
+  if (!baseJid.startsWith(prefix)) return null;
+  const rest = baseJid.slice(prefix.length);
+  const splitAt = rest.indexOf(':');
+  if (splitAt <= 0 || splitAt >= rest.length - 1) return null;
+  return {
+    corpId: rest.slice(0, splitAt),
+    memberId: rest.slice(splitAt + 1),
+  };
+}
+
 export interface WeComFrontClawRuntimeDeps {
   readonly env?: Record<string, string | undefined>;
   readonly imManager: IMConnectionManager;
   readonly getGroup: (jid: string) => RegisteredGroup | undefined;
+  readonly listGroups?: () => Record<string, RegisteredGroup>;
   readonly registerGroup: (jid: string, group: RegisteredGroup) => void;
   readonly onNewChat: (
     userId: string,
@@ -104,11 +164,11 @@ function resolveWeComOwnerUserId(
   explicitOwnerUserId?: string,
 ): { userId: string; hasPersistedUser: boolean } {
   const explicit = explicitOwnerUserId?.trim();
-  if (explicit) {
+  if (explicit && explicit !== SYSTEM_WECOM_OWNER_ID) {
     return { userId: explicit, hasPersistedUser: true };
   }
   const configured = env.FRONT_CLAW_WECOM_OWNER_USER_ID?.trim();
-  if (configured) {
+  if (configured && configured !== SYSTEM_WECOM_OWNER_ID) {
     return { userId: configured, hasPersistedUser: true };
   }
   const admin = getEarliestActiveAdmin();
@@ -152,8 +212,31 @@ function findOrCreateSafeMarketingProfile(ownerUserId: string): string {
   return created.id;
 }
 
+function isSafeMarketingProfile(profile: AgentProfile | undefined): boolean {
+  return Boolean(
+    profile &&
+      profile.status === 'active' &&
+      profile.name === WECOM_SAFE_PROFILE_NAME &&
+      profile.runtime_policy.context.source === 'managed' &&
+      profile.runtime_policy.skills.host?.mode === 'disabled' &&
+      profile.runtime_policy.mcp.mode === 'disabled',
+  );
+}
+
+function ensureSafeProfileBinding(folder: string, ownerUserId: string): void {
+  const mappedId = getWorkspaceAgentProfileId(folder);
+  const mapped = mappedId ? getAgentProfile(mappedId) : undefined;
+  if (isSafeMarketingProfile(mapped)) {
+    return;
+  }
+  const profileId = findOrCreateSafeMarketingProfile(ownerUserId);
+  assignWorkspaceAgentProfile(folder, profileId, 'assistant');
+}
+
 function ensureManagedWeComWorkspace(params: {
   workspaceJid: string;
+  workspaceFolder?: string;
+  workspaceName?: string;
   ownerUserId: string;
   getGroup: (jid: string) => RegisteredGroup | undefined;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
@@ -161,34 +244,54 @@ function ensureManagedWeComWorkspace(params: {
 }): RegisteredGroup | undefined {
   const existing = params.getGroup(params.workspaceJid);
   if (existing) {
+    if (isWeComManagedWorkspaceJid(params.workspaceJid)) {
+      if (
+        existing.created_by === SYSTEM_WECOM_OWNER_ID &&
+        params.ownerUserId !== SYSTEM_WECOM_OWNER_ID
+      ) {
+        const migrated: RegisteredGroup = {
+          ...existing,
+          created_by: params.ownerUserId,
+          executionMode: existing.executionMode ?? 'container',
+          is_home: false,
+        };
+        params.registerGroup(params.workspaceJid, migrated);
+        ensureSafeProfileBinding(migrated.folder, params.ownerUserId);
+        return migrated;
+      }
+      ensureSafeProfileBinding(
+        existing.folder,
+        existing.created_by || params.ownerUserId,
+      );
+    }
     return existing;
   }
-  if (params.workspaceJid !== WECOM_MANAGED_WORKSPACE_JID) {
+
+  const defaultFolder =
+    params.workspaceJid === WECOM_MANAGED_WORKSPACE_JID
+      ? WECOM_MANAGED_WORKSPACE_FOLDER
+      : params.workspaceJid.startsWith(WECOM_MANAGED_WORKSPACE_JID_PREFIX)
+        ? `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${params.workspaceJid.slice(WECOM_MANAGED_WORKSPACE_JID_PREFIX.length)}`
+        : undefined;
+  const folder = params.workspaceFolder ?? defaultFolder;
+  if (!folder) {
     return undefined;
   }
 
-  fs.mkdirSync(path.join(params.groupsDir, WECOM_MANAGED_WORKSPACE_FOLDER), {
+  fs.mkdirSync(path.join(params.groupsDir, folder), {
     recursive: true,
   });
 
   const group: RegisteredGroup = {
-    name: '企微内容营销工作区',
-    folder: WECOM_MANAGED_WORKSPACE_FOLDER,
+    name: params.workspaceName ?? '企微内容营销工作区',
+    folder,
     added_at: new Date().toISOString(),
     created_by: params.ownerUserId,
     is_home: false,
     executionMode: 'container',
   };
-  params.registerGroup(WECOM_MANAGED_WORKSPACE_JID, group);
-
-  const boundProfile = getAgentProfileForWorkspace(
-    group.folder,
-    group.created_by,
-  );
-  if (!boundProfile) {
-    const profileId = findOrCreateSafeMarketingProfile(params.ownerUserId);
-    assignWorkspaceAgentProfile(group.folder, profileId, 'assistant');
-  }
+  params.registerGroup(params.workspaceJid, group);
+  ensureSafeProfileBinding(group.folder, params.ownerUserId);
 
   return group;
 }
@@ -252,15 +355,17 @@ export async function startWeComFrontClawRuntime(
 
   const ownerResolution = resolveWeComOwnerUserId(env, deps.ownerUserId);
   if (!ownerResolution.hasPersistedUser) {
-    logger.warn(
+    logger.error(
       { botId },
-      'No active OpenDot user found; WeCom passthrough outbound replies require an initialized admin/user',
+      'No active OpenDot user found; initialize an admin user (e.g. `node dist/reset-admin.js admin <strong-password>`) and restart before starting WeCom Front Claw runtime',
     );
+    return null;
   }
   const ownerUserId = ownerResolution.userId;
 
   const workspaceJid =
     env.FRONT_CLAW_WECOM_WORKSPACE_JID?.trim() || WECOM_MANAGED_WORKSPACE_JID;
+  const managedWorkspaceEnabled = workspaceJid === WECOM_MANAGED_WORKSPACE_JID;
   const groupsDir = deps.groupsDir ?? GROUPS_DIR;
   const managedGroup = ensureManagedWeComWorkspace({
     workspaceJid,
@@ -270,11 +375,118 @@ export async function startWeComFrontClawRuntime(
     groupsDir,
   });
 
+  const employeeWorkspaceByChat = new Map<
+    string,
+    { jid: string; folder: string }
+  >();
+  const ensureEmployeeTargetWorkspace = (ctx: {
+    corpId: string;
+    memberId: string;
+    displayName?: string;
+  }): { jid: string; folder: string } | undefined => {
+    if (!managedWorkspaceEnabled) {
+      return undefined;
+    }
+    const derived = deriveEmployeeWeComWorkspace({
+      corpId: ctx.corpId,
+      botId,
+      memberId: ctx.memberId,
+    });
+    ensureManagedWeComWorkspace({
+      workspaceJid: derived.jid,
+      workspaceFolder: derived.folder,
+      workspaceName: `企微内容营销工作区 (${ctx.displayName || ctx.memberId})`,
+      ownerUserId,
+      getGroup: deps.getGroup,
+      registerGroup: deps.registerGroup,
+      groupsDir,
+    });
+    const baseC2cJid = `wecom:c2c:${ctx.corpId}:${ctx.memberId}`;
+    employeeWorkspaceByChat.set(baseC2cJid, derived);
+    const existingC2c = deps.getGroup(baseC2cJid);
+    if (
+      existingC2c &&
+      (existingC2c.created_by === SYSTEM_WECOM_OWNER_ID ||
+        existingC2c.target_main_jid !== derived.jid ||
+        existingC2c.folder !== derived.folder ||
+        existingC2c.executionMode === 'host' ||
+        existingC2c.is_home)
+    ) {
+      deps.registerGroup(baseC2cJid, {
+        ...existingC2c,
+        created_by:
+          existingC2c.created_by === SYSTEM_WECOM_OWNER_ID
+            ? ownerUserId
+            : existingC2c.created_by,
+        folder: derived.folder,
+        target_main_jid: derived.jid,
+        executionMode: 'container',
+        is_home: false,
+      });
+    }
+    return derived;
+  };
+
+  // 自愈历史上 front-claw-system 归属与旧共享 web:wecom-front-claw 员工路由
+  const historicalGroups = (deps.listGroups ?? getAllRegisteredGroups)();
+  for (const [existingJid, existingGroup] of Object.entries(historicalGroups)) {
+    if (isWeComManagedWorkspaceJid(existingJid)) {
+      ensureManagedWeComWorkspace({
+        workspaceJid: existingJid,
+        ownerUserId,
+        getGroup: deps.getGroup,
+        registerGroup: deps.registerGroup,
+        groupsDir,
+      });
+      continue;
+    }
+    if (!existingJid.startsWith('wecom:')) {
+      continue;
+    }
+    const baseJid = channelConversationJid(existingJid);
+    const parsedC2c = managedWorkspaceEnabled
+      ? parseWeComC2cJid(baseJid)
+      : null;
+    if (
+      parsedC2c &&
+      (existingGroup.target_main_jid === WECOM_MANAGED_WORKSPACE_JID ||
+        existingGroup.created_by === SYSTEM_WECOM_OWNER_ID)
+    ) {
+      const derived = ensureEmployeeTargetWorkspace(parsedC2c);
+      if (derived && existingJid !== baseJid) {
+        deps.registerGroup(existingJid, {
+          ...existingGroup,
+          created_by:
+            existingGroup.created_by === SYSTEM_WECOM_OWNER_ID
+              ? ownerUserId
+              : existingGroup.created_by,
+          folder: derived.folder,
+          target_main_jid: derived.jid,
+          executionMode: 'container',
+          is_home: false,
+        });
+      }
+      continue;
+    }
+    if (existingGroup.created_by === SYSTEM_WECOM_OWNER_ID) {
+      deps.registerGroup(existingJid, {
+        ...existingGroup,
+        created_by: ownerUserId,
+      });
+    }
+  }
+
   const bridgeOptions: WeComFrontClawBridgeOptions = {
     ...deps.bridgeOptions,
     env: deps.bridgeOptions?.env ?? env,
     resolveWorkspaceJid:
-      deps.bridgeOptions?.resolveWorkspaceJid ?? (() => workspaceJid),
+      deps.bridgeOptions?.resolveWorkspaceJid ??
+      ((ctx) =>
+        ensureEmployeeTargetWorkspace({
+          corpId: ctx.corpId,
+          memberId: ctx.memberId,
+          displayName: ctx.displayName,
+        })?.jid ?? workspaceJid),
     resolveTargetProfile:
       deps.bridgeOptions?.resolveTargetProfile ??
       ((ctx) =>
@@ -289,26 +501,63 @@ export async function startWeComFrontClawRuntime(
     bridge.startMaintenance();
   }
 
-  const baseOnNewChat = deps.onNewChat(
-    ownerUserId,
-    managedGroup?.folder ?? WECOM_MANAGED_WORKSPACE_FOLDER,
-  );
   const onNewChat = (jid: string, name: string) => {
-    baseOnNewChat(jid, name);
     const baseJid = channelConversationJid(jid);
+    const resolvedTarget = (() => {
+      if (!managedWorkspaceEnabled) {
+        return {
+          jid: workspaceJid,
+          folder:
+            managedGroup?.folder ??
+            deps.getGroup(workspaceJid)?.folder ??
+            WECOM_MANAGED_WORKSPACE_FOLDER,
+        };
+      }
+      const cached = employeeWorkspaceByChat.get(baseJid);
+      if (cached) return cached;
+      const parsedC2c = parseWeComC2cJid(baseJid);
+      if (parsedC2c) {
+        const derived = ensureEmployeeTargetWorkspace(parsedC2c);
+        if (derived) return derived;
+      }
+      return {
+        jid: workspaceJid,
+        folder: managedGroup?.folder ?? WECOM_MANAGED_WORKSPACE_FOLDER,
+      };
+    })();
+
+    deps.onNewChat(ownerUserId, resolvedTarget.folder)(jid, name);
     const group = deps.getGroup(baseJid);
     if (!group) return;
     const withFallback = applyChannelAccountRegistrationFallback(
       group,
       botId,
-      workspaceJid,
+      resolvedTarget.jid,
     );
-    const safeGroup: RegisteredGroup =
-      withFallback.executionMode === 'host' || withFallback.is_home
+    const nextGroup: RegisteredGroup = managedWorkspaceEnabled
+      ? {
+          ...withFallback,
+          created_by:
+            withFallback.created_by === SYSTEM_WECOM_OWNER_ID
+              ? ownerUserId
+              : withFallback.created_by,
+          folder: resolvedTarget.folder,
+          target_main_jid: resolvedTarget.jid,
+          executionMode: 'container',
+          is_home: false,
+        }
+      : withFallback.executionMode === 'host' || withFallback.is_home
         ? { ...withFallback, executionMode: 'container', is_home: false }
         : withFallback;
-    if (safeGroup !== group) {
-      deps.registerGroup(baseJid, safeGroup);
+    const changed =
+      nextGroup.target_main_jid !== group.target_main_jid ||
+      nextGroup.folder !== group.folder ||
+      nextGroup.created_by !== group.created_by ||
+      nextGroup.channel_account_id !== group.channel_account_id ||
+      nextGroup.executionMode !== group.executionMode ||
+      nextGroup.is_home !== group.is_home;
+    if (changed) {
+      deps.registerGroup(baseJid, nextGroup);
     }
   };
 
