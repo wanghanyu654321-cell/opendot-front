@@ -7,6 +7,7 @@ export const CHANNEL_PREFIXES: Record<string, string> = {
   dingtalk: 'dingtalk:',
   discord: 'discord:',
   whatsapp: 'whatsapp:',
+  wecom: 'wecom:',
 };
 
 /** Determine the channel type from a JID string. Returns 'web' for unrecognized prefixes. */
