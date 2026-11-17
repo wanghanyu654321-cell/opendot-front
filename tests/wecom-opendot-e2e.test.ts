@@ -143,8 +143,15 @@ import type {
 import { CONSUMER_LEASE_KEY } from '../packages/front-claw/src/opendot/consumer-lease.js';
 import { parseLeaseRecord } from '../packages/front-claw/src/role-eval/fencing.js';
 import { MemorySql } from '../packages/front-claw/tests/role-eval/sql-fixture.js';
-import { startPgCluster } from '../packages/front-claw/tests/helpers/pg-cluster.js';
-import { openPerformanceStore } from '../packages/front-claw/src/role-eval/performance-open.js';
+import {
+  PG_STOP_HOOK_TIMEOUT_MS,
+  startPgCluster,
+} from '../packages/front-claw/tests/helpers/pg-cluster.js';
+import {
+  openPerformanceStore,
+  readPerformanceMigration,
+} from '../packages/front-claw/src/role-eval/performance-open.js';
+import { openSql } from '../packages/front-claw/src/migration/pg.js';
 
 const BOT_ID = 'bot-e2e-1';
 const CORP_ID = 'ww-e2e-corp';
@@ -583,7 +590,7 @@ afterEach(async () => {
   while (activeCleanups.length > 0) {
     await activeCleanups.pop()?.();
   }
-});
+}, Math.max(30_000, PG_STOP_HOOK_TIMEOUT_MS));
 
 describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
   test('Gate 2: accepts normal WeCom message without from.corpid via unique trusted binding and rejects ambiguous/unbound senders', async () => {
@@ -1349,103 +1356,136 @@ const hasPg17 = fs.existsSync(path.join(pgBin, 'initdb'));
 describe.runIf(hasPg17)(
   'OpenDot × Front Claw Real PostgreSQL 17 Convergence',
   () => {
-    test('acquires real PG 17 ConsumerLease, fences stale consumer, and executes single-entry store confirmation', async () => {
-      const cluster = await startPgCluster();
-      activeCleanups.push(() => cluster.stop());
-      const openedAdmin = await openPerformanceStore(
-        { FRONT_CLAW_DATABASE_URL: cluster.url },
-        { requirePostgres: true },
-      );
-      await migrateUp(openedAdmin.sql!, { apply: true });
-      const now = () => new Date(Date.UTC(2026, 10, 12, 6, 0, 0));
-      const store = openedAdmin.store;
-      const bindings = openedAdmin.bindings;
+    test(
+      'acquires real PG 17 ConsumerLease, fences stale consumer, and executes single-entry store confirmation',
+      async () => {
+        const cluster = await startPgCluster();
+        activeCleanups.push(() => cluster.stop());
+        const sql = await openSql(cluster.url);
+        try {
+          await migratePerformance(sql.client, readPerformanceMigration());
+          await migrateUp(sql.client, { apply: true });
+        } finally {
+          await sql.close();
+        }
+        const now = () => new Date(Date.UTC(2026, 10, 12, 6, 0, 0));
+        const openedAdmin = await openPerformanceStore(
+          { FRONT_CLAW_DATABASE_URL: cluster.url },
+          { requirePostgres: true },
+        );
+        try {
+          const store = openedAdmin.store;
+          const bindings = openedAdmin.bindings;
 
-      await store.savePerson({
-        personId: 'p-zhao',
-        accountId: 'a-zhao',
-        memberId: 'm-zhao',
-        displayName: '小赵',
-        storeId: 's-b',
-        storeName: '测试B店',
-        tier: 'employee',
-        roles: ['marketing'],
-        active: true,
-      });
-      await store.setConfig(
-        'employee-loop:m01',
-        JSON.stringify({
-          enabled: true,
-          storeId: 's-b',
-          memberIds: ['m-zhao'],
-        }),
-      );
-      await bindings.saveBinding({
-        botId: BOT_ID,
-        corpId: CORP_ID,
-        memberId: 'm-zhao',
-        accountId: 'a-zhao',
-        version: 1,
-        active: true,
-      });
-      await updateAccessPolicy(store, {
-        expectedVersion: null,
-        next: buildPolicy(1),
-        actor: 'pg17-e2e',
-        reason: 'init',
-        at: now().toISOString(),
-      });
-      await openedAdmin.close();
+          await store.savePerson({
+            personId: 'p-zhao',
+            accountId: 'a-zhao',
+            memberId: 'm-zhao',
+            displayName: '小赵',
+            storeId: 's-b',
+            storeName: '测试B店',
+            tier: 'employee',
+            roles: ['marketing'],
+            active: true,
+          });
+          await store.setConfig(
+            'employee-loop:m01',
+            JSON.stringify({
+              enabled: true,
+              storeId: 's-b',
+              memberIds: ['m-zhao'],
+            }),
+          );
+          await bindings.saveBinding({
+            botId: BOT_ID,
+            corpId: CORP_ID,
+            memberId: 'm-zhao',
+            accountId: 'a-zhao',
+            version: 1,
+            active: true,
+          });
+          await updateAccessPolicy(store, {
+            expectedVersion: null,
+            next: buildPolicy(1),
+            actor: 'pg17-e2e',
+            reason: 'init',
+            at: now().toISOString(),
+          });
+        } finally {
+          await openedAdmin.close();
+        }
 
-      const offline = createOfflineWsClient();
-      const imManager = new IMConnectionManager();
-      const groupsMap: Record<string, RegisteredGroup> = {};
-      const wiring = createRuntimeWiringHarness(groupsMap);
+        const offline = createOfflineWsClient();
+        const imManager = new IMConnectionManager();
+        const groupsMap: Record<string, RegisteredGroup> = {};
+        const wiring = createRuntimeWiringHarness(groupsMap);
 
-      const runtime = await startWeComFrontClawRuntime({
-        env: {
-          FRONT_CLAW_WECOM_ENABLED: '1',
-          FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
-          FRONT_CLAW_WECOM_BOT_SECRET: 'pg17-secret',
-          FRONT_CLAW_DATABASE_URL: cluster.url,
-          FRONT_CLAW_NOTIFY_DISPATCH: '0',
-        },
-        imManager,
-        ...wiring,
-        startMaintenance: false,
-        wecomConnection: { client: offline.client, leaseCheckIntervalMs: 50 },
-        bridgeOptions: { now },
-      });
-      expect(runtime).not.toBeNull();
-      expect(runtime!.bridge.driver).toBe('postgres');
-      expect(runtime!.bridge.leaseHeld()).toBe(true);
+        const runtime = await startWeComFrontClawRuntime({
+          env: {
+            FRONT_CLAW_WECOM_ENABLED: '1',
+            FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+            FRONT_CLAW_WECOM_BOT_SECRET: 'pg17-secret',
+            FRONT_CLAW_DATABASE_URL: cluster.url,
+            FRONT_CLAW_NOTIFY_DISPATCH: '0',
+          },
+          imManager,
+          ...wiring,
+          startMaintenance: false,
+          wecomConnection: { client: offline.client, leaseCheckIntervalMs: 50 },
+          bridgeOptions: { now },
+        });
+        try {
+          expect(runtime).not.toBeNull();
+          expect(runtime!.bridge.driver).toBe('postgres');
+          expect(runtime!.bridge.leaseHeld()).toBe(true);
 
-      offline.emitInboundText({
-        reqId: 'pg-req-1',
-        msgid: 'pg-msg-1',
-        userid: 'm-zhao',
-        content: '12号测试B店\n560（小赵）',
-      });
-      await waitUntil(() =>
-        offline.sent.some((f) => f.headers.req_id === 'pg-req-1'),
-      );
+          offline.emitInboundText({
+            reqId: 'pg-req-1',
+            msgid: 'pg-msg-1',
+            userid: 'm-zhao',
+            content: '12号测试B店\n560（小赵）',
+          });
+          await waitUntil(() =>
+            offline.sent.some((f) => f.headers.req_id === 'pg-req-1'),
+          );
 
-      offline.emitInboundText({
-        reqId: 'pg-req-2',
-        msgid: 'pg-msg-2',
-        userid: 'm-zhao',
-        content: '对',
-      });
-      await waitUntil(() =>
-        offline.sent.some(
-          (f) =>
-            f.headers.req_id === 'pg-req-2' &&
-            JSON.stringify(f.body).includes('已入账'),
-        ),
-      );
+          offline.emitInboundText({
+            reqId: 'pg-req-2',
+            msgid: 'pg-msg-2',
+            userid: 'm-zhao',
+            content: '对',
+          });
+          await waitUntil(() =>
+            offline.sent.some(
+              (f) =>
+                f.headers.req_id === 'pg-req-2' &&
+                JSON.stringify(f.body).includes('已入账'),
+            ),
+          );
+        } finally {
+          await runtime?.close();
+          await imManager.disconnectAll();
+        }
 
-      await runtime!.close();
-      await imManager.disconnectAll();
-    });
+        const verify = await openPerformanceStore(
+          { FRONT_CLAW_DATABASE_URL: cluster.url },
+          { requirePostgres: true },
+        );
+        try {
+          const entries = await verify.store.listEntries({
+            storeId: 's-b',
+            ownerPersonId: 'p-zhao',
+          });
+          expect(entries.map((e) => e.amount)).toContain(56000);
+          const leaseRaw = await verify.store.getConfig(CONSUMER_LEASE_KEY);
+          expect(parseLeaseRecord(leaseRaw)?.until).toBeLessThanOrEqual(
+            now().getTime(),
+          );
+        } finally {
+          await verify.close();
+        }
+      },
+      60_000,
+    );
   },
 );

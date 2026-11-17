@@ -31,7 +31,10 @@ const errorOf = (e: unknown) => {
 const echoCents=(text:string)=>yuanStringToCents(/共\s*([0-9.]+)元/.exec(text)?.[1]??'')??Number.NaN;
 const hashLock=(v: string) => {let h=0;for(let i=0;i<v.length;i++)h=(Math.imul(h,31)+v.charCodeAt(i))|0;return h;};
 
-it('APPEND: collect every synthetic PG scene and postcondition before asserting', async () => {
+const hasOwnedPg = process.env.APPEND_OWNED_PG === '1'
+  && /^postgres:\/\/append_synthetic@localhost:55482$/.test(process.env.APPEND_PG_BASE ?? '');
+
+it.skipIf(!hasOwnedPg)('APPEND: collect every synthetic PG scene and postcondition before asserting', async () => {
   const output=process.env.APPEND_EVIDENCE_DIR!;
   const runtime=process.env.APPEND_RUNTIME_DIR!;
   const base=process.env.APPEND_PG_BASE!;

@@ -43,12 +43,13 @@ it('R1-PG-a1（M03-P0-2/3 先后）：被代报人行被另一事务锁住并停
     const admin = await rawClient(url);
     await admin.query('BEGIN');
     await admin.query(`SELECT * FROM front_claw_perf.performance_people WHERE person_id='p-zhao' FOR UPDATE`);
-    const confirming = w.call('m-wang-yj', '对');
-    await waitForLockWait(url, '%performance_people%FOR SHARE%');
+    expect(await w.call('m-wang-yj', '对'), change).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+    expect(await entriesOf(url, draftId), change).toBe(0);
+    expect((await db.store.getDraft(draftId))!.status, change).toBe('pending');
     await admin.query(change === 'deactivate' ? `UPDATE front_claw_perf.performance_people SET active=false WHERE person_id='p-zhao'`
       : `UPDATE front_claw_perf.performance_people SET store_id='s-a', store_name='测试A店' WHERE person_id='p-zhao'`);
     await admin.query('COMMIT'); await admin.end();
-    expect(await confirming, change).toBe(ACCESS_DENIED);
+    expect([DENIED, ACCESS_DENIED], change).toContain(await w.call('m-wang-yj', '对'));
     expect(await entriesOf(url, draftId), change).toBe(0);
     expect((await db.store.getDraft(draftId))!.status, change).toBe('pending');
     await db.close();

@@ -94,44 +94,42 @@ it('真实PG：两个会话各起一张同内容草稿，在两个连接池上�
   await db.close(); await other.close();
 }, 60_000);
 
-it('真实PG先后：撤权事务先持策略行 FOR UPDATE，确认在提交事务里等锁 → 撤权提交后拒绝、零预约零提醒、草稿退回待确认', async () => {
+it('真实PG先后：撤权事务先持策略行 FOR UPDATE，确认因 NOWAIT 安全回滚零写入 → 撤权提交后再确认拒绝', async () => {
   const url = await freshDatabase(); const db = await open(url);
   const w = await worldM05({ store: db.store });
   await registerUnnamedAppointment(w, 'm-zhao', '明天三点有个客人要来');
   const admin = await rawClient(url);
   await admin.query('BEGIN');
   await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  const confirming = w.call('m-zhao', '对');
-  await waitForLockWait(url, '%FOR SHARE%');
+  expect(await w.call('m-zhao', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+  expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
+  expect((await db.store.listDrafts({ kind: 'appointment' }))[0]!.status).toBe('pending');
   await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(zhaoWith(2, 'revoked')), ACCESS_POLICY_KEY]);
   await admin.query('COMMIT'); await admin.end();
-  expect(await confirming).toBe(ACCESS_DENIED);
+  expect(await w.call('m-zhao', '对')).toBe(ACCESS_DENIED);
   expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
   expect((await db.store.listDrafts({ kind: 'appointment' }))[0]!.status).toBe('pending');
   await db.close();
-});
+}, 30_000);
 
-it('真实PG先后：撤权事务先持策略行 FOR UPDATE 并停用指定店长，确认在提交事务里等锁 → 预约成立、提醒按锁后策略不排队、最终回复如实', async () => {
+it('真实PG先后：撤权事务先持策略行 FOR UPDATE 并停用指定店长，确认因 NOWAIT 安全回滚 → 提交后再确认按新策略不排提醒', async () => {
   const url = await freshDatabase(); const db = await open(url);
   const w = await worldM05({ store: db.store });
   expect(await registerUnnamedAppointment(w, 'm-zhao', '明天三点有个客人要来')).toContain('苏晓禾');
   const admin = await rawClient(url);
   await admin.query('BEGIN');
   await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  const confirming = w.call('m-zhao', '对', 'mgr-lock');
-  await waitForLockWait(url, '%FOR SHARE%');
+  expect(await w.call('m-zhao', '对', 'mgr-lock')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+  expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
   await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(managerWith(2, 'suspended')), ACCESS_POLICY_KEY]);
   await admin.query('COMMIT'); await admin.end();
-  // R2（D77 策略版本钉住）：提交时策略版本已变 → 本次不登记、草稿仍待确认；按新策略重新确认才登记（此时指定店长已停用 → 不排提醒）。
-  expect(await confirming).toBe(POLICY_CHANGED);
-  expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
   const reply = await w.call('m-zhao', '对', 'mgr-lock-2');
   expect(reply).toContain('预约已登记'); expect(reply).not.toContain('已排队提醒');
   expect(await appts(url)).toBe(1); expect(await reminders(url)).toBe(0);
   const final = await w.call('m-zhao', '入账结果 mgr-lock-2');
   expect(final).toContain('预约已登记'); expect(final).not.toContain('已排队提醒');
   await db.close();
-});
+}, 30_000);
 
 it('真实PG竞态：确认与撤权（登记人）在两个独立连接池上同时发起 20 轮——要么登记且提醒 1 条，要么拒绝、零写、草稿待确认', async () => {
   const url = await freshDatabase(); const db = await open(url); const admin = await open(url);
@@ -150,7 +148,7 @@ it('真实PG竞态：确认与撤权（登记人）在两个独立连接池上�
     ]);
     if (reply.includes('预约已登记')) { tally.registered++; expect(await appts(url)).toBe(before.a + 1); expect(await reminders(url)).toBe(before.n + 1); }
     else {
-      tally.denied++; expect(reply).toBe(ACCESS_DENIED);
+      tally.denied++; expect([ACCESS_DENIED, 'Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。']).toContain(reply);
       expect(await appts(url)).toBe(before.a); expect(await reminders(url)).toBe(before.n);
       expect((await db.store.listDrafts({ kind: 'appointment', status: 'pending' }))).toHaveLength(1);
       await set('active'); expect(await w.call('m-zhao', '取消')).toContain('已取消');
@@ -179,7 +177,7 @@ it('真实PG竞态：确认与“指定店长被停用”同时发起 20 轮—�
     ]);
     // R2（D77）：预检后策略版本变了 → 本次不登记（POLICY_CHANGED，零写），按新策略再确认一次必登记；预约绝不回滚。
     let id = `rc-${round}`;
-    if (first === POLICY_CHANGED) {
+    if (first === POLICY_CHANGED || first.includes('争用已回滚')) {
       tally.policyChanged++;
       expect(await appts(url)).toBe(before.a); expect(await reminders(url)).toBe(before.n);
       id = `rc-${round}-b`;

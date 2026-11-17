@@ -103,7 +103,7 @@ it('真实PG：同一条「对」在两个连接池上同时重放 → 只一条
   await db.close(); await other.close();
 });
 
-it('真实PG先后①：撤权事务先持策略行 FOR UPDATE，更正确认在提交事务里等锁 → 撤权提交后拒绝、零修订、草稿退回待确认', async () => {
+it('真实PG先后①：撤权事务先持策略行 FOR UPDATE，更正确认因 NOWAIT 安全回滚零修订 → 撤权提交后再确认拒绝', async () => {
   const url = await freshDatabase(); const db = await open(url);
   const w = await worldM04({ store: db.store });
   await w.call('m-zhao', '880（小赵）'); await w.call('m-zhao', '对');
@@ -112,16 +112,18 @@ it('真实PG先后①：撤权事务先持策略行 FOR UPDATE，更正确认在
   const admin = await rawClient(url);
   await admin.query('BEGIN');
   await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  const confirming = w.call('m-zhao', '对');
-  await waitForLockWait(url, '%FOR SHARE%');
+  expect(await w.call('m-zhao', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+  expect(await newEntryAmount(db.store, entry.entryId)).toBe(88000);
+  expect(await count(url, `SELECT count(*)::int AS n FROM front_claw_perf.performance_revisions`)).toBe(0);
+  expect((await db.store.listDrafts({ kind: 'correction' }))[0]!.status).toBe('pending');
   await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(revokedZhao(2)), ACCESS_POLICY_KEY]);
   await admin.query('COMMIT'); await admin.end();
-  expect(await confirming).toBe(ACCESS_DENIED);
+  expect(await w.call('m-zhao', '对')).toBe(ACCESS_DENIED);
   expect(await newEntryAmount(db.store, entry.entryId)).toBe(88000);
   expect(await count(url, `SELECT count(*)::int AS n FROM front_claw_perf.performance_revisions`)).toBe(0);
   expect((await db.store.listDrafts({ kind: 'correction' }))[0]!.status).toBe('pending');
   await db.close();
-});
+}, 30_000);
 
 it('真实PG先后②：另一事务先锁住账目行并改了金额，更正确认等行锁后比对版本不符 → 作废、零修订、不覆盖', async () => {
   const url = await freshDatabase(); const db = await open(url);
@@ -166,7 +168,7 @@ it('真实PG竞态：更正确认与撤权在两个独立连接池上同时发�
     const amount = await newEntryAmount(db.store, entry.entryId);
     if (reply.includes('已改账')) { tally.committed++; expect(amount).toBe(700); expect(revisions).toBe(1); }
     else {
-      tally.denied++; expect(reply).toBe(ACCESS_DENIED); expect(amount).toBe((2000 + round) * 100); expect(revisions).toBe(0);
+      tally.denied++; expect([ACCESS_DENIED, 'Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。']).toContain(reply); expect(amount).toBe((2000 + round) * 100); expect(revisions).toBe(0);
       await grant(); expect(await w.call('m-zhao', '取消')).toContain('已取消');
     }
   }
