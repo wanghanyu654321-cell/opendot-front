@@ -499,6 +499,12 @@ import {
 import { getMergedTaskRunHistory } from './task-run-history.js';
 import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
 import {
+  WECOM_MANAGED_WORKSPACE_FOLDER,
+  type WeComFrontClawRuntimeHandle,
+  startWeComFrontClawRuntime,
+} from './wecom-front-claw-runtime.js';
+import { SAFE_MARKETING_DISALLOWED_TOOLS } from './wecom-front-claw-bridge.js';
+import {
   getScriptTaskHostExecutionError,
   resolveTaskExecutionModeForTarget,
   SCRIPT_TASK_HOST_REQUIRED_ERROR,
@@ -9656,7 +9662,19 @@ async function runAgent(
       logger.warn({ chatJid }, 'Computer capability unavailable for main chat');
     }
   }
-  const containerAgentProfile = toContainerAgentProfile(resolvedAgentProfile);
+  const rawContainerAgentProfile =
+    toContainerAgentProfile(resolvedAgentProfile);
+  const isWeComRestrictedTurn =
+    group.folder === WECOM_MANAGED_WORKSPACE_FOLDER ||
+    currentSourceJid?.startsWith('wecom:') === true ||
+    chatJid.startsWith('wecom:');
+  const containerAgentProfile =
+    isWeComRestrictedTurn && rawContainerAgentProfile
+      ? {
+          ...rawContainerAgentProfile,
+          disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
+        }
+      : rawContainerAgentProfile;
   const miniclawOwnerProfile = resolveMiniclawOwnerProfileForTurn({
     group,
     profile: resolvedAgentProfile,
@@ -9741,8 +9759,18 @@ async function runAgent(
   ipcWatcherManager?.watchGroup(group.folder);
   try {
     const executionMode = group.executionMode || 'container';
+    const useInprocessWeComSandbox =
+      executionMode === 'container' &&
+      !group.is_home &&
+      isWeComRestrictedTurn &&
+      process.env.FRONT_CLAW_WECOM_INPROCESS_SANDBOX === '1' &&
+      Array.isArray(containerAgentProfile?.disallowedTools) &&
+      containerAgentProfile.disallowedTools.length > 0 &&
+      !(await isDockerAvailable());
+    const useHostProcessRunner =
+      executionMode === 'host' || useInprocessWeComSandbox;
     const feishuCliAccountId =
-      executionMode === 'container'
+      executionMode === 'container' && !useInprocessWeComSandbox
         ? resolveFeishuCliBoundAccountId({
             channelContext,
             workspaceChannelAccountId: group.channel_account_id,
@@ -9754,8 +9782,8 @@ async function runAgent(
       identifier: string,
       selectedProviderId: string | null,
     ) => {
-      // 宿主机模式：containerName 传 null，走 process.kill() 路径
-      const containerName = executionMode === 'container' ? identifier : null;
+      // 宿主机模式或受控单容器沙箱进程：containerName 传 null，走 process.kill() 路径
+      const containerName = useHostProcessRunner ? null : identifier;
       queue.registerProcess(chatJid, proc, {
         containerName,
         groupFolder: group.folder,
@@ -9766,8 +9794,6 @@ async function runAgent(
     };
 
     const ownerHomeFolder = resolveOwnerHomeFolder(group);
-
-    let output: ContainerOutput;
 
     if (executionMode === 'host') {
       // Re-read the owner at the last possible point before spawning a host
@@ -9783,66 +9809,38 @@ async function runAgent(
         );
         return { status: 'error', error: HOST_EXECUTION_FORBIDDEN_ERROR };
       }
-      output = await runAgentWithModelFallback(
-        runHostAgent,
-        group,
-        {
-          prompt,
-          sessionId,
-          turnId,
-          queryRunId: queue.getActiveQueryId(chatJid) ?? undefined,
-          groupFolder: group.folder,
-          chatJid,
-          interactionMode,
-          currentSourceJid,
-          channelContext,
-          isMain: isAdminHome,
-          isHome,
-          isAdminHome,
-          miniclawBootstrapPending,
-          miniclawOwnerProfile,
-          miniclawOwnerProfileEnabled,
-          agentBuilderEnabled: resolvedAgentProfile?.is_default === true,
-          codingMcpEnabled: mainComputerEnabled,
-          images,
-          messageTaskId,
-          agentProfile: containerAgentProfile,
-        },
-        onProcessCb,
-        wrappedOnOutput,
-        ownerHomeFolder,
-      );
-    } else {
-      output = await runAgentWithModelFallback(
-        runContainerAgent,
-        group,
-        {
-          prompt,
-          sessionId,
-          turnId,
-          queryRunId: queue.getActiveQueryId(chatJid) ?? undefined,
-          groupFolder: group.folder,
-          chatJid,
-          interactionMode,
-          currentSourceJid,
-          channelContext,
-          isMain: isAdminHome,
-          isHome,
-          isAdminHome,
-          miniclawBootstrapPending,
-          miniclawOwnerProfile,
-          miniclawOwnerProfileEnabled,
-          agentBuilderEnabled: resolvedAgentProfile?.is_default === true,
-          codingMcpEnabled: mainComputerEnabled,
-          images,
-          messageTaskId,
-          agentProfile: containerAgentProfile,
-        },
-        onProcessCb,
-        wrappedOnOutput,
-        ownerHomeFolder,
-      );
     }
+
+    const runnerFn = useHostProcessRunner ? runHostAgent : runContainerAgent;
+    const output = await runAgentWithModelFallback(
+      runnerFn,
+      group,
+      {
+        prompt,
+        sessionId,
+        turnId,
+        queryRunId: queue.getActiveQueryId(chatJid) ?? undefined,
+        groupFolder: group.folder,
+        chatJid,
+        interactionMode,
+        currentSourceJid,
+        channelContext,
+        isMain: isAdminHome,
+        isHome,
+        isAdminHome,
+        miniclawBootstrapPending,
+        miniclawOwnerProfile,
+        miniclawOwnerProfileEnabled,
+        agentBuilderEnabled: resolvedAgentProfile?.is_default === true,
+        codingMcpEnabled: mainComputerEnabled,
+        images,
+        messageTaskId,
+        agentProfile: containerAgentProfile,
+      },
+      onProcessCb,
+      wrappedOnOutput,
+      ownerHomeFolder,
+    );
 
     // 仅从成功的最终输出中更新 session ID；
     // error 状态的输出可能携带 stale ID，覆盖流式阶段已写入的有效 session
@@ -20619,6 +20617,7 @@ async function main(): Promise<void> {
   }
   const productRuntime = startProductRuntimeService();
   const botHandoffs = startBotHandoffService(productRuntime);
+  let wecomFrontClawRuntime: WeComFrontClawRuntimeHandle | null = null;
 
   // Plugin catalog scan: one shot 5s after startup + every 1h thereafter.
   // Disabled when SystemSettings.pluginAutoScan = false; admin can still
@@ -20710,6 +20709,13 @@ async function main(): Promise<void> {
     // Keep IM transports connected through this phase: active runs may still
     // need the authenticated Feishu client to finalize their current card.
     await Promise.allSettled([
+      wecomFrontClawRuntime
+        ? wecomFrontClawRuntime
+            .close()
+            .catch((err) =>
+              logger.warn({ err }, 'Error shutting down WeCom Front Claw runtime'),
+            )
+        : Promise.resolve(),
       botHandoffs.close().then(() => productRuntime.close()),
       shutdownWebServer().catch((err) =>
         logger.warn({ err }, 'Error shutting down web server'),
@@ -22224,6 +22230,27 @@ async function main(): Promise<void> {
     ),
   );
   anyFeishuConnected = imManager.isAnyFeishuConnected();
+
+  try {
+    wecomFrontClawRuntime = await startWeComFrontClawRuntime({
+      imManager,
+      getGroup: (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+      registerGroup: (jid, group) => {
+        setRegisteredGroup(jid, group);
+        registeredGroups[jid] = group;
+      },
+      onNewChat: (userId, homeFolder) => buildOnNewChat(userId, homeFolder),
+      onCommand: handleCommand,
+      resolveGroupFolder: (jid) => resolveEffectiveFolder(jid),
+      resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+      onAgentMessage: buildOnAgentMessage(),
+    });
+  } catch (err) {
+    logger.error(
+      { err },
+      'Failed to start WeCom Front Claw native runtime; WeCom channel disabled',
+    );
+  }
 
   // Recovery order is intentional and forms a correctness boundary:
   // exact Bot account ready -> close cards left live by the old process ->

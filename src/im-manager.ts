@@ -1098,12 +1098,20 @@ export class IMConnectionManager {
       if (!user || user.status !== 'active') return false;
       if (!accountId) return true;
       const account = getChannelAccount(accountId);
-      return Boolean(
-        account &&
-        account.enabled &&
-        account.owner_user_id === userId &&
-        account.provider === channelType,
-      );
+      if (account) {
+        return Boolean(
+          account.enabled &&
+            account.owner_user_id === userId &&
+            account.provider === channelType,
+        );
+      }
+      if (channelType === 'wecom') {
+        const ch = this.connections
+          .get(userId)
+          ?.channels.get(this.channelKey('wecom', accountId));
+        return Boolean(ch?.isConnected());
+      }
+      return false;
     } catch (error) {
       logger.error(
         { error, userId, channelType, accountId },
@@ -1864,6 +1872,31 @@ export class IMConnectionManager {
     } else {
       await this.disconnectChannel(userId, 'wecom');
     }
+  }
+
+  async notifyUserWeCom(
+    userId: string,
+    botId: string,
+    memberId: string,
+    content: string,
+    scope: { signal: AbortSignal; deadline: number },
+    beforeSend: () => Promise<void>,
+  ): Promise<{
+    state: 'accepted' | 'rejected' | 'blocked' | 'unknown';
+    apiErrorCode: number | null;
+    detail: string;
+  }> {
+    const channel = this.connections
+      .get(userId)
+      ?.channels.get(this.channelKey('wecom', botId));
+    if (!channel?.notifyMember) {
+      return {
+        state: 'blocked',
+        apiErrorCode: null,
+        detail: 'wecom_channel_not_connected',
+      };
+    }
+    return channel.notifyMember(memberId, content, scope, beforeSend);
   }
 
   /**

@@ -243,6 +243,8 @@ export interface ContainerInput {
     includeClaudePreset: boolean;
     /** Opaque host-normalized policy; retained only for runtime provenance. */
     runtimePolicy?: unknown;
+    /** Host-authoritative list of disallowed built-in or external tool names. */
+    disallowedTools?: readonly string[];
   };
   /**
    * True only for an interactive turn in the built-in Miniclaw Home

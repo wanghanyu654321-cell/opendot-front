@@ -580,7 +580,7 @@ export class MemoryPerformanceStore implements PerformanceStore {
     return clone(this.storeTargets.filter(row => storeId === undefined || row.storeId === storeId));
   }
   async commitConfirmingStoreTarget(draft: Draft, target: StoreTarget, expectedBefore: { amount: number; setBy: string; updatedAt: string } | null, guard?: CommitGuard): Promise<LedgerCommit> {
-    if (this.guardDenied(draft, guard)) return 'denied';
+    if (!await this.checkGuardSnapshot(draft, guard)) return 'denied';
     const index = this.drafts.findIndex(row => row.draftId === draft.draftId);
     if (index < 0 || this.drafts[index]!.status !== 'confirming') return 'already';
     const current = this.storeTargets.find(row => row.storeId === target.storeId && row.periodMonth === target.periodMonth) ?? null;
@@ -669,12 +669,12 @@ export class MemoryPerformanceStore implements PerformanceStore {
     draft.status = 'confirming';
     return clone(draft);
   }
-  private snapshotFor(guard: CommitGuard): GateSnapshot {
+  private snapshotFor(guard: CommitGuard, validatedBinding?: Readonly<WecomBotBinding>): GateSnapshot {
     const config: Record<string, string | null> = {};
     for (const key of guardKeys(guard)) config[key] = this.config.get(key) ?? null;
     const people: Record<string, Person | null> = {};
     for (const id of guard.personIds ?? []) people[id] = clone(this.people.find(row => row.personId === id) ?? null);
-    return { config, people };
+    return { config, people, ...(validatedBinding ? { binding: clone(validatedBinding) } : {}) };
   }
   /** R4：补偿只在本消费者仍是当前持有者时才把 confirming 退回 pending。 */
   private fenceHeld(guard?: CommitGuard): boolean {
@@ -689,17 +689,25 @@ export class MemoryPerformanceStore implements PerformanceStore {
     current.status = 'pending'; current.closedAt = null;
     return true;
   }
+  /**
+   * 内存库没有独立 binding 表；若调用方提供了 validate（如 OpenDot adapter.validateBinding），
+   * 先在提交前实时复核 binding，通过后再将已验 binding 放入快照；未提供 validate 但带 guard.binding 时仍失败关闭。
+   */
+  private async checkGuardSnapshot(draft: Draft, guard?: CommitGuard): Promise<GateSnapshot | null> {
+    if (guard?.validate && !await guard.validate()) {
+      this.revertIfCurrentHolder(draft, guard);
+      return null;
+    }
+    const snapshot = guard ? this.snapshotFor(guard, guard.validate ? guard.binding : undefined) : { config: {}, people: {} };
+    if (guard && (!guardPasses(guard, snapshot) || (guard.fence && !this.fenceHeld(guard)))) {
+      this.revertIfCurrentHolder(draft, guard);
+      return null;
+    }
+    return snapshot;
+  }
   async commitConfirmingDraft(draft: Draft, entries: readonly LedgerEntry[], guard?: CommitGuard): Promise<number> {
+    if (!await this.checkGuardSnapshot(draft, guard)) return -1;
     const current = this.drafts.find(row => row.draftId === draft.draftId);
-    if (guard && !guardPasses(guard, this.snapshotFor(guard))) {
-      this.revertIfCurrentHolder(draft, guard);
-      return -1;
-    }
-    if (guard?.fence && !this.fenceHeld(guard)) {
-      // 补偿仍走比对当前持有者的入口：失权则 0 行，不打扰新持有者。
-      this.revertIfCurrentHolder(draft, guard);
-      return -1;
-    }
     if (current?.status !== 'confirming') {
       // R17 / D151：不是本次把 confirming 改成 confirmed，返回 0，不把已有行数当成这次写入。
       return 0;
@@ -736,16 +744,8 @@ export class MemoryPerformanceStore implements PerformanceStore {
     row.status = 'void'; row.closedAt = closedAt;
     row.payload = { ...row.payload, outcome: 'conflict' } as DraftPayload;
   }
-  private guardDenied(draft: Draft, guard?: CommitGuard): boolean {
-    if (guard && !guardPasses(guard, this.snapshotFor(guard))) {
-      this.revertIfCurrentHolder(draft, guard);
-      return true;
-    }
-    if (guard?.fence && !this.fenceHeld(guard)) return true;
-    return false;
-  }
   async commitConfirmingTarget(draft: Draft, target: Target, expectedBefore: TargetPayload['before'], guard?: CommitGuard): Promise<LedgerCommit> {
-    if (this.guardDenied(draft, guard)) return 'denied';
+    if (!await this.checkGuardSnapshot(draft, guard)) return 'denied';
     const index = this.drafts.findIndex(row => row.draftId === draft.draftId);
     if (index < 0 || this.drafts[index]!.status !== 'confirming') return 'already';
     const current = this.targets.find(row => row.storeId === target.storeId && row.personId === target.personId && row.periodMonth === target.periodMonth) ?? null;
@@ -757,7 +757,7 @@ export class MemoryPerformanceStore implements PerformanceStore {
     return 'committed';
   }
   async commitConfirmingCorrection(draft: Draft, writes: readonly CorrectionWrite[], meta: { editorPersonId: string; reason: string; createdAt: string }, notices: readonly Notification[], guard?: CommitGuard): Promise<LedgerCommit> {
-    if (this.guardDenied(draft, guard)) return 'denied';
+    if (!await this.checkGuardSnapshot(draft, guard)) return 'denied';
     const index = this.drafts.findIndex(row => row.draftId === draft.draftId);
     if (index < 0 || this.drafts[index]!.status !== 'confirming') return 'already';
     for (const write of writes) {
@@ -774,7 +774,8 @@ export class MemoryPerformanceStore implements PerformanceStore {
   }
   async commitConfirmingAppointments(draft: Draft, appointments: readonly Appointment[], options?: AppointmentCommitOptions): Promise<AppointmentCommit> {
     if (options) {
-      if (this.guardDenied(draft, options.guard)) return { total: 0, claimed: false, outcome: 'denied', noticesWritten: 0 };
+      const snapshot = await this.checkGuardSnapshot(draft, options.guard);
+      if (!snapshot) return { total: 0, claimed: false, outcome: 'denied', noticesWritten: 0 };
       const index = this.drafts.findIndex(row => row.draftId === draft.draftId);
       if (index < 0 || this.drafts[index]!.status !== 'confirming') return { total: 0, claimed: false, outcome: 'already', noticesWritten: 0 };
       if (appointments.some(appointment => this.appointments.some(row => row.appointmentId === appointment.appointmentId))) {
@@ -784,7 +785,6 @@ export class MemoryPerformanceStore implements PerformanceStore {
       }
       this.drafts[index] = clone(draft);
       for (const appointment of appointments) this.appointments.push(clone(appointment));
-      const snapshot = options.guard ? this.snapshotFor(options.guard) : { config: {}, people: {} };
       const raw = options.guard ? snapshot.config[options.guard.key] ?? null : null;
       let noticesWritten = 0;
       for (const notice of options.notices) {

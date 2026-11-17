@@ -221,6 +221,17 @@ export interface IMChannel {
     context: ChannelTurnContext,
     request: FeishuCapabilityRequest,
   ): Promise<FeishuCapabilityResult>;
+  /** Dispatch a single proactive notification through a connected WeCom bot. */
+  notifyMember?(
+    memberId: string,
+    content: string,
+    scope: { signal: AbortSignal; deadline: number },
+    beforeSend: () => Promise<void>,
+  ): Promise<{
+    state: 'accepted' | 'rejected' | 'blocked' | 'unknown';
+    apiErrorCode: number | null;
+    detail: string;
+  }>;
 }
 
 export interface ChannelMessageDeliveryOptions {
@@ -1404,6 +1415,27 @@ export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
 
     async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
       // WeCom intelligent bot WebSocket protocol does not expose typing indicators
+    },
+
+    async notifyMember(
+      memberId: string,
+      content: string,
+      scope: { signal: AbortSignal; deadline: number },
+      beforeSend: () => Promise<void>,
+    ) {
+      if (!inner?.notify) {
+        return {
+          state: 'blocked' as const,
+          apiErrorCode: null,
+          detail: 'wecom_channel_not_connected',
+        };
+      }
+      const outcome = await inner.notify(memberId, content, scope, beforeSend);
+      return {
+        state: outcome.state,
+        apiErrorCode: outcome.apiErrorCode,
+        detail: outcome.detail,
+      };
     },
 
     isConnected(): boolean {

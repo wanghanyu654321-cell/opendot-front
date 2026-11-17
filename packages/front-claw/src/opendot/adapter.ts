@@ -204,12 +204,17 @@ export async function startFrontClawOpenDotService(host: OpenDotHost, deps: Adap
     const deadline = performance.now() + requestTimeoutMs;
     const logInbound = async (reason?: string) => {
       const observation = reason ? undefined : observations.get(event.messageId);
-      if (!reason) observations.delete(event.messageId);
+      if (!reason || reason === 'timeout' || reason === 'cancelled' || reason === 'failed') {
+        observations.delete(event.messageId);
+      }
+      const seq = observation?.pendingSequence ?? (await pendingArrival?.catch(() => undefined))?.sequence ?? null;
       try { host.logger.info({ event: 'inbound_message',
         route: observation?.route ?? '追问',
-        gateReason: reason ?? (observation?.gateReason === 'not_applicable' ? 'not_applicable' : 'permission'),
+        gateReason: reason ?? observation?.gateReason ?? 'not_applicable',
+        pendingSequence: seq,
+        modelMs: observation?.modelMs ?? 0,
         ...(denial ? { identityReason: denial } : {}),
-        errorCategory: reason === 'failed' ? 'processing_error' : reason === 'timeout' || reason === 'cancelled' ? reason : 'none' }); } catch { /* Logs cannot change business results. */ }
+        errorCategory: reason === 'failed' ? 'processing_error' : reason === 'timeout' || reason === 'cancelled' ? reason : (observation?.errorCategory ?? 'none') }); } catch { /* Logs cannot change business results. */ }
     };
     if (closing) { stats.droppedClosing++; void logInbound('closing'); return; }
     // 旧消费者（租约本地已过期）不做任何业务写入，也不回复。

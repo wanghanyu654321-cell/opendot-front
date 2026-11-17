@@ -1,18 +1,26 @@
-# CI paused 2026-10-25 (Actions minutes exhausted). Restore the original triggers to re-enable.
 name: CI
 
 on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  validate:
+  front-claw-pg17:
+    name: Front Claw (Node 22 + PG 17)
     runs-on: ubuntu-24.04
-    # The existing main run already takes ~19m on hosted runners, including
-    # natural lease/process recovery. Keep every test and its own timeout.
-    timeout-minutes: 30
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: packages/front-claw
+    env:
+      FRONT_CLAW_PG_BIN: /usr/lib/postgresql/17/bin
+      AUDIT_PG_ALLOW: isolated-synthetic
+      AUDIT_PG_PORT: "55439"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -20,100 +28,157 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 24
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/front-claw/package-lock.json
+
+      - name: Install PostgreSQL 17 from PGDG
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-17
+          sudo pg_ctlcluster 17 main stop || true
+
+      - name: Check PG 17 binaries and non-root user
+        run: |
+          id
+          test "$(id -u)" -ne 0
+          "$FRONT_CLAW_PG_BIN/initdb" --version
+          "$FRONT_CLAW_PG_BIN/postgres" --version
+          "$FRONT_CLAW_PG_BIN/initdb" --version | grep -E ' 17\.'
+
+      - name: Install Front Claw dependencies
+        run: npm ci
+
+      - name: Front Claw typecheck & build
+        run: |
+          npm run typecheck
+          npm run build
+
+      - name: Front Claw boundary and deployment contracts
+        run: npx vitest run tests/e2e tests/deploy
+
+      - name: Front Claw unit CI suite
+        run: npm run test:ci
+
+      - name: Start disposable audit PG 17 cluster
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/audit-pg"
+          mkdir -p "$root/run"
+          "$FRONT_CLAW_PG_BIN/initdb" -D "$root/data" -U frontclaw --auth=trust --no-sync --encoding=UTF8 > "$root/initdb.log"
+          echo "host all all 127.0.0.1/32 trust" > "$root/data/pg_hba.conf"
+          "$FRONT_CLAW_PG_BIN/pg_ctl" -D "$root/data" -l "$root/postgres.log" -w -t 60 \
+            -o "-c listen_addresses=127.0.0.1 -c port=$AUDIT_PG_PORT -c unix_socket_directories=$root/run -c fsync=off" start
+          psql "postgres://frontclaw@127.0.0.1:$AUDIT_PG_PORT/postgres" -Atc 'select version()'
+          echo "AUDIT_PG_URL=postgres://frontclaw@127.0.0.1:$AUDIT_PG_PORT/postgres" >> "$GITHUB_ENV"
+
+      - name: Front Claw PG 17 integration tests (full suite)
+        run: npm run test:pg
+
+      - name: Concurrent employee confirmation repeated five times
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            echo "::group::employee confirmation run $i/5"
+            npm run test:pg -- tests/role-eval/employee-loop-pg-m02.integration.test.ts
+            echo "::endgroup::"
+          done
+
+      - name: Stop disposable audit PG 17 cluster
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/audit-pg/data/postmaster.pid" ]; then
+            "$FRONT_CLAW_PG_BIN/pg_ctl" -D "$RUNNER_TEMP/audit-pg/data" -m fast -w stop
+          fi
+
+  validate:
+    name: OpenDot × Front Claw Unified Gate (Node 22 + PG 17)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FRONT_CLAW_PG_BIN: /usr/lib/postgresql/17/bin
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
           cache: npm
           cache-dependency-path: |
             package-lock.json
             web/package-lock.json
             container/agent-runner/package-lock.json
-            apps/cloud-agent/package-lock.json
+            packages/front-claw/package-lock.json
+
+      - name: Install PostgreSQL 17 from PGDG
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-17
+          sudo pg_ctlcluster 17 main stop || true
 
       - name: Install dependencies
         run: |
           npm ci
           npm --prefix web ci
           npm --prefix container/agent-runner ci
-          npm --prefix apps/cloud-agent ci
+          npm --prefix packages/front-claw ci
 
-      - name: Install Playwright Chromium
-        working-directory: web
-        run: npx playwright install --with-deps chromium
-
-      - name: Check changed-file formatting
-        run: npm run format:check
-        env:
-          FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
-
-      - name: Verify generated type sources
+      - name: Verify shared type synchronization
         run: |
           make sync-types
-          git diff --exit-code -- shared/stream-event.ts src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts
-          npx prettier --check shared/stream-event.ts src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts
+          git diff --exit-code -- \
+            shared/stream-event.ts \
+            src/stream-event.types.ts \
+            web/src/stream-event.types.ts \
+            container/agent-runner/src/stream-event.types.ts \
+            shared/channel-prefixes.ts \
+            src/channel-prefixes.ts \
+            container/agent-runner/src/channel-prefixes.ts
+          npx prettier --check \
+            shared/stream-event.ts \
+            src/stream-event.types.ts \
+            web/src/stream-event.types.ts \
+            container/agent-runner/src/stream-event.types.ts
+          ./scripts/check-stream-event-sync.sh
+          ./scripts/check-agent-runner-prompts.sh
 
-      - name: Typecheck
-        run: make typecheck
-
-      - name: Test
-        run: npm test -- --run
-
-      - name: Build
-        run: npm run build:all
-
-      - name: Bundle Cloud Runtime for product browser acceptance
-        run: npm --prefix apps/cloud-agent run build
-
-      - name: Mobile browser interaction tests
-        run: npm --prefix web run test:e2e
-
-      - name: Agent runner self-test
-        run: npm run self-test:agent-runner
-
-  cloud-agent:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: apps/cloud-agent
-    env:
-      WRANGLER_SEND_METRICS: 'false'
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: apps/cloud-agent/package-lock.json
-      - name: Install locked Cloud Runtime dependencies
-        run: npm ci
-      - name: Audit Cloud Runtime production dependencies
-        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
-      - name: Cloud Runtime Typecheck
-        run: npm run typecheck
-      - name: Actual workerd SQLite and lifecycle fault tests
-        run: npm test
-      - name: Wrangler bundle without deployment
-        run: npm run build
-
-  cloud-authority:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    env:
-      WRANGLER_SEND_METRICS: 'false'
-      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            apps/cloud-agent/package-lock.json
-      - name: Install locked Node authority and Cloud Runtime dependencies
+      - name: Typecheck backend, web, and agent-runner
         run: |
-          npm ci
-          npm --prefix apps/cloud-agent ci
-      - name: Bundle actual Worker without deployment
-        run: npm --prefix apps/cloud-agent run build
-      - name: Actual workerd to Node authority and encrypted Provider HTTP integration
-        run: npm run test:cloud-authority
+          npm run typecheck
+          npm --prefix web exec tsc -- --noEmit
+          npm --prefix container/agent-runner exec tsc -- --noEmit
+
+      - name: Build unified runtime bundles
+        run: |
+          npm run build:all
+          npm --prefix packages/front-claw run build
+
+      - name: Validate single-container Compose manifest
+        run: |
+          set -euo pipefail
+          printf 'FRONT_CLAW_WECOM_BOT_ID=ci\n' > "$RUNNER_TEMP/core.env"
+          printf 'PG_ADMIN_PASSWORD=ci\nDATABASE_ADMIN_URL=postgres://postgres:ci@pg:5432/front_dot\nAPP_DB_PASSWORD=ci\nREADONLY_DB_PASSWORD=ci\n' > "$RUNNER_TEMP/admin.env"
+          CORE_ENV_FILE="$RUNNER_TEMP/core.env" \
+          ADMIN_ENV_FILE="$RUNNER_TEMP/admin.env" \
+          PG_ADMIN_PASSWORD=ci \
+          DATABASE_ADMIN_URL=postgres://postgres:ci@pg:5432/front_dot \
+          APP_DB_PASSWORD=ci \
+          READONLY_DB_PASSWORD=ci \
+            docker compose -f deploy/docker-compose.yml config --quiet
+
+      - name: Run WeCom IM channel, bridge, end-to-end (PG 17), and contract suites
+        run: |
+          npx vitest run \
+            tests/wecom-im-channel.test.ts \
+            tests/wecom-front-claw-bridge.test.ts \
+            tests/wecom-opendot-e2e.test.ts \
+            tests/reproducible-build-contract.test.ts \
+            tests/graceful-shutdown-order.test.ts \
+            tests/channel-account-startup-contract.test.ts

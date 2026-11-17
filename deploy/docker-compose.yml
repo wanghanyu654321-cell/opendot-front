@@ -1,0 +1,116 @@
+name: opendot-front-claw
+
+services:
+  pg:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: front_dot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:?required}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=40
+      - -c
+      - wal_keep_size=64MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d front_dot"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 512m
+    restart: unless-stopped
+
+  core:
+    image: opendot-front:${OPENDOT_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      pg:
+        condition: service_healthy
+    networks:
+      - private
+      - outbound
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    deploy:
+      replicas: 1
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Shanghai
+      HOME: /app/data/home
+      WEB_PORT: "3000"
+      FRONT_CLAW_WECOM_ENABLED: "1"
+      FRONT_CLAW_WECOM_INPROCESS_SANDBOX: "1"
+      FRONT_CLAW_OPENDOT_ADAPTER: "1"
+      FRONT_CLAW_WECOM_WORKSPACE_JID: web:wecom-front-claw
+    env_file:
+      - ${CORE_ENV_FILE:?required}
+    volumes:
+      - opendot_data:/app/data
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    stop_grace_period: 30s
+    mem_limit: 768m
+    restart: unless-stopped
+
+  admin:
+    image: opendot-front:${OPENDOT_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    profiles:
+      - tools
+    depends_on:
+      pg:
+        condition: service_healthy
+    networks:
+      - private
+    working_dir: /app/packages/front-claw
+    entrypoint: ["node", "dist/standalone/admin.js"]
+    environment:
+      DATABASE_ADMIN_URL: ${DATABASE_ADMIN_URL:?required}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?required}
+      READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD:?required}
+    env_file:
+      - ${ADMIN_ENV_FILE:?required}
+    read_only: true
+    tmpfs:
+      - /tmp
+
+networks:
+  private:
+    internal: true
+  outbound: {}
+
+volumes:
+  pgdata: {}
+  opendot_data: {}

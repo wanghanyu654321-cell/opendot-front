@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { WSClient, WsCmd, type WsFrame } from '@wecom/aibot-node-sdk';
-import { storeChatMetadata, storeMessageDirect } from './db.js';
+import {
+  hasStoredMessage,
+  storeChatMetadata,
+  storeMessageDirect,
+} from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
@@ -122,6 +126,12 @@ export interface WeComConnection {
     text: string,
     localImagePaths?: string[],
   ): Promise<void>;
+  notify?(
+    memberId: string,
+    content: string,
+    scope: BotReadScope,
+    beforeSend: () => Promise<void>,
+  ): Promise<BotSendOutcome>;
   isConnected(): boolean;
 }
 
@@ -704,6 +714,8 @@ export function createWeComConnection(
   let leaseRenewTimer: ReturnType<typeof setInterval> | null = null;
   let stopping = false;
   let closed = true;
+  const admittedPassKeys = new Set<string>();
+  const MAX_ADMITTED_PASS_KEYS = 2048;
 
   function disconnectSync(): void {
     if (closed && !client && !leaseCheckTimer && !leaseRenewTimer) return;
@@ -1048,6 +1060,28 @@ export function createWeComConnection(
     if (targetJid !== jid) {
       storeChatMetadata(targetJid, timestamp, chatName);
     }
+    const passDedupeKey = `${targetJid}\0${inboundEvent.messageId}`;
+    let alreadyStored = admittedPassKeys.has(passDedupeKey);
+    if (!alreadyStored) {
+      try {
+        alreadyStored = hasStoredMessage?.(targetJid, inboundEvent.messageId) === true;
+      } catch {
+        alreadyStored = false;
+      }
+    }
+    if (alreadyStored) {
+      logger.debug(
+        { botId, targetJid, messageId: inboundEvent.messageId },
+        'Duplicate WeCom inbound pass message ignored',
+      );
+      return;
+    }
+    admittedPassKeys.add(passDedupeKey);
+    if (admittedPassKeys.size > MAX_ADMITTED_PASS_KEYS) {
+      const oldest = admittedPassKeys.values().next().value;
+      if (oldest !== undefined) admittedPassKeys.delete(oldest);
+    }
+
     storeMessageDirect(
       inboundEvent.messageId,
       targetJid,
@@ -1245,6 +1279,42 @@ export function createWeComConnection(
         return;
       }
       await sendProactiveText(chatId, memberId, text);
+    },
+
+    async notify(
+      memberId: string,
+      content: string,
+      scope: BotReadScope,
+      beforeSend: () => Promise<void>,
+    ): Promise<BotSendOutcome> {
+      if (!ensureLeaseHeld() || stopping || closed || !sender || !sdk?.ready()) {
+        return {
+          state: 'blocked',
+          apiErrorCode: null,
+          msgid: null,
+          detail: 'wecom_channel_not_connected',
+        };
+      }
+
+      const outcome = await sender.notify(memberId, content, scope, async () => {
+        if (!ensureLeaseHeld() || stopping || closed || !sdk?.ready()) {
+          throw new Error('channel_closed');
+        }
+        await beforeSend();
+      });
+
+      if (outcome.state === 'unknown') {
+        logger.warn(
+          {
+            botId,
+            memberId,
+            detail: outcome.detail,
+          },
+          'WeCom proactive notify ACK timed out (state=unknown); not retrying',
+        );
+      }
+
+      return outcome;
     },
 
     isConnected(): boolean {

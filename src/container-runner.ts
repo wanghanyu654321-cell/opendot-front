@@ -405,6 +405,8 @@ export interface ContainerInput {
     /** Null means inherit the system default model configuration. */
     modelConfigId?: string | null;
     runtimePolicy?: AgentProfileRuntimePolicy;
+    /** Host-authoritative list of disallowed built-in or external tool names. */
+    disallowedTools?: readonly string[];
   };
   /**
    * True only for an interactive turn in the built-in Miniclaw Home
@@ -776,6 +778,35 @@ function getAgentProfileMcpPolicyMode(
   agentProfile?: RunnerAgentProfile,
 ): 'inherit' | 'custom' | 'disabled' {
   return agentProfile?.runtimePolicy?.mcp.mode ?? 'inherit';
+}
+
+export function getAgentProfileDisallowedTools(
+  agentProfile?: Pick<RunnerAgentProfile, 'disallowedTools'>,
+): string[] {
+  if (!Array.isArray(agentProfile?.disallowedTools)) return [];
+  const seen = new Set<string>();
+  for (const raw of agentProfile.disallowedTools) {
+    const trimmed = typeof raw === 'string' ? raw.trim() : '';
+    if (trimmed) seen.add(trimmed);
+  }
+  return [...seen];
+}
+
+const RESTRICTED_SECRET_ENV_PATTERNS: readonly RegExp[] = [
+  /^FRONT_CLAW_/i,
+  /^DATABASE_URL$/i,
+  /^PG(?:HOST|HOSTADDR|PORT|USER|PASSWORD|DATABASE|PASSFILE|SERVICE|SSLMODE|SSLCERT|SSLKEY|SSLROOTCERT|OPTIONS|APPNAME|CONNECT_TIMEOUT)?$/i,
+  /^CORE_ENV_FILE$/i,
+  /^ADMIN_ENV_FILE$/i,
+  /^WECOM_BOT_SECRET$/i,
+];
+
+export function scrubFrontClawSecretsFromEnv(env: Record<string, string>): void {
+  for (const key of Object.keys(env)) {
+    if (RESTRICTED_SECRET_ENV_PATTERNS.some((pattern) => pattern.test(key))) {
+      delete env[key];
+    }
+  }
 }
 
 /**
@@ -1427,6 +1458,22 @@ export function buildVolumeMounts(
   const mcpPolicyMode = getAgentProfileMcpPolicyMode(agentProfile);
   if (mcpPolicyMode !== 'inherit') {
     envLines.push(`MINICLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
+  }
+  const disallowedTools = getAgentProfileDisallowedTools(agentProfile);
+  if (disallowedTools.length > 0) {
+    envLines.push(
+      `MINICLAW_AGENT_DISALLOWED_TOOLS=${JSON.stringify(disallowedTools)}`,
+    );
+    for (let index = envLines.length - 1; index >= 0; index -= 1) {
+      const line = envLines[index] ?? '';
+      const eqIdx = line.indexOf('=');
+      if (eqIdx > 0) {
+        const key = line.slice(0, eqIdx);
+        if (RESTRICTED_SECRET_ENV_PATTERNS.some((p) => p.test(key))) {
+          envLines.splice(index, 1);
+        }
+      }
+    }
   }
   applyFallbackModelToEnvLines(envLines);
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
@@ -2533,6 +2580,7 @@ export async function runHostAgent(
   // from the Miniclaw parent process leak into a host-mode child after the
   // user switches providers (especially third-party -> official OAuth).
   clearInheritedClaudeProviderEnv(hostEnv);
+  scrubFrontClawSecretsFromEnv(hostEnv);
 
   // Strip macOS launch-context vars that must not be inherited by child
   // processes. When miniclaw is started by a background process manager
@@ -2717,6 +2765,12 @@ export async function runHostAgent(
     delete hostEnv['MINICLAW_AGENT_MCP_POLICY'];
     if (hostMcpPolicyMode !== 'inherit') {
       hostEnv['MINICLAW_AGENT_MCP_POLICY'] = hostMcpPolicyMode;
+    }
+    const disallowedTools = getAgentProfileDisallowedTools(input.agentProfile);
+    if (disallowedTools.length > 0) {
+      hostEnv['MINICLAW_AGENT_DISALLOWED_TOOLS'] =
+        JSON.stringify(disallowedTools);
+      scrubFrontClawSecretsFromEnv(hostEnv);
     }
 
     // 路径映射

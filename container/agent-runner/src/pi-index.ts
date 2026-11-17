@@ -39,6 +39,11 @@ import { adaptClaudeMcpToolsToPi } from './runtime/pi/pi-tools.js';
 import { PiRuntimeAdapter } from './runtime/pi/pi-runtime.js';
 import { loadExternalMcpTools } from './runtime/pi/external-mcp.js';
 import { runPiQueryAttempt } from './runtime/pi/pi-runner.js';
+import {
+  DEFAULT_ALLOWED_TOOLS,
+  isToolDisallowed,
+  resolveDisallowedToolSet,
+} from './tool-policy.js';
 
 const WORKSPACE_GROUP =
   process.env.MINICLAW_WORKSPACE_GROUP || '/workspace/group';
@@ -52,20 +57,6 @@ const INTERRUPT_SENTINEL = path.join(INPUT_DIR, '_interrupt');
 const DRAIN_SENTINEL = path.join(INPUT_DIR, '_drain');
 const OUTPUT_START = '---MINICLAW_OUTPUT_START---';
 const OUTPUT_END = '---MINICLAW_OUTPUT_END---';
-const DEFAULT_ALLOWED_TOOLS = [
-  'Bash',
-  'Read',
-  'Write',
-  'Edit',
-  'Glob',
-  'Grep',
-  'WebSearch',
-  'WebFetch',
-  'Task',
-  'TaskOutput',
-  'TaskStop',
-  'mcp__miniclaw__*',
-];
 const PROMPTS_DIR = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   '..',
@@ -272,9 +263,11 @@ function buildSystemPrompt(input: ContainerInput, ctx: McpContext): string {
       : input.interactionMode === 'proactive'
         ? loadPrompt('output.proactive.md')
         : loadPrompt('output.assistant.md'),
-    backgroundTasks: DEFAULT_ALLOWED_TOOLS.includes('Task')
-      ? loadPrompt('background-tasks.md')
-      : undefined,
+    backgroundTasks:
+      DEFAULT_ALLOWED_TOOLS.includes('Task') &&
+      !isToolDisallowed('Task', resolveDisallowedToolSet(input).canonicalLower)
+        ? loadPrompt('background-tasks.md')
+        : undefined,
     channel: channelPrompt
       ? {
           id: channel,
@@ -342,6 +335,14 @@ async function runTurn(
     latestIpcDeliveryId(initialMessages) || input.turnId || generateTurnId();
   ctx.currentInputTurnId = activeInputTurnId;
   let firstWakeAcknowledgementStarted = false;
+  const disallowedPolicy = resolveDisallowedToolSet(input);
+  const effectiveAllowedTools = [
+    ...DEFAULT_ALLOWED_TOOLS,
+    ...externalTools.map((tool) => tool.name),
+  ].filter((name) => !isToolDisallowed(name, disallowedPolicy.canonicalLower));
+  const effectiveCustomTools = [...customTools, ...externalTools].filter(
+    (tool) => !isToolDisallowed(tool.name, disallowedPolicy.canonicalLower),
+  );
   const result = await runPiQueryAttempt({
     runtime,
     sessionOptions: {
@@ -353,11 +354,11 @@ async function runTurn(
       sessionId: input.sessionId,
       model: provider.model || undefined,
       systemPrompt: buildSystemPrompt(input, ctx),
-      allowedTools: [
-        ...DEFAULT_ALLOWED_TOOLS,
-        ...externalTools.map((tool) => tool.name),
-      ],
-      customTools: [...customTools, ...externalTools],
+      allowedTools: effectiveAllowedTools,
+      ...(disallowedPolicy.rawList.length > 0
+        ? { excludedTools: disallowedPolicy.rawList }
+        : {}),
+      customTools: effectiveCustomTools,
       provider: {
         endpointKind: provider.endpointKind,
         api: provider.modelApi,
