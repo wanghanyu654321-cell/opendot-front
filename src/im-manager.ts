@@ -18,6 +18,7 @@ import {
   createDiscordChannel,
   isDiscordChannel,
   createWhatsAppChannel,
+  createWeComChannel,
 } from './im-channel.js';
 import type {
   DiscordHistoryMessage,
@@ -40,6 +41,7 @@ import {
   type WhatsAppConnectionConfig,
   type WhatsAppConnectionState,
 } from './whatsapp.js';
+import type { WeComConnectionConfig } from './wecom.js';
 import { rm } from 'fs/promises';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
@@ -128,6 +130,10 @@ export interface WhatsAppConnectConfig {
   authDir?: string;
   enabled?: boolean;
 }
+
+export type WeComConnectConfig = WeComConnectionConfig & {
+  enabled?: boolean;
+};
 
 /**
  * Re-export from src/whatsapp.ts as the canonical state shape.
@@ -1784,6 +1790,83 @@ export class IMConnectionManager {
   }
 
   /**
+   * Connect a WeCom intelligent bot long-connection instance for a specific user.
+   */
+  async connectUserWeCom(
+    userId: string,
+    config: WeComConnectConfig,
+    onNewChat: (chatJid: string, chatName: string) => void,
+    options?: {
+      accountId?: string;
+      scopeIncomingJids?: boolean;
+      ignoreMessagesBefore?: number;
+      onReady?: () => void;
+      onMessage?: (chatJid: string, text: string, senderName: string) => void;
+      onCommand?: (
+        chatJid: string,
+        command: string,
+        senderImId?: string,
+      ) => Promise<string | null>;
+      resolveGroupFolder?: (jid: string) => string | undefined;
+      resolveEffectiveChatJid?: (chatJid: string) => {
+        effectiveJid: string;
+        agentId: string | null;
+        sourceJid?: string;
+      } | null;
+      onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      isChatAuthorized?: (jid: string) => boolean;
+      onPairAttempt?: (
+        jid: string,
+        chatName: string,
+        code: string,
+      ) => Promise<boolean>;
+    },
+  ): Promise<boolean> {
+    if (!config.botId || !config.secret) {
+      logger.info({ userId }, 'WeCom config empty, skipping connection');
+      return false;
+    }
+
+    const channel = createWeComChannel(config);
+    const accountId = options?.accountId ?? config.botId;
+
+    return this.connectChannel(
+      userId,
+      'wecom',
+      channel,
+      {
+        onReady: () => {
+          logger.info(
+            { userId, botId: config.botId },
+            'User WeCom bot connected',
+          );
+          options?.onReady?.();
+        },
+        onNewChat,
+        onMessage: options?.onMessage,
+        ignoreMessagesBefore: options?.ignoreMessagesBefore,
+        onCommand: options?.onCommand,
+        resolveGroupFolder: options?.resolveGroupFolder,
+        resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+        onAgentMessage: options?.onAgentMessage,
+        isChatAuthorized: options?.isChatAuthorized,
+        onPairAttempt: options?.onPairAttempt,
+      },
+      accountId,
+      options?.scopeIncomingJids,
+      config.botId,
+    );
+  }
+
+  async disconnectUserWeCom(userId: string, botId?: string): Promise<void> {
+    if (botId) {
+      await this.disconnectChannelAccount(userId, 'wecom', botId);
+    } else {
+      await this.disconnectChannel(userId, 'wecom');
+    }
+  }
+
+  /**
    * Send a message to a Feishu chat.
    * @deprecated Use sendMessage(jid, text) which auto-routes.
    */
@@ -1971,6 +2054,11 @@ export class IMConnectionManager {
   isWhatsAppConnected(userId: string): boolean {
     const conn = this.connections.get(userId);
     return this.hasConnectedType(conn, 'whatsapp');
+  }
+
+  isWeComConnected(userId: string): boolean {
+    const conn = this.connections.get(userId);
+    return this.hasConnectedType(conn, 'wecom');
   }
 
   private hasConnectedType(

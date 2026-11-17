@@ -47,6 +47,11 @@ import {
   type WhatsAppConnectionConfig,
   type WhatsAppConnectionState,
 } from './whatsapp.js';
+import {
+  createWeComConnection,
+  type WeComConnection,
+  type WeComConnectionConfig,
+} from './wecom.js';
 import { logger } from './logger.js';
 import type {
   ChannelMessageMeta,
@@ -1338,6 +1343,71 @@ export function createWhatsAppChannel(
 
     getWhatsAppState(): WhatsAppConnectionState {
       return inner?.getState() ?? { status: 'disconnected' };
+    },
+  };
+
+  return channel;
+}
+
+// ─── WeCom Adapter ──────────────────────────────────────────────
+
+export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
+  let inner: WeComConnection | null = null;
+
+  const channel: IMChannel = {
+    channelType: 'wecom',
+
+    async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      inner = createWeComConnection(config);
+      try {
+        return await inner.connect({
+          onReady: opts.onReady,
+          onNewChat: opts.onNewChat,
+          onMessage: opts.onMessage,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
+          isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
+          onCommand: opts.onCommand,
+          resolveGroupFolder: opts.resolveGroupFolder,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
+          shouldDeferInbound: opts.shouldDeferInbound,
+        });
+      } catch (err) {
+        logger.error({ err }, 'WeCom channel connect failed');
+        return false;
+      }
+    },
+
+    async disconnect(): Promise<void> {
+      if (inner) {
+        await inner.disconnect();
+        inner = null;
+      }
+    },
+
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+    ): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'WeCom channel not connected, skip sending message',
+        );
+        return;
+      }
+      await inner.sendMessage(chatId, text, localImagePaths);
+    },
+
+    async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
+      // WeCom intelligent bot WebSocket protocol does not expose typing indicators
+    },
+
+    isConnected(): boolean {
+      return inner?.isConnected() ?? false;
     },
   };
 
