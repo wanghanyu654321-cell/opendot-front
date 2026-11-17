@@ -48,6 +48,12 @@ export interface EmployeeRouterOptions {
   /** 模型调用超时（毫秒），超时走追问、不执行。默认取配置或 DEFAULT_MODEL_TIMEOUT_MS（8 秒）。 */
   modelClassifyTimeoutMs?: number;
   marketing?: MarketingPort;
+  /**
+   * OpenDot 桥接模式：当决策为 marketing 且本人具备 marketing 授权时，
+   * 在完成 loop(input, '') 身份与挂起项预检及 marketingActor 复核后返回 pass: true、expiredReminder 与 actor，
+   * 交由外层桥接器转交 OpenDot 原生 Agent（不再强制要求 router.marketing）。
+   */
+  passthroughMarketing?: boolean;
   onRoute?: (record: RouteLogRecord) => void;
 }
 export interface MessageObservation {
@@ -55,6 +61,9 @@ export interface MessageObservation {
 }
 export interface RoutedHandleResult extends HandleResult {
   requestId: string; state: TerminalState; target: RouteDecision['target']; duplicate: boolean;
+  pass?: true;
+  expiredReminder?: string;
+  actor?: Person;
 }
 
 const F = 'Front Claw';
@@ -71,6 +80,9 @@ const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(valu
 export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?: EmployeeRouterOptions },
   loop: (input: EmployeeMessage, preflightReply?: PreflightReply) => Promise<EmployeeLoopResult>) {
   const router = { ...options.router };
+  const passthroughMarketing = router.passthroughMarketing === true;
+  type EntryWorkResult = WorkResult & { pass?: true; expiredReminder?: string; actor?: Person };
+  type EntryTerminal = import('./request-budget.js').Terminal & { pass?: true; expiredReminder?: string; actor?: Person };
   const modelRuntime = router.modelClassify ? { mode: 'stub' as const, timeoutMs: 8000 } : loadModelRuntimeConfig(router.modelConfig);
   const modelClassifier = router.modelClassify ?? createModelClassifier(modelRuntime);
   const modelClassifyTimeoutMs = router.modelClassifyTimeoutMs ?? modelRuntime.timeoutMs;
@@ -148,9 +160,9 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       });
       if ((classified.source === 'semantic' || classified.reason === 'semantic-rejected' || classified.reason === 'semantic-timeout') && !isDeterministicStub(router.semantic)) modelCalled = true;
       const marketing = router.marketing;
-      const grantedActor = classified.label === 'marketing' && !!marketing?.enabled ? await marketingActor(input.memberId) : null;
-      const granted = !!grantedActor;
-      decision = decideRoute(classified, { marketingEnabled: !!marketing?.enabled, marketingGranted: granted });
+      const marketingEnabled = Boolean(marketing?.enabled || passthroughMarketing);
+      let grantedActor = classified.label === 'marketing' && marketingEnabled ? await marketingActor(input.memberId) : null;
+      decision = decideRoute(classified, { marketingEnabled, marketingGranted: !!grantedActor });
       log.classify(requestId, { label: decision.label, target: decision.target, source: classified.source, reason: classified.reason });
       // R3（D81 已定口径）：非今天的报数说法 → 固定一句，不追问、不写。
       const today = businessDate(options.now(), cutoff, timeZone);
@@ -225,8 +237,10 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
             : chain.classification.intent === 'marketing' ? 'marketing' as const
             : 'progress' as const;
           if (label === 'chitchat') decision = { target: 'chitchat', label: 'chitchat', intents: ['chitchat'] };
-          else if (label === 'marketing') decision = decideRoute({ label: 'marketing', intents: ['marketing'], source: 'semantic', reason: 'semantic' }, { marketingEnabled: !!marketing?.enabled, marketingGranted: granted });
-          else decision = { target: 'store', label, intents: [label === 'progress' ? 'progress' : label === 'correction' ? 'correction' : label === 'appointment' ? 'appointment' : 'report'] };
+          else if (label === 'marketing') {
+            if (!grantedActor && marketingEnabled) grantedActor = await marketingActor(input.memberId);
+            decision = decideRoute({ label: 'marketing', intents: ['marketing'], source: 'semantic', reason: 'semantic' }, { marketingEnabled, marketingGranted: !!grantedActor });
+          } else decision = { target: 'store', label, intents: [label === 'progress' ? 'progress' : label === 'correction' ? 'correction' : label === 'appointment' ? 'appointment' : 'report'] };
         }
       }
       switch (decision.target) {
@@ -248,11 +262,25 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
           if (!prepared.newMessagePrepared) return { reply: prepared.replies.join('\n'), target: 'store', ...(prepared.access ? { access: prepared.access } : {}) };
           const finish = (reply: string) => prepared.expiredReminder ? `${reply}\n${prepared.expiredReminder}` : reply;
           if (child.signal.aborted || performance.now() >= child.deadline) return { reply: finish(MARKETING_UNAVAILABLE) };
+          // R1（M03-05）：发出/放行前同一入口门再判；预检期间撤权/停用 → 拒绝。
+          const verifiedActor = await marketingActor(input.memberId, grantedActor!);
+          if (!verifiedActor) return { reply: finish(MARKETING_UNAVAILABLE), target: 'marketing', access: { capability: 'marketing', storeIds: [grantedActor!.storeId] } };
+          if (passthroughMarketing) {
+            const work: EntryWorkResult = {
+              reply: '',
+              target: 'marketing',
+              access: { capability: 'marketing', storeIds: [verifiedActor.storeId] },
+              pass: true,
+              actor: verifiedActor,
+              ...(prepared.expiredReminder ? { expiredReminder: prepared.expiredReminder } : {}),
+            };
+            return work;
+          }
           modelCalled = true;
           const text = await marketing!.handle({ memberId: input.memberId, text: input.text, signal: child.signal, deadline: child.deadline });
-          // R1（M03-05）：发出前同一入口门再判；生成期间撤权/停用 → 不发出生成结果。
-          if (!await marketingActor(input.memberId, grantedActor!)) return { reply: finish(MARKETING_UNAVAILABLE) };
-          return { reply: finish(typeof text === 'string' && text.trim() ? text.trim() : `${F}：这次没有生成内容，没有写入任何账目。`), target: 'marketing', access: { capability: 'marketing', storeIds: [grantedActor!.storeId] } };
+          // R1（M03-05）：生成后发出前再判一次；生成期间撤权/停用 → 不发出生成结果。
+          if (!await marketingActor(input.memberId, verifiedActor)) return { reply: finish(MARKETING_UNAVAILABLE) };
+          return { reply: finish(typeof text === 'string' && text.trim() ? text.trim() : `${F}：这次没有生成内容，没有写入任何账目。`), target: 'marketing', access: { capability: 'marketing', storeIds: [verifiedActor.storeId] } };
         }
         default: return preflightResponse(decision.ask ?? (decision.intents.length > 1 ? MULTI_REPLY : CLARIFY_REPLY), 'ask');
       }
@@ -262,20 +290,34 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         : `${F}：${state === 'timeout' ? '这次没在时限内处理完' : '这次没有处理成'}，没有写入任何账目，请稍后再发。`,
     }));
     const { duplicate } = run;
-    let terminal = run.terminal;
+    let terminal = run.terminal as EntryTerminal;
     // R1（M03-04）：去重不等于授权。已完成结果被重复命中时，按当前权限复核原回复依赖的能力；不过则改回拒绝。
     if (duplicate && terminal.state === 'completed' && (terminal.target === 'store' || terminal.target === 'marketing') &&
       !await stillAllowed(input.memberId, terminal.access ?? { capability: null, storeIds: [] }).catch(() => false)) {
-      terminal = Object.freeze({ ...terminal, reply: terminal.target === 'marketing' ? MARKETING_UNAVAILABLE : ACCESS_DENIED, ledgerSettled: false });
+      const { pass: _pass, expiredReminder: _exp, actor: _actor, ...rest } = terminal;
+      terminal = Object.freeze({ ...rest, reply: terminal.target === 'marketing' ? MARKETING_UNAVAILABLE : ACCESS_DENIED, ledgerSettled: false });
     }
     if (!duplicate) log.commit(requestId, { state: terminal.state, ...(terminal.ledgerSettled ? { ledgerSettled: true } : {}) });
     const deliver = budget.claimDelivery(terminal);
     log.deliver(requestId, { delivered: deliver, duplicate, state: terminal.state });
-    // 投递与业务分开：投递失败不回滚已提交业务，异常照常抛给调用方。
-    if (deliver) options.onOutbound?.(terminal.reply);
+    // 投递与业务分开：投递失败不回滚已提交业务，异常照常抛给调用方；放行给外层 Agent 时不发空店务消息。
+    if (deliver && !terminal.pass) options.onOutbound?.(terminal.reply);
     try { router.onObservation?.({ requestId, route: gateReason !== 'accepted' && (modelAttempted || decision.target === 'clarify') ? '追问' : modelAttempted ? '模型' : '快通道',
       gateReason, pendingSequence, modelMs, errorCategory }); } catch { /* No content is logged. */ }
-    return { entry: 'unified', replies: [terminal.reply], modelCalled, ...(terminal.ledgerSettled ? { ledgerSettled: true } : {}),
-      requestId, state: terminal.state, target: decision.target, duplicate };
+    return {
+      entry: 'unified',
+      replies: terminal.pass ? [] : [terminal.reply],
+      modelCalled,
+      ...(terminal.ledgerSettled ? { ledgerSettled: true } : {}),
+      requestId,
+      state: terminal.state,
+      target: decision.target,
+      duplicate,
+      ...(terminal.pass ? {
+        pass: true as const,
+        ...(terminal.expiredReminder ? { expiredReminder: terminal.expiredReminder } : {}),
+        ...(terminal.actor ? { actor: terminal.actor } : {}),
+      } : {}),
+    };
   };
 }
