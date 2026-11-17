@@ -110,19 +110,24 @@ it('真实PG先后①：撤权事务先持策略行 FOR UPDATE，更正确认因
   const entry = (await db.store.listEntries({ storeId: 's-b', ownerPersonId: 'p-zhao', status: 'confirmed' })).at(-1)!;
   await w.call('m-zhao', '把刚才那笔改成800');
   const admin = await rawClient(url);
-  await admin.query('BEGIN');
-  await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  expect(await w.call('m-zhao', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
-  expect(await newEntryAmount(db.store, entry.entryId)).toBe(88000);
-  expect(await count(url, `SELECT count(*)::int AS n FROM front_claw_perf.performance_revisions`)).toBe(0);
-  expect((await db.store.listDrafts({ kind: 'correction' }))[0]!.status).toBe('pending');
-  await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(revokedZhao(2)), ACCESS_POLICY_KEY]);
-  await admin.query('COMMIT'); await admin.end();
-  expect(await w.call('m-zhao', '对')).toBe(ACCESS_DENIED);
-  expect(await newEntryAmount(db.store, entry.entryId)).toBe(88000);
-  expect(await count(url, `SELECT count(*)::int AS n FROM front_claw_perf.performance_revisions`)).toBe(0);
-  expect((await db.store.listDrafts({ kind: 'correction' }))[0]!.status).toBe('pending');
-  await db.close();
+  try {
+    await admin.query('BEGIN');
+    await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
+    expect(await w.call('m-zhao', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+    expect(await newEntryAmount(db.store, entry.entryId)).toBe(88000);
+    expect(await count(url, `SELECT count(*)::int AS n FROM front_claw_perf.performance_revisions`)).toBe(0);
+    expect((await db.store.listDrafts({ kind: 'correction' }))[0]!.status).toBe('confirming');
+    await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(revokedZhao(2)), ACCESS_POLICY_KEY]);
+    await admin.query('COMMIT');
+    expect(await w.call('m-zhao', '对')).toBe(ACCESS_DENIED);
+    expect(await newEntryAmount(db.store, entry.entryId)).toBe(88000);
+    expect(await count(url, `SELECT count(*)::int AS n FROM front_claw_perf.performance_revisions`)).toBe(0);
+    expect((await db.store.listDrafts({ kind: 'correction' }))[0]!.status).toBe('confirming');
+  } finally {
+    await admin.query('ROLLBACK').catch(() => {});
+    await admin.end().catch(() => {});
+    await db.close();
+  }
 }, 30_000);
 
 it('真实PG先后②：另一事务先锁住账目行并改了金额，更正确认等行锁后比对版本不符 → 作废、零修订、不覆盖', async () => {

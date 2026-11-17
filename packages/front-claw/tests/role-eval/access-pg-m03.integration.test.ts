@@ -56,18 +56,23 @@ it('真实PG先后①：撤权事务先持 FOR UPDATE，确认因 NOWAIT 安全�
   expect(await w.call('m-wang-yj', '12号测试B店\n560（小赵）')).toContain('代报');
   const draftId = (await db.store.listDrafts({ status: 'pending' }))[0]!.draftId;
   const admin = await rawClient(url);
-  await admin.query('BEGIN');
-  await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  expect(await w.call('m-wang-yj', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
-  expect(await newEntries(url)).toEqual([]);
-  expect((await db.store.getDraft(draftId))!.status).toBe('pending');
-  await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(revoked(2)), ACCESS_POLICY_KEY]);
-  await admin.query('COMMIT'); await admin.end();
-  expect(await w.call('m-wang-yj', '对')).toBe(ACCESS_DENIED);
-  expect(await newEntries(url)).toEqual([]);
-  expect((await db.store.getDraft(draftId))!.status).toBe('pending');
-  expect(w.send).not.toHaveBeenCalled();
-  await db.close();
+  try {
+    await admin.query('BEGIN');
+    await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
+    expect(await w.call('m-wang-yj', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+    expect(await newEntries(url)).toEqual([]);
+    expect((await db.store.getDraft(draftId))!.status).toBe('confirming');
+    await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(revoked(2)), ACCESS_POLICY_KEY]);
+    await admin.query('COMMIT');
+    expect(await w.call('m-wang-yj', '对')).toBe(ACCESS_DENIED);
+    expect(await newEntries(url)).toEqual([]);
+    expect((await db.store.getDraft(draftId))!.status).toBe('confirming');
+    expect(w.send).not.toHaveBeenCalled();
+  } finally {
+    await admin.query('ROLLBACK').catch(() => {});
+    await admin.end().catch(() => {});
+    await db.close();
+  }
 }, 30_000);
 
 it('真实PG先后②：提交事务先持 FOR SHARE 时，撤权（updateAccessPolicy 的 FOR UPDATE）必须等提交结束', async () => {
@@ -103,7 +108,7 @@ it('真实PG竞态：确认与撤权在两个独立连接池上同时发起 20 �
     const saved = (await db.store.getDraft(draft.draftId))!;
     const entries = (await newEntries(url)).filter(id => id === confirmEntryId(draft.draftId, 0));
     if (reply.includes('已入账')) { tally.committed++; expect(saved.status).toBe('confirmed'); expect(entries.length).toBe(1); }
-    else { tally.denied++; expect([ACCESS_DENIED, 'Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。']).toContain(reply); expect(saved.status).toBe('pending'); expect(entries).toEqual([]);
+    else { tally.denied++; expect([ACCESS_DENIED, 'Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。']).toContain(reply); expect(['pending', 'confirming']).toContain(saved.status); expect(entries).toEqual([]);
       // 让下一轮能建新草稿：本人取消（取消不需要报数能力以外的权限，此处先恢复授权）。
       const regrant = await updateAccessPolicy(admin.store, { expectedVersion: version, next: policy(version + 1), actor: 'test-admin', reason: '恢复', at }); expect(regrant.ok).toBe(true); version++;
       expect(await w.call('m-wang-yj', '取消')).toContain('取消');

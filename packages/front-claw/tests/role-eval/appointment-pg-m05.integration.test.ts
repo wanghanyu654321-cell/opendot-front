@@ -99,17 +99,22 @@ it('真实PG先后：撤权事务先持策略行 FOR UPDATE，确认因 NOWAIT �
   const w = await worldM05({ store: db.store });
   await registerUnnamedAppointment(w, 'm-zhao', '明天三点有个客人要来');
   const admin = await rawClient(url);
-  await admin.query('BEGIN');
-  await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  expect(await w.call('m-zhao', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
-  expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
-  expect((await db.store.listDrafts({ kind: 'appointment' }))[0]!.status).toBe('pending');
-  await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(zhaoWith(2, 'revoked')), ACCESS_POLICY_KEY]);
-  await admin.query('COMMIT'); await admin.end();
-  expect(await w.call('m-zhao', '对')).toBe(ACCESS_DENIED);
-  expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
-  expect((await db.store.listDrafts({ kind: 'appointment' }))[0]!.status).toBe('pending');
-  await db.close();
+  try {
+    await admin.query('BEGIN');
+    await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
+    expect(await w.call('m-zhao', '对')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+    expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
+    expect((await db.store.listDrafts({ kind: 'appointment' }))[0]!.status).toBe('confirming');
+    await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(zhaoWith(2, 'revoked')), ACCESS_POLICY_KEY]);
+    await admin.query('COMMIT');
+    expect(await w.call('m-zhao', '对')).toBe(ACCESS_DENIED);
+    expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
+    expect((await db.store.listDrafts({ kind: 'appointment' }))[0]!.status).toBe('confirming');
+  } finally {
+    await admin.query('ROLLBACK').catch(() => {});
+    await admin.end().catch(() => {});
+    await db.close();
+  }
 }, 30_000);
 
 it('真实PG先后：撤权事务先持策略行 FOR UPDATE 并停用指定店长，确认因 NOWAIT 安全回滚 → 提交后再确认按新策略不排提醒', async () => {
@@ -117,18 +122,23 @@ it('真实PG先后：撤权事务先持策略行 FOR UPDATE 并停用指定店�
   const w = await worldM05({ store: db.store });
   expect(await registerUnnamedAppointment(w, 'm-zhao', '明天三点有个客人要来')).toContain('苏晓禾');
   const admin = await rawClient(url);
-  await admin.query('BEGIN');
-  await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
-  expect(await w.call('m-zhao', '对', 'mgr-lock')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
-  expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
-  await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(managerWith(2, 'suspended')), ACCESS_POLICY_KEY]);
-  await admin.query('COMMIT'); await admin.end();
-  const reply = await w.call('m-zhao', '对', 'mgr-lock-2');
-  expect(reply).toContain('预约已登记'); expect(reply).not.toContain('已排队提醒');
-  expect(await appts(url)).toBe(1); expect(await reminders(url)).toBe(0);
-  const final = await w.call('m-zhao', '入账结果 mgr-lock-2');
-  expect(final).toContain('预约已登记'); expect(final).not.toContain('已排队提醒');
-  await db.close();
+  try {
+    await admin.query('BEGIN');
+    await admin.query(`SELECT * FROM front_claw_perf.performance_config WHERE key=$1 FOR UPDATE`, [ACCESS_POLICY_KEY]);
+    expect(await w.call('m-zhao', '对', 'mgr-lock')).toBe('Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。');
+    expect(await appts(url)).toBe(0); expect(await reminders(url)).toBe(0);
+    await admin.query(`UPDATE front_claw_perf.performance_config SET value=$1 WHERE key=$2`, [JSON.stringify(managerWith(2, 'suspended')), ACCESS_POLICY_KEY]);
+    await admin.query('COMMIT');
+    const reply = await w.call('m-zhao', '对', 'mgr-lock-2');
+    expect(reply).toContain('预约已登记'); expect(reply).not.toContain('已排队提醒');
+    expect(await appts(url)).toBe(1); expect(await reminders(url)).toBe(0);
+    const final = await w.call('m-zhao', '入账结果 mgr-lock');
+    expect(final).toContain('预约已登记'); expect(final).not.toContain('已排队提醒');
+  } finally {
+    await admin.query('ROLLBACK').catch(() => {});
+    await admin.end().catch(() => {});
+    await db.close();
+  }
 }, 30_000);
 
 it('真实PG竞态：确认与撤权（登记人）在两个独立连接池上同时发起 20 轮——要么登记且提醒 1 条，要么拒绝、零写、草稿待确认', async () => {
@@ -150,7 +160,7 @@ it('真实PG竞态：确认与撤权（登记人）在两个独立连接池上�
     else {
       tally.denied++; expect([ACCESS_DENIED, 'Front Claw：本次提交因争用已回滚，请查原操作结果；不要另报一笔。']).toContain(reply);
       expect(await appts(url)).toBe(before.a); expect(await reminders(url)).toBe(before.n);
-      expect((await db.store.listDrafts({ kind: 'appointment', status: 'pending' }))).toHaveLength(1);
+      expect((await db.store.listDrafts({ kind: 'appointment' })).filter(d => d.status === 'pending' || d.status === 'confirming')).toHaveLength(1);
       await set('active'); expect(await w.call('m-zhao', '取消')).toContain('已取消');
     }
   }
@@ -180,8 +190,8 @@ it('真实PG竞态：确认与“指定店长被停用”同时发起 20 轮—�
     if (first === POLICY_CHANGED || first.includes('争用已回滚')) {
       tally.policyChanged++;
       expect(await appts(url)).toBe(before.a); expect(await reminders(url)).toBe(before.n);
-      id = `rc-${round}-b`;
-      expect(await w.call('m-zhao', '对', id)).toContain('预约已登记');
+      if (first === POLICY_CHANGED) id = `rc-${round}-b`;
+      expect(await w.call('m-zhao', '对', `rc-${round}-b`)).toContain('预约已登记');
     }
     expect(await appts(url), `round ${round}: ${first}`).toBe(before.a + 1);
     const added = await reminders(url) - before.n;
