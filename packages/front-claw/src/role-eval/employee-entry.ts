@@ -188,7 +188,7 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         const actor = await options.store.getPersonByMember(input.memberId);
         const asked = actor ? (await options.store.getConfig(appointmentAskKey(actor, input)))?.trim() : '';
         const appt = parseAppointmentRequest(input.text, new Date(), 'Asia/Shanghai');
-        if (asked || parseCorrectionPick(input.text) || parseAddNewChoice(input.text) || parseAskManagerChoice(input.text)
+        if (asked || input.text.trim() === '确认入账' || parseCorrectionPick(input.text) || parseAddNewChoice(input.text) || parseAskManagerChoice(input.text)
             || isSelfProgressQuery(input.text) || isStorePerfQuery(input.text)
             || isManagedQueryPhrase(input.text)
             || (appt && (appt.kind === 'request' || appt.kind === 'needs_time' || appt.kind === 'past' || appt.kind === 'invalid'))) {
@@ -258,7 +258,10 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         case 'marketing-unavailable': return preflightResponse(MARKETING_UNAVAILABLE);
         case 'marketing': {
           // D175/D179：沿用循环身份预检，只消费过期项；有效挂起项保留。
-          const prepared = await loop({ ...input, signal: child.signal, deadline: child.deadline }, '');
+          const prepared = await loop(
+            { ...input, signal: child.signal, deadline: child.deadline },
+            passthroughMarketing ? { text: '', kind: 'reply', markInterleaved: true } : '',
+          );
           if (!prepared.newMessagePrepared) return { reply: prepared.replies.join('\n'), target: 'store', ...(prepared.access ? { access: prepared.access } : {}) };
           const finish = (reply: string) => prepared.expiredReminder ? `${reply}\n${prepared.expiredReminder}` : reply;
           if (child.signal.aborted || performance.now() >= child.deadline) return { reply: finish(MARKETING_UNAVAILABLE) };
