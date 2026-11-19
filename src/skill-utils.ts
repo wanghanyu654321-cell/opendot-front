@@ -40,7 +40,7 @@ export function validateSkillPath(
 }
 
 export function parseFrontmatter(content: string): Record<string, string> {
-  const lines = content.split('\n');
+  const lines = content.split(/\r?\n/);
   if (lines[0]?.trim() !== '---') return {};
 
   const endIndex = lines.slice(1).findIndex((line) => line.trim() === '---');
