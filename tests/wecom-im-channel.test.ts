@@ -117,9 +117,13 @@ const { CHANNEL_PREFIXES, getChannelFromJid } =
 const { getImChannelCapabilities } =
   await import('../src/im-channel-capabilities.js');
 const { IMConnectionManager } = await import('../src/im-manager.js');
+const { createWeComChannel } = await import('../src/im-channel.js');
 const { parseWeComMemberId } = await import('../src/wecom.js');
 import type {
   WeComConsumerLease,
+  WeComDeliveryOutcomeEvent,
+  WeComOutboundAuthorizePort,
+  WeComOutboxDeliveryOutcome,
   WeComPrecheckOutcome,
   WeComPrecheckPort,
 } from '../src/wecom.js';
@@ -137,6 +141,10 @@ function createOfflineWsClient(
   options: {
     autoAuthenticate?: boolean;
     suppressAck?: (frame: SentWireFrame) => boolean;
+    ackFor?: (
+      frame: SentWireFrame,
+      index: number,
+    ) => { errcode: number; errmsg?: string } | null;
   } = {},
 ) {
   const client = new WSClient({
@@ -164,17 +172,25 @@ function createOfflineWsClient(
 
   const sent: SentWireFrame[] = [];
   let suppressAck = options.suppressAck ?? (() => false);
+  let ackFor = options.ackFor;
 
   const mockWs = {
     readyState: 3, // CLOSED until connect()
     send(raw: string) {
       const parsed = JSON.parse(raw) as SentWireFrame;
+      const index = sent.length;
       sent.push(parsed);
-      if (!suppressAck(parsed)) {
+      const ack = ackFor
+        ? ackFor(parsed, index)
+        : suppressAck(parsed)
+          ? null
+          : { errcode: 0 };
+      if (ack !== null) {
         queueMicrotask(() => {
           wsManager.handleFrame({
             headers: { req_id: parsed.headers.req_id },
-            errcode: 0,
+            errcode: ack.errcode,
+            ...(ack.errmsg !== undefined ? { errmsg: ack.errmsg } : {}),
             body: {},
           });
         });
@@ -217,6 +233,16 @@ function createOfflineWsClient(
     disconnectSpy,
     setSuppressAck(fn: (frame: SentWireFrame) => boolean) {
       suppressAck = fn;
+    },
+    setAckFor(
+      fn:
+        | ((
+            frame: SentWireFrame,
+            index: number,
+          ) => { errcode: number; errmsg?: string } | null)
+        | undefined,
+    ) {
+      ackFor = fn;
     },
     authenticate() {
       mockWs.readyState = 1;
@@ -796,5 +822,804 @@ describe('WeCom IMChannel integration contracts', () => {
     expect(manager.isWeComConnected('owner-1')).toBe(false);
 
     await manager.disconnectAll();
+  });
+
+  test('6. sendMessageWithReceipt returns accepted receipt (single & multi-chunk), invokes metadata-only onDeliveryOutcome, and returns null for non-WeCom JIDs', async () => {
+    const botId = 'wecom-bot-receipt-ok';
+    ensureBotAccount('owner-1', botId);
+    const offline = createOfflineWsClient(botId);
+    const manager = new IMConnectionManager();
+    const events: WeComDeliveryOutcomeEvent[] = [];
+
+    await manager.connectUserWeCom(
+      'owner-1',
+      {
+        botId,
+        secret: 'sec-6',
+        client: offline.client,
+        onDeliveryOutcome: (event) => events.push(event),
+      },
+      vi.fn(),
+    );
+
+    const chatJid = `wecom:c2c:corp-ok:m-ok#account:${botId}`;
+    db.setRegisteredGroup(chatJid, {
+      name: 'Receipt OK User',
+      folder: 'receipt-ok-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+    });
+
+    const singleOutcome = await manager.sendMessageWithReceipt(
+      chatJid,
+      '单段回执测试正文',
+      { correlationId: 'corr-single-1' },
+    );
+    expect(offline.sent).toHaveLength(1);
+    expect(offline.sent[0]!.cmd).toBe(WsCmd.SEND_MSG);
+    expect(singleOutcome).toEqual({
+      state: 'accepted',
+      providerMessageId: offline.sent[0]!.headers.req_id,
+      chunkCount: 1,
+    });
+
+    const longBody = 'A'.repeat(16001);
+    const multiOutcome = await manager.sendMessageWithReceipt(
+      chatJid,
+      longBody,
+      { correlationId: 'corr-multi-2' },
+    );
+    expect(offline.sent).toHaveLength(3);
+    expect(multiOutcome).toEqual({
+      state: 'accepted',
+      providerMessageId: offline.sent[2]!.headers.req_id,
+      chunkCount: 2,
+    });
+
+    expect(events).toEqual([
+      {
+        botId,
+        chatId: 'c2c:corp-ok:m-ok',
+        correlationId: 'corr-single-1',
+        outcome: singleOutcome,
+      },
+      {
+        botId,
+        chatId: 'c2c:corp-ok:m-ok',
+        correlationId: 'corr-multi-2',
+        outcome: multiOutcome,
+      },
+    ]);
+    const serializedEvents = JSON.stringify(events);
+    expect(serializedEvents).not.toContain('单段回执测试正文');
+    expect(serializedEvents).not.toContain('AAAA');
+
+    await expect(
+      manager.sendMessageWithReceipt('feishu:oc_non_wecom', 'non-wecom'),
+    ).resolves.toBeNull();
+    await expect(
+      manager.sendMessageWithReceipt('web:workspace', 'web-jid'),
+    ).resolves.toBeNull();
+
+    await manager.disconnectAll();
+  });
+
+  test('7. sendMessageWithReceipt returns blocked (sentChunkCount=0) with zero wire frames when pre-send gates reject', async () => {
+    const botId = 'wecom-bot-receipt-blocked';
+    ensureBotAccount('owner-1', botId);
+    const offline = createOfflineWsClient(botId);
+    const manager = new IMConnectionManager();
+    const events: WeComDeliveryOutcomeEvent[] = [];
+
+    let leaseHeld = true;
+    const lease: WeComConsumerLease = {
+      owner: 'worker-auth',
+      acquire: async () => leaseHeld,
+      held: () => leaseHeld,
+    };
+
+    let mode: 'deny' | 'throw' | 'allow' = 'deny';
+    const authorizeOutbound: WeComOutboundAuthorizePort = vi.fn(async () => {
+      if (mode === 'deny') {
+        return { allowed: false, reason: 'member_revoked' };
+      }
+      if (mode === 'throw') {
+        throw new Error('auth_db_down');
+      }
+      return { allowed: true };
+    });
+
+    await manager.connectUserWeCom(
+      'owner-1',
+      {
+        botId,
+        secret: 'sec-7',
+        client: offline.client,
+        lease,
+        authorizeOutbound,
+        onDeliveryOutcome: (event) => events.push(event),
+      },
+      vi.fn(),
+    );
+
+    const chatJid = `wecom:c2c:corp-auth:m-auth#account:${botId}`;
+    db.setRegisteredGroup(chatJid, {
+      name: 'Auth Blocked User',
+      folder: 'auth-blocked-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+    });
+
+    // 7a. authorizeOutbound returns allowed=false -> blocked with 0 wire sends
+    const denied = await manager.sendMessageWithReceipt(chatJid, '敏感消息', {
+      correlationId: 'corr-auth-deny',
+    });
+    expect(denied).toEqual({
+      state: 'blocked',
+      reason: 'member_revoked',
+      sentChunkCount: 0,
+    });
+    expect(offline.sent).toHaveLength(0);
+    expect(authorizeOutbound).toHaveBeenCalledWith({
+      botId,
+      chatId: 'c2c:corp-auth:m-auth',
+      memberId: 'm-auth',
+      corpId: 'corp-auth',
+      correlationId: 'corr-auth-deny',
+    });
+
+    // 7b. authorizeOutbound throws -> blocked with 0 wire sends
+    mode = 'throw';
+    const threw = await manager.sendMessageWithReceipt(chatJid, '异常消息');
+    expect(threw).toEqual({
+      state: 'blocked',
+      reason: 'auth_db_down',
+      sentChunkCount: 0,
+    });
+    expect(offline.sent).toHaveLength(0);
+
+    // 7c. Lease lost before send -> disconnects and returns blocked(lease_lost)
+    mode = 'allow';
+    leaseHeld = false;
+    const leaseBlocked = await manager.sendMessageWithReceipt(
+      chatJid,
+      '失租消息',
+    );
+    expect(leaseBlocked).toEqual({
+      state: 'blocked',
+      reason: 'lease_lost',
+      sentChunkCount: 0,
+    });
+    expect(offline.disconnectSpy).toHaveBeenCalledTimes(1);
+    expect(offline.sent).toHaveLength(0);
+
+    // 7d. Missing WeCom channel returns blocked via IMManager
+    const missingOutcome = await manager.sendMessageWithReceipt(
+      'wecom:c2c:corp-missing:m-missing#account:missing-bot',
+      '无连接消息',
+    );
+    expect(missingOutcome).toEqual({
+      state: 'blocked',
+      reason: 'wecom_channel_not_connected',
+      sentChunkCount: 0,
+    });
+
+    // 7e. Unconnected createWeComChannel directly returns blocked and notifies observer
+    const directEvents: WeComDeliveryOutcomeEvent[] = [];
+    const directChannel = createWeComChannel({
+      botId: 'direct-unconnected',
+      secret: 'sec-direct',
+      onDeliveryOutcome: (event) => directEvents.push(event),
+    });
+    const directOutcome = await directChannel.sendMessageWithReceipt(
+      'c2c:corp-x:m-x',
+      '未连接直调',
+      { correlationId: 'corr-direct' },
+    );
+    expect(directOutcome).toEqual({
+      state: 'blocked',
+      reason: 'not_connected',
+      sentChunkCount: 0,
+    });
+    expect(directEvents).toEqual([
+      {
+        botId: 'direct-unconnected',
+        chatId: 'c2c:corp-x:m-x',
+        correlationId: 'corr-direct',
+        outcome: directOutcome,
+      },
+    ]);
+    expect(events.length).toBeGreaterThanOrEqual(3);
+
+    await manager.disconnectAll();
+  });
+
+  test('8. sendMessageWithReceipt reports chunk-1 rejected (sentChunkCount=0) and chunk-1 unknown timeout without retry, keeping sendMessage() backward compatible', async () => {
+    vi.useFakeTimers();
+    const botId = 'wecom-bot-receipt-fail';
+    ensureBotAccount('owner-1', botId);
+    const offline = createOfflineWsClient(botId, {
+      ackFor: () => ({ errcode: 40003, errmsg: 'invalid userid' }),
+    });
+    const manager = new IMConnectionManager();
+
+    await manager.connectUserWeCom(
+      'owner-1',
+      {
+        botId,
+        secret: 'sec-8',
+        client: offline.client,
+        sendTimeoutMs: 50,
+      },
+      vi.fn(),
+    );
+
+    const chatJid = `wecom:c2c:corp-fail:m-fail#account:${botId}`;
+    db.setRegisteredGroup(chatJid, {
+      name: 'Fail User',
+      folder: 'fail-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+    });
+
+    // 8a. Explicit chunk-1 rejection -> rejected, sentChunkCount=0, never retried
+    const rejected: WeComOutboxDeliveryOutcome | null =
+      await manager.sendMessageWithReceipt(chatJid, '首块拒收测试');
+    expect(rejected).toEqual({
+      state: 'rejected',
+      reason: 'sdk_ack_rejected',
+      apiErrorCode: 40003,
+      sentChunkCount: 0,
+    });
+    expect(offline.sent).toHaveLength(1);
+
+    // 8b. Chunk-1 ACK timeout -> unknown, sentChunkCount=0, never retried
+    offline.setAckFor(() => null);
+    const timeoutPromise = manager.sendMessageWithReceipt(
+      chatJid,
+      '首块超时测试',
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    expect(offline.sent).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(60);
+    const timedOut = await timeoutPromise;
+    expect(timedOut).toEqual({
+      state: 'unknown',
+      reason: 'send_result_unknown',
+      sentChunkCount: 0,
+    });
+    expect(offline.sent).toHaveLength(2);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        botId,
+        memberId: 'm-fail',
+        detail: 'send_result_unknown',
+      }),
+      expect.stringContaining('state=unknown'),
+    );
+
+    // 8c. Legacy IMManager.sendMessage() still resolves void on accepted and on unknown without throwing
+    offline.setAckFor(() => ({ errcode: 0 }));
+    await expect(
+      manager.sendMessage(chatJid, '旧接口兼容成功'),
+    ).resolves.toBeUndefined();
+    expect(offline.sent).toHaveLength(3);
+
+    offline.setAckFor(() => null);
+    const legacyTimeout = manager.sendMessage(chatJid, '旧接口兼容超时');
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(60);
+    await expect(legacyTimeout).resolves.toBeUndefined();
+    expect(offline.sent).toHaveLength(4);
+
+    await manager.disconnectAll();
+  });
+
+  test('9. sendMessageWithReceipt aborts immediately on multi-chunk partial delivery (sentChunkCount > 0) for rejection, timeout, authorizeOutbound deny, and lease loss', async () => {
+    const botId = 'wecom-bot-receipt-partial';
+    ensureBotAccount('owner-1', botId);
+    const offline = createOfflineWsClient(botId);
+    const manager = new IMConnectionManager();
+
+    let leaseHeld = true;
+    const lease: WeComConsumerLease = {
+      owner: 'worker-partial',
+      acquire: async () => leaseHeld,
+      held: () => leaseHeld,
+    };
+
+    let authCallCount = 0;
+    let authMode: 'allow' | 'deny_second' | 'drop_lease_second' = 'allow';
+    const authorizeOutbound: WeComOutboundAuthorizePort = vi.fn(async () => {
+      authCallCount += 1;
+      if (authMode === 'deny_second' && authCallCount === 2) {
+        return { allowed: false, reason: 'revoked_between_chunks' };
+      }
+      if (authMode === 'drop_lease_second' && authCallCount === 2) {
+        leaseHeld = false;
+      }
+      return { allowed: true };
+    });
+
+    await manager.connectUserWeCom(
+      'owner-1',
+      {
+        botId,
+        secret: 'sec-9',
+        client: offline.client,
+        lease,
+        authorizeOutbound,
+        sendTimeoutMs: 50,
+      },
+      vi.fn(),
+    );
+
+    const chatJid = `wecom:c2c:corp-partial:m-partial#account:${botId}`;
+    db.setRegisteredGroup(chatJid, {
+      name: 'Partial User',
+      folder: 'partial-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+    });
+
+    // 9a. 3 chunks: chunk 1 accepted, chunk 2 rejected -> aborts before chunk 3, sentChunkCount=1
+    offline.setAckFor((_frame, idx) =>
+      idx === 0 ? { errcode: 0 } : { errcode: 40003, errmsg: 'rate_limit' },
+    );
+    const threeChunkTextA = 'A'.repeat(32001);
+    const partialRejected = await manager.sendMessageWithReceipt(
+      chatJid,
+      threeChunkTextA,
+    );
+    expect(offline.sent).toHaveLength(2);
+    expect(partialRejected).toEqual({
+      state: 'rejected',
+      reason: 'sdk_ack_rejected',
+      apiErrorCode: 40003,
+      sentChunkCount: 1,
+    });
+
+    // 9b. 3 chunks: chunk 1 accepted, chunk 2 ACK timeout -> aborts before chunk 3, sentChunkCount=1
+    vi.useFakeTimers();
+    const sentBeforeTimeout = offline.sent.length;
+    offline.setAckFor((_frame, idx) =>
+      idx === sentBeforeTimeout ? { errcode: 0 } : null,
+    );
+    const partialTimeoutPromise = manager.sendMessageWithReceipt(
+      chatJid,
+      'B'.repeat(32001),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    expect(offline.sent).toHaveLength(sentBeforeTimeout + 2);
+    await vi.advanceTimersByTimeAsync(60);
+    const partialTimedOut = await partialTimeoutPromise;
+    expect(partialTimedOut).toEqual({
+      state: 'unknown',
+      reason: 'send_result_unknown',
+      sentChunkCount: 1,
+    });
+    expect(offline.sent).toHaveLength(sentBeforeTimeout + 2);
+    vi.useRealTimers();
+
+    // 9c. 2 chunks: chunk 1 accepted, chunk 2 authorizeOutbound denies -> aborts before wire send 2, returns unknown with sentChunkCount=1
+    authCallCount = 0;
+    authMode = 'deny_second';
+    const sentBeforeDeny = offline.sent.length;
+    offline.setAckFor(() => ({ errcode: 0 }));
+    const partialDenied = await manager.sendMessageWithReceipt(
+      chatJid,
+      'C'.repeat(16001),
+    );
+    expect(offline.sent).toHaveLength(sentBeforeDeny + 1);
+    expect(partialDenied).toEqual({
+      state: 'unknown',
+      reason: 'revoked_between_chunks',
+      sentChunkCount: 1,
+    });
+
+    // 9d. 2 chunks: chunk 1 accepted, lease lost before chunk 2 -> disconnects and returns unknown with sentChunkCount=1
+    authCallCount = 0;
+    authMode = 'drop_lease_second';
+    const sentBeforeLeaseDrop = offline.sent.length;
+    const partialLeaseDropped = await manager.sendMessageWithReceipt(
+      chatJid,
+      'D'.repeat(16001),
+    );
+    expect(offline.sent).toHaveLength(sentBeforeLeaseDrop + 1);
+    expect(partialLeaseDropped).toEqual({
+      state: 'unknown',
+      reason: 'lease_lost',
+      sentChunkCount: 1,
+    });
+
+    await manager.disconnectAll();
+  });
+
+  test('10. inbound slow-path dedupes by stable channel identity before routing (prevents cross-role replay) and keeps durable hasStoredMessage fallback', async () => {
+    const botId = 'wecom-bot-idem';
+    ensureBotAccount('owner-1', botId);
+    const offline = createOfflineWsClient(botId);
+    const manager = new IMConnectionManager();
+    const expectedScopedJid = `wecom:c2c:corp-idem:m-idem#account:${botId}`;
+    const otherScopedJid = `wecom:c2c:corp-idem:m-other#account:${botId}`;
+
+    db.setRegisteredGroup(expectedScopedJid, {
+      name: 'Idem Employee',
+      folder: 'idem-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+      target_main_jid: 'web:base-idem',
+    });
+    db.setRegisteredGroup(otherScopedJid, {
+      name: 'Other Employee',
+      folder: 'other-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+      target_main_jid: 'web:base-idem',
+    });
+
+    let nextWorkspace = 'web:wecom-front-claw:role-a';
+    const precheck: WeComPrecheckPort = vi.fn(async (event) => ({
+      kind: 'pass',
+      corpId: event.corpId ?? 'corp-idem',
+      accountId: `acc-${event.memberId}`,
+      storeId: 'store-idem',
+      displayName: event.memberId,
+      workspaceJid: nextWorkspace,
+    }));
+
+    const resolveEffectiveChatJid = vi.fn(() => ({
+      effectiveJid: 'web:base-idem',
+      agentId: null,
+    }));
+    const isTrustedManagedWorkspaceJid = vi.fn((ws: string) =>
+      ws.startsWith('web:wecom-front-claw:'),
+    );
+
+    await manager.connectUserWeCom(
+      'owner-1',
+      {
+        botId,
+        secret: 'sec-10',
+        client: offline.client,
+        precheck,
+      },
+      vi.fn(),
+      {
+        resolveEffectiveChatJid,
+        isTrustedManagedWorkspaceJid,
+      },
+    );
+
+    // First delivery into role-a
+    offline.emitInboundText({
+      reqId: 'req-idem-1',
+      msgid: 'msg-idem-1',
+      userid: 'm-idem',
+      corpid: 'corp-idem',
+      content: '跨岗幂等第一条',
+    });
+    await vi.waitFor(() =>
+      expect(spies.notifyNewImMessage).toHaveBeenCalledTimes(1),
+    );
+    expect(resolveEffectiveChatJid).toHaveBeenCalledTimes(1);
+    expect(isTrustedManagedWorkspaceJid).toHaveBeenCalledTimes(1);
+    expect(
+      db.getMessagesSince('web:wecom-front-claw:role-a', {
+        timestamp: '',
+        id: '',
+      }),
+    ).toHaveLength(1);
+
+    // Replay same (corpId, botId, memberId, messageId) after role switch to role-b -> dropped BEFORE routing
+    nextWorkspace = 'web:wecom-front-claw:role-b';
+    offline.emitInboundText({
+      reqId: 'req-idem-2',
+      msgid: 'msg-idem-1',
+      userid: 'm-idem',
+      corpid: 'corp-idem',
+      content: '跨岗幂等重放',
+    });
+    await vi.waitFor(() => expect(precheck).toHaveBeenCalledTimes(2));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(resolveEffectiveChatJid).toHaveBeenCalledTimes(1);
+    expect(isTrustedManagedWorkspaceJid).toHaveBeenCalledTimes(1);
+    expect(spies.storeMessageDirect).toHaveBeenCalledTimes(1);
+    expect(
+      db.getMessagesSince('web:wecom-front-claw:role-b', {
+        timestamp: '',
+        id: '',
+      }),
+    ).toHaveLength(0);
+
+    // Different memberId with same messageId is NOT conflated and enters role-b normally
+    offline.emitInboundText({
+      reqId: 'req-idem-3',
+      msgid: 'msg-idem-1',
+      userid: 'm-other',
+      corpid: 'corp-idem',
+      content: '另一成员同msgid',
+    });
+    await vi.waitFor(() =>
+      expect(spies.notifyNewImMessage).toHaveBeenCalledTimes(2),
+    );
+    expect(
+      db.getMessagesSince('web:wecom-front-claw:role-b', {
+        timestamp: '',
+        id: '',
+      }),
+    ).toHaveLength(1);
+
+    await manager.disconnectAll();
+
+    // Fresh connection (empty in-memory admittedPassKeys) still blocks replay via durable hasStoredMessage
+    const offlineRestart = createOfflineWsClient(botId);
+    const managerRestart = new IMConnectionManager();
+    nextWorkspace = 'web:wecom-front-claw:role-a';
+    await managerRestart.connectUserWeCom(
+      'owner-1',
+      {
+        botId,
+        secret: 'sec-10',
+        client: offlineRestart.client,
+        precheck,
+      },
+      vi.fn(),
+      {
+        resolveEffectiveChatJid,
+        isTrustedManagedWorkspaceJid,
+      },
+    );
+    offlineRestart.emitInboundText({
+      reqId: 'req-idem-4',
+      msgid: 'msg-idem-1',
+      userid: 'm-idem',
+      corpid: 'corp-idem',
+      content: '重启后持久化兜底重放',
+    });
+    await vi.waitFor(() => expect(precheck).toHaveBeenCalledTimes(4));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(spies.notifyNewImMessage).toHaveBeenCalledTimes(2);
+    expect(spies.storeMessageDirect).toHaveBeenCalledTimes(2);
+
+    await managerRestart.disconnectAll();
+  });
+
+  test('11. controlled dynamic outcome.workspaceJid preserves resolveAdmittedChannelRoute gate, avoids onNewChat overwrite, and falls back safely for untrusted targets', async () => {
+    const botId = 'wecom-bot-dynamic-route';
+    ensureBotAccount('owner-1', botId);
+    const offline = createOfflineWsClient(botId);
+    const manager = new IMConnectionManager();
+
+    const admittedJid = `wecom:c2c:corp-dyn:m-dyn#account:${botId}`;
+    const rejectedJid = `wecom:c2c:corp-dyn:m-rejected#account:${botId}`;
+    db.setRegisteredGroup(admittedJid, {
+      name: 'Dynamic Employee',
+      folder: 'dyn-base-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+      target_main_jid: 'web:base-ws',
+    });
+    db.setRegisteredGroup(rejectedJid, {
+      name: 'Disabled Employee',
+      folder: 'dyn-disabled-folder',
+      added_at: new Date().toISOString(),
+      created_by: 'owner-1',
+      channel_account_id: botId,
+    });
+
+    const workspaceByMsg: Record<string, string | undefined> = {
+      'msg-rejected-route': 'web:wecom-front-claw:role-sales',
+      'msg-trusted-sales': 'web:wecom-front-claw:role-sales',
+      'msg-trusted-ops': 'web:wecom-front-claw:role-ops',
+      'msg-forged-ws': 'web:evil-hijack',
+    };
+
+    const precheck: WeComPrecheckPort = vi.fn(async (event) => ({
+      kind: 'pass',
+      corpId: event.corpId ?? 'corp-dyn',
+      accountId: 'acc-dyn',
+      storeId: 'store-dyn',
+      displayName: event.memberId,
+      workspaceJid: workspaceByMsg[event.messageId],
+    }));
+
+    const onNewChat = vi.fn((chatJid: string) => {
+      db.setRegisteredGroup(chatJid, {
+        name: 'Overwritten',
+        folder: 'overwritten-folder',
+        added_at: new Date().toISOString(),
+        created_by: 'owner-1',
+        channel_account_id: botId,
+        target_main_jid: 'web:overwritten-by-onNewChat',
+      });
+    });
+    const onMessage = vi.fn();
+
+    await manager.connectUserWeCom(
+      'owner-1',
+      {
+        botId,
+        secret: 'sec-11',
+        client: offline.client,
+        precheck,
+      },
+      onNewChat,
+      {
+        onMessage,
+        resolveEffectiveChatJid: (chatJid) => {
+          if (chatJid === admittedJid) {
+            return { effectiveJid: 'web:base-ws', agentId: null };
+          }
+          return null;
+        },
+        isTrustedManagedWorkspaceJid: (ws) =>
+          ws.startsWith('web:wecom-front-claw:'),
+      },
+    );
+
+    // 11a. Rejected by resolveEffectiveChatJid -> dropped even when workspaceJid is trusted (never bypasses admission)
+    offline.emitInboundText({
+      reqId: 'req-dyn-rej',
+      msgid: 'msg-rejected-route',
+      userid: 'm-rejected',
+      corpid: 'corp-dyn',
+      content: '未准入渠道不可绕过',
+    });
+    await vi.waitFor(() => expect(precheck).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(spies.storeMessageDirect).not.toHaveBeenCalled();
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(
+      db.getMessagesSince('web:wecom-front-claw:role-sales', {
+        timestamp: '',
+        id: '',
+      }),
+    ).toHaveLength(0);
+
+    // 11b. Admitted + trusted dynamic workspaceJid routes across roles without invoking onNewChat overwrite
+    offline.emitInboundText({
+      reqId: 'req-dyn-sales',
+      msgid: 'msg-trusted-sales',
+      userid: 'm-dyn',
+      corpid: 'corp-dyn',
+      content: '去销售岗工作区',
+    });
+    await vi.waitFor(() =>
+      expect(spies.notifyNewImMessage).toHaveBeenCalledTimes(1),
+    );
+
+    offline.emitInboundText({
+      reqId: 'req-dyn-ops',
+      msgid: 'msg-trusted-ops',
+      userid: 'm-dyn',
+      corpid: 'corp-dyn',
+      content: '切到运营岗工作区',
+    });
+    await vi.waitFor(() =>
+      expect(spies.notifyNewImMessage).toHaveBeenCalledTimes(2),
+    );
+
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(db.getRegisteredGroup(admittedJid)?.target_main_jid).toBe(
+      'web:base-ws',
+    );
+    expect(spies.storeMessageDirect).toHaveBeenNthCalledWith(
+      1,
+      'msg-trusted-sales',
+      'web:wecom-front-claw:role-sales',
+      'wecom:m-dyn',
+      'm-dyn',
+      '去销售岗工作区',
+      expect.any(String),
+      false,
+      { sourceJid: admittedJid },
+    );
+    expect(spies.storeMessageDirect).toHaveBeenNthCalledWith(
+      2,
+      'msg-trusted-ops',
+      'web:wecom-front-claw:role-ops',
+      'wecom:m-dyn',
+      'm-dyn',
+      '切到运营岗工作区',
+      expect.any(String),
+      false,
+      { sourceJid: admittedJid },
+    );
+    expect(onMessage).toHaveBeenNthCalledWith(
+      1,
+      admittedJid,
+      '去销售岗工作区',
+      'm-dyn',
+    );
+    expect(onMessage).toHaveBeenNthCalledWith(
+      2,
+      admittedJid,
+      '切到运营岗工作区',
+      'm-dyn',
+    );
+
+    // Replying to sourceJid routes outbound via WsCmd.SEND_MSG to m-dyn
+    const replyReceipt = await manager.sendMessageWithReceipt(
+      admittedJid,
+      '动态工作区回推到来源单聊',
+    );
+    expect(replyReceipt).toMatchObject({ state: 'accepted', chunkCount: 1 });
+    expect(offline.sent[0]!.cmd).toBe(WsCmd.SEND_MSG);
+    expect(offline.sent[0]!.body).toMatchObject({ chatid: 'm-dyn' });
+
+    // 11c. Untrusted/forged outcome.workspaceJid is ignored and falls back to resolved.targetJid
+    offline.emitInboundText({
+      reqId: 'req-dyn-forged',
+      msgid: 'msg-forged-ws',
+      userid: 'm-dyn',
+      corpid: 'corp-dyn',
+      content: '伪造目标工作区测试',
+    });
+    await vi.waitFor(() =>
+      expect(spies.notifyNewImMessage).toHaveBeenCalledTimes(3),
+    );
+    expect(
+      db.getMessagesSince('web:evil-hijack', { timestamp: '', id: '' }),
+    ).toHaveLength(0);
+    expect(
+      db
+        .getMessagesSince('web:base-ws', { timestamp: '', id: '' })
+        .map((m) => m.id),
+    ).toContain('msg-forged-ws');
+
+    await manager.disconnectAll();
+
+    // 11d. Without isTrustedManagedWorkspaceJid (or resolveEffectiveChatJid), workspaceJid is never trusted
+    const botPlain = 'wecom-bot-no-trust-hook';
+    ensureBotAccount('owner-1', botPlain);
+    const offlinePlain = createOfflineWsClient(botPlain);
+    const managerPlain = new IMConnectionManager();
+    const plainJid = `wecom:c2c:corp-plain:m-plain#account:${botPlain}`;
+
+    await managerPlain.connectUserWeCom(
+      'owner-1',
+      {
+        botId: botPlain,
+        secret: 'sec-11d',
+        client: offlinePlain.client,
+        precheck: async () => ({
+          kind: 'pass',
+          corpId: 'corp-plain',
+          accountId: 'acc-plain',
+          storeId: 'store-plain',
+          displayName: 'Plain User',
+          workspaceJid: 'web:unverified-ws',
+        }),
+      },
+      vi.fn(),
+    );
+
+    offlinePlain.emitInboundText({
+      reqId: 'req-plain-1',
+      msgid: 'msg-plain-1',
+      userid: 'm-plain',
+      corpid: 'corp-plain',
+      content: '无信任钩子回退来源JID',
+    });
+    await vi.waitFor(() =>
+      expect(spies.notifyNewImMessage).toHaveBeenCalledTimes(4),
+    );
+    expect(
+      db.getMessagesSince('web:unverified-ws', { timestamp: '', id: '' }),
+    ).toHaveLength(0);
+    expect(
+      db.getMessagesSince(plainJid, { timestamp: '', id: '' }).map((m) => m.id),
+    ).toContain('msg-plain-1');
+
+    await managerPlain.disconnectAll();
   });
 });
