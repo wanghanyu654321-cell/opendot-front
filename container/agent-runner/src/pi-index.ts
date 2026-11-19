@@ -43,6 +43,7 @@ import {
   DEFAULT_ALLOWED_TOOLS,
   isToolDisallowed,
   resolveDisallowedToolSet,
+  resolveEffectivePiToolPolicy,
 } from './tool-policy.js';
 
 const WORKSPACE_GROUP =
@@ -230,7 +231,11 @@ function applyTurnContext(
     message.receipt?.deliveryId || message.queryRunId || input.turnId || null;
 }
 
-function buildSystemPrompt(input: ContainerInput, ctx: McpContext): string {
+function buildSystemPrompt(
+  input: ContainerInput,
+  ctx: McpContext,
+  options?: { backgroundTasksEnabled?: boolean },
+): string {
   const channel = (input.currentSourceJid || input.chatJid).split(':')[0];
   const channelPrompt = fs.existsSync(
     path.join(PROMPTS_DIR, 'channels', `${channel}.md`),
@@ -238,6 +243,13 @@ function buildSystemPrompt(input: ContainerInput, ctx: McpContext): string {
     ? loadPrompt(`channels/${channel}.md`)
     : undefined;
   const identity = input.agentProfile?.identityPrompt?.trim();
+  const backgroundTasksEnabled =
+    options?.backgroundTasksEnabled ??
+    (DEFAULT_ALLOWED_TOOLS.includes('Task') &&
+      !isToolDisallowed(
+        'Task',
+        resolveDisallowedToolSet(input).canonicalLower,
+      ));
   const plan = buildMiniclawPromptPlan({
     platformIdentity: input.agentProfile?.isDefault
       ? loadPrompt('identity.miniclaw.md')
@@ -263,11 +275,9 @@ function buildSystemPrompt(input: ContainerInput, ctx: McpContext): string {
       : input.interactionMode === 'proactive'
         ? loadPrompt('output.proactive.md')
         : loadPrompt('output.assistant.md'),
-    backgroundTasks:
-      DEFAULT_ALLOWED_TOOLS.includes('Task') &&
-      !isToolDisallowed('Task', resolveDisallowedToolSet(input).canonicalLower)
-        ? loadPrompt('background-tasks.md')
-        : undefined,
+    backgroundTasks: backgroundTasksEnabled
+      ? loadPrompt('background-tasks.md')
+      : undefined,
     channel: channelPrompt
       ? {
           id: channel,
@@ -335,14 +345,11 @@ async function runTurn(
     latestIpcDeliveryId(initialMessages) || input.turnId || generateTurnId();
   ctx.currentInputTurnId = activeInputTurnId;
   let firstWakeAcknowledgementStarted = false;
-  const disallowedPolicy = resolveDisallowedToolSet(input);
-  const effectiveAllowedTools = [
-    ...DEFAULT_ALLOWED_TOOLS,
-    ...externalTools.map((tool) => tool.name),
-  ].filter((name) => !isToolDisallowed(name, disallowedPolicy.canonicalLower));
-  const effectiveCustomTools = [...customTools, ...externalTools].filter(
-    (tool) => !isToolDisallowed(tool.name, disallowedPolicy.canonicalLower),
-  );
+  const toolPolicy = resolveEffectivePiToolPolicy({
+    input,
+    customTools,
+    externalTools,
+  });
   const result = await runPiQueryAttempt({
     runtime,
     sessionOptions: {
@@ -353,12 +360,14 @@ async function runTurn(
       ),
       sessionId: input.sessionId,
       model: provider.model || undefined,
-      systemPrompt: buildSystemPrompt(input, ctx),
-      allowedTools: effectiveAllowedTools,
-      ...(disallowedPolicy.rawList.length > 0
-        ? { excludedTools: disallowedPolicy.rawList }
+      systemPrompt: buildSystemPrompt(input, ctx, {
+        backgroundTasksEnabled: toolPolicy.backgroundTasksEnabled,
+      }),
+      allowedTools: toolPolicy.effectiveAllowedTools,
+      ...(toolPolicy.excludedTools.length > 0
+        ? { excludedTools: toolPolicy.excludedTools }
         : {}),
-      customTools: effectiveCustomTools,
+      customTools: toolPolicy.effectiveCustomTools,
       provider: {
         endpointKind: provider.endpointKind,
         api: provider.modelApi,

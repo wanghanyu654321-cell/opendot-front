@@ -30,6 +30,54 @@ export type NativeModelIdentity = {
   runtime: 'node-durable';
 };
 
+export interface WeComPrecheckTelemetry {
+  readonly correlationId: string;
+  readonly botId: string;
+  readonly memberId: string;
+  readonly storeId?: string;
+  readonly route: string;
+  readonly gateReason: string;
+  readonly modelMs: number;
+  readonly errorCategory: string;
+  readonly outcomeKind: 'handled' | 'pass' | 'failed';
+}
+
+export interface WeComAgentTurnTelemetry {
+  readonly correlationId: string;
+  readonly workspaceFolder: string;
+  readonly profileId?: string;
+  readonly skillIds?: readonly string[];
+  readonly durationMs: number;
+  readonly status: 'success' | 'error' | 'aborted';
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+}
+
+export interface WeComOutboundAuthTelemetry {
+  readonly correlationId: string;
+  readonly botId: string;
+  readonly memberId: string;
+  readonly allowed: boolean;
+  readonly reason: string;
+  readonly policyVersion?: number;
+}
+
+export interface WeComDeliveryTelemetry {
+  readonly correlationId: string;
+  readonly botId: string;
+  readonly outboxStatus:
+    | 'delivered'
+    | 'uncertain'
+    | 'failed'
+    | 'retry_wait'
+    | 'busy'
+    | 'cancelled'
+    | 'lease_lost';
+  readonly wecomState: 'accepted' | 'blocked' | 'rejected' | 'unknown';
+  readonly chunkCount: number;
+  readonly durationMs?: number;
+}
+
 type Pending = {
   spans: ReadableSpan[];
   bytes: number;
@@ -38,6 +86,68 @@ type Pending = {
 const success: ExportResult = { code: ExportResultCode.SUCCESS };
 const hash = (value: string) =>
   createHash('sha256').update(value).digest('hex');
+const hashRef = (value: string) => hash(value).slice(0, 24);
+const SAFE_CODE_PATTERN = /^[a-zA-Z0-9._:-]{1,64}$/;
+const SAFE_SKILL_ID_PATTERN = /^[\w.:-]{1,64}$/;
+const WECOM_OUTCOME_KINDS = new Set<WeComPrecheckTelemetry['outcomeKind']>([
+  'handled',
+  'pass',
+  'failed',
+]);
+const WECOM_AGENT_STATUSES = new Set<WeComAgentTurnTelemetry['status']>([
+  'success',
+  'error',
+  'aborted',
+]);
+const WECOM_OUTBOX_STATUSES = new Set<WeComDeliveryTelemetry['outboxStatus']>([
+  'delivered',
+  'uncertain',
+  'failed',
+  'retry_wait',
+  'busy',
+  'cancelled',
+  'lease_lost',
+]);
+const WECOM_STATES = new Set<WeComDeliveryTelemetry['wecomState']>([
+  'accepted',
+  'blocked',
+  'rejected',
+  'unknown',
+]);
+
+function sanitizeCode(value: unknown, fallback = 'redacted'): string {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  if (!trimmed) return 'none';
+  return SAFE_CODE_PATTERN.test(trimmed) ? trimmed : fallback;
+}
+
+function sanitizeSkillIds(ids: unknown): string[] | undefined {
+  if (!Array.isArray(ids)) return undefined;
+  const sanitized = ids
+    .slice(0, 16)
+    .map((id) =>
+      typeof id === 'string' && SAFE_SKILL_ID_PATTERN.test(id.trim())
+        ? id.trim()
+        : 'invalid_skill_id',
+    );
+  return sanitized.length > 0 ? sanitized : undefined;
+}
+
+function normalizeDurationMs(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.round(value));
+}
+
+function normalizeNonNegativeInt(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.trunc(value));
+}
+
+function normalizeOptionalInt(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return Math.max(0, Math.trunc(value));
+}
 
 /** Bounded in bytes, not just span count. Official OTLP serialization is used
  * to measure the exact uncompressed request before placing it in memory. */
@@ -693,6 +803,149 @@ export class HostObservability {
       },
     };
   }
+  private sampledWeCom(correlationId: string): boolean {
+    if (
+      this.stopped ||
+      this.options.sampleRate === 0 ||
+      typeof correlationId !== 'string' ||
+      !correlationId.trim()
+    )
+      return false;
+    if (this.options.sampleRate >= 1) return true;
+    const key = `${this.options.installationId}:wecom:${correlationId}`;
+    return (
+      parseInt(hash(key).slice(0, 13), 16) / 0x10000000000000 <
+      this.options.sampleRate
+    );
+  }
+  private emitWeComSpan(
+    name:
+      | 'dot.wecom.precheck'
+      | 'dot.wecom.agent_turn'
+      | 'dot.wecom.outbound_auth'
+      | 'dot.wecom.delivery',
+    correlationId: string,
+    buildMetadata: () => Record<string, unknown>,
+    durationMs?: number,
+  ): void {
+    try {
+      if (!this.sampledWeCom(correlationId)) return;
+      const endedAt = Date.now();
+      const normalizedDurationMs =
+        durationMs === undefined ? 0 : normalizeDurationMs(durationMs);
+      const startedAt = endedAt - normalizedDurationMs;
+      const metadata = buildMetadata();
+      const span = otelContext.with(ROOT_CONTEXT, () =>
+        startObservation(
+          name,
+          { metadata },
+          { startTime: new Date(startedAt) },
+        ),
+      );
+      span.end(new Date(endedAt));
+    } catch {
+      /* Observability degradation must never block WeCom message handling. */
+    }
+  }
+  /** Redacted WeCom precheck decision span correlated by hashed correlationId. */
+  wecomPrecheck(input: WeComPrecheckTelemetry): void {
+    this.emitWeComSpan(
+      'dot.wecom.precheck',
+      input.correlationId,
+      () => {
+        const storeRef =
+          typeof input.storeId === 'string' && input.storeId.trim()
+            ? hashRef(input.storeId.trim())
+            : undefined;
+        return {
+          channel: 'wecom',
+          correlation_ref: hashRef(input.correlationId),
+          bot_ref: hashRef(input.botId),
+          member_ref: hashRef(input.memberId),
+          ...(storeRef ? { store_ref: storeRef } : {}),
+          route: sanitizeCode(input.route),
+          gate_reason: sanitizeCode(input.gateReason),
+          model_ms: normalizeDurationMs(input.modelMs),
+          error_category: sanitizeCode(input.errorCategory),
+          outcome_kind: WECOM_OUTCOME_KINDS.has(input.outcomeKind)
+            ? input.outcomeKind
+            : 'failed',
+        };
+      },
+      input.modelMs,
+    );
+  }
+  /** Redacted WeCom OpenDot Agent turn telemetry span. */
+  wecomAgentTurn(input: WeComAgentTurnTelemetry): void {
+    this.emitWeComSpan(
+      'dot.wecom.agent_turn',
+      input.correlationId,
+      () => {
+        const profileRef =
+          typeof input.profileId === 'string' && input.profileId.trim()
+            ? hashRef(input.profileId.trim())
+            : undefined;
+        const skillIds = sanitizeSkillIds(input.skillIds);
+        const inputTokens = normalizeOptionalInt(input.inputTokens);
+        const outputTokens = normalizeOptionalInt(input.outputTokens);
+        return {
+          channel: 'wecom',
+          correlation_ref: hashRef(input.correlationId),
+          workspace_ref: hashRef(input.workspaceFolder),
+          ...(profileRef ? { profile_ref: profileRef } : {}),
+          ...(skillIds ? { skill_ids: skillIds } : {}),
+          duration_ms: normalizeDurationMs(input.durationMs),
+          status: WECOM_AGENT_STATUSES.has(input.status)
+            ? input.status
+            : 'error',
+          ...(inputTokens === undefined ? {} : { input_tokens: inputTokens }),
+          ...(outputTokens === undefined
+            ? {}
+            : { output_tokens: outputTokens }),
+        };
+      },
+      input.durationMs,
+    );
+  }
+  /** Redacted WeCom outbound send authorization telemetry span. */
+  wecomOutboundAuth(input: WeComOutboundAuthTelemetry): void {
+    this.emitWeComSpan('dot.wecom.outbound_auth', input.correlationId, () => {
+      const policyVersion = normalizeOptionalInt(input.policyVersion);
+      return {
+        channel: 'wecom',
+        correlation_ref: hashRef(input.correlationId),
+        bot_ref: hashRef(input.botId),
+        member_ref: hashRef(input.memberId),
+        allowed: Boolean(input.allowed),
+        reason: sanitizeCode(input.reason),
+        ...(policyVersion === undefined
+          ? {}
+          : { policy_version: policyVersion }),
+      };
+    });
+  }
+  /** Redacted WeCom delivery & outbox settlement telemetry span. */
+  wecomDelivery(input: WeComDeliveryTelemetry): void {
+    const durationMs = normalizeOptionalInt(input.durationMs);
+    this.emitWeComSpan(
+      'dot.wecom.delivery',
+      input.correlationId,
+      () => ({
+        channel: 'wecom',
+        correlation_ref: hashRef(input.correlationId),
+        bot_ref: hashRef(input.botId),
+        outbox_status: WECOM_OUTBOX_STATUSES.has(input.outboxStatus)
+          ? input.outboxStatus
+          : 'failed',
+        wecom_state: WECOM_STATES.has(input.wecomState)
+          ? input.wecomState
+          : 'unknown',
+        chunk_count: normalizeNonNegativeInt(input.chunkCount),
+        ...(durationMs === undefined ? {} : { duration_ms: durationMs }),
+      }),
+      durationMs,
+    );
+  }
   async flush() {
     await this.provider.forceFlush();
   }
@@ -710,5 +963,39 @@ export class HostObservability {
       }),
     ]);
     await this.provider.shutdown().catch(() => {});
+  }
+}
+
+export function observeWeComPrecheck(input: WeComPrecheckTelemetry): void {
+  try {
+    active?.wecomPrecheck(input);
+  } catch {
+    /* Silent no-op when observability is unconfigured or degraded. */
+  }
+}
+
+export function observeWeComAgentTurn(input: WeComAgentTurnTelemetry): void {
+  try {
+    active?.wecomAgentTurn(input);
+  } catch {
+    /* Silent no-op when observability is unconfigured or degraded. */
+  }
+}
+
+export function observeWeComOutboundAuth(
+  input: WeComOutboundAuthTelemetry,
+): void {
+  try {
+    active?.wecomOutboundAuth(input);
+  } catch {
+    /* Silent no-op when observability is unconfigured or degraded. */
+  }
+}
+
+export function observeWeComDelivery(input: WeComDeliveryTelemetry): void {
+  try {
+    active?.wecomDelivery(input);
+  } catch {
+    /* Silent no-op when observability is unconfigured or degraded. */
   }
 }
