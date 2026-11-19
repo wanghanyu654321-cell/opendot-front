@@ -14,7 +14,10 @@ import {
 import { registerDurableImSender } from './personal-agent/durable-im-notice.js';
 import { getProductRuntime } from './personal-agent/product-runtime-store.js';
 import { startStoredHostObservability } from './personal-agent/host-observability-config.js';
-import { getHostObservability } from './personal-agent/host-observability.js';
+import {
+  getHostObservability,
+  observeWeComAgentTurn,
+} from './personal-agent/host-observability.js';
 import { CodingToolObservationTracker } from './personal-agent/coding-tool-observation.js';
 import {
   startFeedbackScoreExport,
@@ -500,6 +503,7 @@ import { getMergedTaskRunHistory } from './task-run-history.js';
 import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
 import {
   type WeComFrontClawRuntimeHandle,
+  deliverWeComTextViaOutbox,
   isWeComManagedWorkspaceFolder,
   startWeComFrontClawRuntime,
 } from './wecom-front-claw-runtime.js';
@@ -2680,6 +2684,7 @@ async function deliverScopedChannelOutput(
   input: {
     kind: 'text' | 'card' | 'image' | 'file';
     payload: unknown;
+    wecomText?: string;
     send: () => Promise<void>;
   },
 ): Promise<boolean | null> {
@@ -2748,7 +2753,7 @@ async function deliverScopedChannelOutput(
     ordinalSlot: ref.ordinalSlot,
   });
   const ordinal = stableChannelOutboxOrdinal(semanticIdentity);
-  const result = await deliverChannelOutboxItem({
+  const outboxBase = {
     provider: scope.provider,
     accountId: scope.accountId,
     sourceJid: scope.sourceJid,
@@ -2761,21 +2766,35 @@ async function deliverScopedChannelOutput(
     payload: input.payload,
     idempotencyKey: `${scope.turnRunId}:${semanticIdentity}`,
     owner: scope.owner,
-    delivery: {
-      mode: 'single',
-      send: async ({ item }) => {
-        // deliverChannelOutboxItem persists `sending` before entering here.
-        await input.send();
-        return {
-          providerMessageId: syntheticChannelProviderAck({
-            turnRunId: scope.turnRunId,
-            ordinal,
-            payloadHash: item.payloadHash,
-          }),
-        };
-      },
-    },
-  });
+  };
+  const result =
+    scope.provider === 'wecom' &&
+    input.kind === 'text' &&
+    input.wecomText !== undefined
+      ? await deliverWeComTextViaOutbox({
+          imManager,
+          targetJid,
+          text: input.wecomText,
+          correlationId: scope.inputTurnId || scope.turnRunId,
+          outbox: outboxBase,
+        })
+      : await deliverChannelOutboxItem({
+          ...outboxBase,
+          delivery: {
+            mode: 'single',
+            send: async ({ item }) => {
+              // deliverChannelOutboxItem persists `sending` before entering here.
+              await input.send();
+              return {
+                providerMessageId: syntheticChannelProviderAck({
+                  turnRunId: scope.turnRunId,
+                  ordinal,
+                  payloadHash: item.payloadHash,
+                }),
+              };
+            },
+          },
+        });
   if (result.status !== 'delivered') {
     logger.warn(
       {
@@ -2849,6 +2868,7 @@ async function sendImWithRetry(
         },
         {
           kind: 'text',
+          wecomText: getChannelType(imJid) === 'wecom' ? text : undefined,
           payload: buildInteractionTextOutboxPayload(
             text,
             deliveryOptions?.presentation,
@@ -9716,10 +9736,26 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  const wecomTurnStartedAt = isWeComRestrictedTurn ? Date.now() : 0;
+  let wecomTurnStatus: 'success' | 'error' | 'aborted' = 'error';
+  let wecomInputTokens: number | undefined;
+  let wecomOutputTokens: number | undefined;
+
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         queue.markRunnerActivity(chatJid);
+        if (
+          isWeComRestrictedTurn &&
+          output.status === 'stream' &&
+          output.streamEvent?.eventType === 'usage' &&
+          output.streamEvent.usage
+        ) {
+          wecomInputTokens =
+            (wecomInputTokens ?? 0) + output.streamEvent.usage.inputTokens;
+          wecomOutputTokens =
+            (wecomOutputTokens ?? 0) + output.streamEvent.usage.outputTokens;
+        }
         if (
           output.ipcReceipts?.length &&
           (!output.providerFailure || output.providerFailureTerminal === true)
@@ -9860,6 +9896,7 @@ async function runAgent(
     // Agent was interrupted by _close sentinel (home folder drain).
     // Propagate so processGroupMessages can skip cursor commit.
     if (output.status === 'closed') {
+      wecomTurnStatus = 'aborted';
       return { status: 'closed' };
     }
 
@@ -9878,12 +9915,32 @@ async function runAgent(
       return { status: 'error', error: output.error };
     }
 
+    wecomTurnStatus = 'success';
     return { status: 'success' };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
     return { status: 'error', error: errorMsg };
   } finally {
+    if (isWeComRestrictedTurn) {
+      observeWeComAgentTurn({
+        correlationId: turnId || `${group.folder}:${wecomTurnStartedAt}`,
+        workspaceFolder: group.folder,
+        profileId: resolvedAgentProfile?.id,
+        skillIds:
+          resolvedAgentProfile?.runtime_policy?.skills?.mode === 'custom'
+            ? resolvedAgentProfile.runtime_policy.skills.ids
+            : undefined,
+        durationMs: Math.max(0, Date.now() - wecomTurnStartedAt),
+        status: wecomTurnStatus,
+        ...(wecomInputTokens !== undefined
+          ? { inputTokens: wecomInputTokens }
+          : {}),
+        ...(wecomOutputTokens !== undefined
+          ? { outputTokens: wecomOutputTokens }
+          : {}),
+      });
+    }
     ipcWatcherManager?.unwatchGroup(group.folder);
   }
 }
