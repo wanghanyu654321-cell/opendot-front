@@ -50,6 +50,25 @@ export type WeComPrecheckPort = (
   event: WeComInboundTextEvent,
 ) => Promise<WeComPrecheckOutcome>;
 
+export interface WeComOutboundAuthRequest {
+  readonly corpId?: string;
+  readonly memberId: string;
+  readonly storeId?: string;
+  readonly capability?: 'marketing';
+}
+
+export type WeComOutboundAuthResult =
+  | {
+      readonly allowed: true;
+      readonly policyVersion: number;
+      readonly personId: string;
+      readonly storeId: string;
+    }
+  | {
+      readonly allowed: false;
+      readonly reason: string;
+    };
+
 export type ModelIntent =
   | 'report'
   | 'query'
@@ -118,6 +137,7 @@ export interface OpenDotClassifierRuntimeConfig {
   providerId: string | null;
   baseUrl: string;
   model: string;
+  maxTokens: number;
   apiKey?: string;
   authToken?: string;
   timeoutMs: number;
@@ -249,6 +269,9 @@ export interface WeComFrontClawBridgeOptions {
 export interface WeComFrontClawBridge {
   readonly precheck: WeComPrecheckPort;
   readonly driver: string;
+  authorizeOutbound(
+    req: WeComOutboundAuthRequest,
+  ): Promise<WeComOutboundAuthResult>;
   isActive(): boolean;
   leaseHeld(): boolean;
   startMaintenance(): void;
@@ -262,6 +285,9 @@ export interface WeComFrontClawBridge {
 
 const DEFAULT_BUDGET_MS = 15_000;
 const DEFAULT_MODEL_TIMEOUT_MS = 8_000;
+const DEFAULT_CLASSIFIER_MAX_TOKENS = 1024;
+const MIN_CLASSIFIER_MAX_TOKENS = 256;
+const MAX_CLASSIFIER_MAX_TOKENS = 4096;
 const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_RENEW_MS = 10_000;
 
@@ -281,6 +307,12 @@ export const SAFE_MARKETING_DISALLOWED_TOOLS = [
   'Write',
   'Edit',
   'NotebookEdit',
+  'Task',
+  'TaskOutput',
+  'TaskStop',
+  'WebFetch',
+  'WebSearch',
+  'mcp__miniclaw__*',
 ] as const;
 
 const DANGEROUS_TOOL_NAMES = new Set([
@@ -322,10 +354,18 @@ const FORBIDDEN_SECRET_ENV_KEYS = new Set([
 const MODEL_CLASSIFIER_SYSTEM_PROMPT = [
   '你是美容门店助手 Front Claw 的前置意图分类器。',
   '只输出一个合法 JSON 对象，不要包含 Markdown 代码块、解释或多余文本。',
-  '允许字段：intent, object, action, slots, confidence, uncertain。',
-  'intent 仅可为 report | query | amend | withdraw | appointment | target | chitchat | marketing | unknown。',
-  '若拿不准或含糊请设为 {"intent":"unknown","object":null,"action":null,"slots":{},"confidence":0,"uncertain":true}。',
-  '绝不猜测金额数字，amountText 若出现必须保留原始文本。',
+  '顶层仅允许这 6 个键：intent, object, action, slots, confidence, uncertain。',
+  'intent 仅可为：report | query | amend | withdraw | appointment | target | chitchat | marketing | unknown。',
+  'object 仅可为：null | performance | target | completion | entry | appointment | progress | ranking | summary。',
+  'action 仅可为：null | query | report | amend | cancel | delete。',
+  'slots 仅允许这 6 个键：amountText, customer, employee, index, period, store（禁止输出 customerName、projectName、amount、cents 等未定义键）。',
+  '映射规则：',
+  '- 员工报业绩：intent="report", object="performance", action="report"，客户称呼放入 slots.customer（须为原文子串），金额原文放入 slots.amountText（绝不猜数字或换算）。',
+  '- 查本人业绩/进度：intent="query", object="progress", action="query"；查全店汇总：object="summary", action="query"；查排名：object="ranking", action="query"。',
+  '- 改账：intent="amend", object="entry", action="amend"；撤回/作废：intent="withdraw", object="entry", action="cancel"。',
+  '- 预约：intent="appointment", object="appointment", action="report"|"query"|"cancel"；目标：intent="target", object="target", action="report"|"query"|"amend"。',
+  '- 客套闲聊：intent="chitchat", object=null, action=null, slots={}；营销文案/非店务创作：intent="marketing", object=null, action=null, slots={}。',
+  'confidence 为 0..1 数值，uncertain 为布尔值；若拿不准或含糊请设为 {"intent":"unknown","object":null,"action":null,"slots":{},"confidence":0,"uncertain":true}。',
 ].join('\n');
 
 interface FrontClawBootModule {
@@ -365,6 +405,18 @@ interface FrontClawMem0Module {
 
 interface FrontClawAccessPolicyModule {
   CAPABILITIES: readonly string[];
+  readPolicy: (store: {
+    getConfig: (key: string) => Promise<string | null>;
+  }) => Promise<{ policy: string | null; highWater: string | null }>;
+  decideAccess: (
+    raw: { policy: string | null; highWater: string | null },
+    person: BridgePerson | null,
+    capability: string,
+    storeId: string,
+    platform?: readonly string[],
+  ) =>
+    | { allowed: true; version: number; role: BridgePerson['tier'] }
+    | { allowed: false; reason: string; version?: number };
 }
 
 interface FrontClawLeaseModule {
@@ -688,6 +740,25 @@ function readOpenDotClaudeConfig(providerIdOverride?: string): {
   }
 }
 
+function parseClassifierMaxTokens(raw: string | number | undefined): number {
+  if (typeof raw === 'number') {
+    return Number.isInteger(raw) &&
+      raw >= MIN_CLASSIFIER_MAX_TOKENS &&
+      raw <= MAX_CLASSIFIER_MAX_TOKENS
+      ? raw
+      : DEFAULT_CLASSIFIER_MAX_TOKENS;
+  }
+  if (typeof raw !== 'string') return DEFAULT_CLASSIFIER_MAX_TOKENS;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_CLASSIFIER_MAX_TOKENS;
+  const parsed = Number(trimmed);
+  return Number.isInteger(parsed) &&
+    parsed >= MIN_CLASSIFIER_MAX_TOKENS &&
+    parsed <= MAX_CLASSIFIER_MAX_TOKENS
+    ? parsed
+    : DEFAULT_CLASSIFIER_MAX_TOKENS;
+}
+
 /**
  * 读取 OpenDot src/runtime-config.ts 中当前生效的模型配置，并结合 FC_MODEL_* 环境变量决定桩或真模型模式。
  * 遵循 front-claw R7：默认永远为 stub，不会在默认/单测路径偷偷外发网络请求。
@@ -733,10 +804,14 @@ export function resolveOpenDotClassifierConfig(
     env.ANTHROPIC_BASE_URL?.trim() ||
     'https://api.anthropic.com';
   const model =
+    env.FC_MODEL_CLASSIFIER_MODEL?.trim() ||
     objConfig?.model?.trim() ||
     config.anthropicModel.trim() ||
     env.ANTHROPIC_MODEL?.trim() ||
     '';
+  const maxTokens = parseClassifierMaxTokens(
+    env.FC_MODEL_CLASSIFIER_MAX_TOKENS,
+  );
   const apiKey =
     (config.anthropicApiKey || env.ANTHROPIC_API_KEY || '').trim() || undefined;
   const authToken =
@@ -753,6 +828,7 @@ export function resolveOpenDotClassifierConfig(
     providerId,
     baseUrl,
     model,
+    maxTokens,
     ...(apiKey ? { apiKey } : {}),
     ...(authToken ? { authToken } : {}),
     timeoutMs,
@@ -767,7 +843,11 @@ function buildAnthropicMessagesUrl(baseUrl: string): string {
 }
 
 function parseStrictJsonObject(raw: string): unknown {
-  const trimmed = raw.trim();
+  let trimmed = raw.trim();
+  const fenceMatch = /^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/i.exec(trimmed);
+  if (fenceMatch) {
+    trimmed = fenceMatch[1]!.trim();
+  }
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined;
   try {
     const parsed: unknown = JSON.parse(trimmed);
@@ -833,7 +913,8 @@ export function createModelClassifierFromOpenDotConfig(
       signal,
       body: JSON.stringify({
         model: runtime.model,
-        max_tokens: 256,
+        // Thinking-enabled Anthropic-compatible models (e.g. deepseek-flash) consume thinking_tokens inside max_tokens.
+        max_tokens: parseClassifierMaxTokens(runtime.maxTokens),
         temperature: 0,
         system: MODEL_CLASSIFIER_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: text.slice(0, 2000) }],
@@ -1436,8 +1517,187 @@ export async function createWeComFrontClawBridge(
     return outcomePromise;
   }
 
+  async function authorizeOutbound(
+    req: WeComOutboundAuthRequest,
+  ): Promise<WeComOutboundAuthResult> {
+    try {
+      if (closing || closed) {
+        return { allowed: false, reason: 'bridge_closed' };
+      }
+      if (!isLeaseHeld()) {
+        return { allowed: false, reason: 'lease_not_held' };
+      }
+      const activeFence = lease?.fence() ?? undefined;
+      if (activeFence && !(await fenceStillHolds(activeFence))) {
+        return { allowed: false, reason: 'lease_not_held' };
+      }
+
+      if (!req || typeof req !== 'object' || !nonEmpty(req.memberId)) {
+        return { allowed: false, reason: 'invalid_request' };
+      }
+      if (req.corpId !== undefined && !nonEmpty(req.corpId)) {
+        return { allowed: false, reason: 'corp_mismatch' };
+      }
+      if (req.storeId !== undefined && !nonEmpty(req.storeId)) {
+        return { allowed: false, reason: 'store_mismatch' };
+      }
+      const capability = req.capability ?? 'marketing';
+      if (capability !== 'marketing') {
+        return { allowed: false, reason: 'unsupported_capability' };
+      }
+
+      let rows: BridgeWecomBotBinding[];
+      try {
+        rows = structuredClone(await boot.bindings.listBindings());
+      } catch {
+        return { allowed: false, reason: 'invalid_directory' };
+      }
+      if (
+        !Array.isArray(rows) ||
+        rows.some((row) => !row || typeof row !== 'object')
+      ) {
+        return { allowed: false, reason: 'invalid_directory' };
+      }
+
+      const memberRows = rows.filter((row) => row.memberId === req.memberId);
+      if (memberRows.length === 0) {
+        return { allowed: false, reason: 'no_binding' };
+      }
+
+      let snapshots: Readonly<BridgeWecomBotBinding>[];
+      try {
+        snapshots = memberRows.map((row) =>
+          Object.freeze(mods.bindings.snapshotBinding(row)),
+        );
+      } catch {
+        return { allowed: false, reason: 'invalid_directory' };
+      }
+
+      let binding: Readonly<BridgeWecomBotBinding>;
+      if (req.corpId !== undefined) {
+        const corpMatches = snapshots.filter(
+          (row) => row.corpId === req.corpId,
+        );
+        if (corpMatches.length === 0) {
+          return { allowed: false, reason: 'corp_mismatch' };
+        }
+        if (
+          new Set(corpMatches.map((row) => row.botId)).size !==
+          corpMatches.length
+        ) {
+          return { allowed: false, reason: 'binding_ambiguous' };
+        }
+        const activeMatches = corpMatches.filter((row) => row.active);
+        if (activeMatches.length === 0) {
+          return { allowed: false, reason: 'binding_inactive' };
+        }
+        if (activeMatches.length !== 1) {
+          return { allowed: false, reason: 'binding_ambiguous' };
+        }
+        binding = activeMatches[0]!;
+      } else {
+        const activeMatches = snapshots.filter((row) => row.active);
+        if (activeMatches.length === 0) {
+          return { allowed: false, reason: 'binding_inactive' };
+        }
+        if (
+          activeMatches.length !== 1 ||
+          new Set(activeMatches.map((row) => row.corpId)).size !== 1 ||
+          new Set(activeMatches.map((row) => row.accountId)).size !== 1
+        ) {
+          return { allowed: false, reason: 'binding_ambiguous' };
+        }
+        binding = activeMatches[0]!;
+      }
+
+      if (!nonEmpty(binding.corpId)) {
+        return { allowed: false, reason: 'missing_domain' };
+      }
+
+      let person: BridgePerson | null;
+      let people: BridgePerson[];
+      try {
+        person = structuredClone(
+          await boot.store.getPersonByMember(req.memberId),
+        );
+        people = structuredClone(await boot.store.listPeople());
+      } catch {
+        return { allowed: false, reason: 'invalid_directory' };
+      }
+
+      if (!person) return { allowed: false, reason: 'person_not_found' };
+      if (!person.active) return { allowed: false, reason: 'person_inactive' };
+      if (
+        person.memberId !== binding.memberId ||
+        person.accountId !== binding.accountId
+      ) {
+        return { allowed: false, reason: 'binding_mismatch' };
+      }
+      if ('corpId' in person && person.corpId !== binding.corpId) {
+        return { allowed: false, reason: 'corp_mismatch' };
+      }
+      if (
+        !nonEmpty(person.personId) ||
+        !nonEmpty(person.accountId) ||
+        !nonEmpty(person.storeId) ||
+        !nonEmpty(person.displayName) ||
+        !nonEmpty(person.storeName)
+      ) {
+        return { allowed: false, reason: 'incomplete_profile' };
+      }
+      if (
+        people.filter((p) => p.memberId === binding.memberId).length !== 1 ||
+        people.filter((p) => p.accountId === binding.accountId).length !== 1
+      ) {
+        return { allowed: false, reason: 'person_ambiguous' };
+      }
+      const current = people.find((p) => p.personId === person!.personId);
+      if (
+        !current?.active ||
+        current.memberId !== binding.memberId ||
+        current.accountId !== binding.accountId ||
+        !nonEmpty(current.displayName) ||
+        !nonEmpty(current.storeId) ||
+        !nonEmpty(current.storeName) ||
+        ('corpId' in current && current.corpId !== binding.corpId)
+      ) {
+        return { allowed: false, reason: 'person_mismatch' };
+      }
+
+      if (typeof boot.store.getConfig !== 'function') {
+        return { allowed: false, reason: 'policy_store_unavailable' };
+      }
+      const targetStoreId = req.storeId ?? person.storeId;
+      const rawPolicy = await mods.accessPolicy.readPolicy({
+        getConfig: (key) => boot.store.getConfig!(key),
+      });
+      const decision = mods.accessPolicy.decideAccess(
+        rawPolicy,
+        person,
+        capability,
+        targetStoreId,
+        platformCapabilities,
+      );
+      if (!decision.allowed) {
+        return { allowed: false, reason: decision.reason };
+      }
+      if (activeFence && !(await fenceStillHolds(activeFence))) {
+        return { allowed: false, reason: 'lease_not_held' };
+      }
+      return {
+        allowed: true,
+        policyVersion: decision.version,
+        personId: person.personId,
+        storeId: targetStoreId,
+      };
+    } catch {
+      return { allowed: false, reason: 'auth_check_failed' };
+    }
+  }
+
   return {
     precheck,
+    authorizeOutbound,
     driver: boot.driver,
     isActive: () => !closing && !closed && isLeaseHeld(),
     leaseHeld: () => isLeaseHeld(),

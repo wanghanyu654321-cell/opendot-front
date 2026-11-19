@@ -9,14 +9,22 @@ import {
   SAFE_MARKETING_DISALLOWED_TOOLS,
   validateTargetAgentProfile,
   type WeComInboundTextEvent,
+  type WeComOutboundAuthRequest,
+  type WeComOutboundAuthResult,
   type WeComPrecheckPort,
 } from '../src/wecom-front-claw-bridge.js';
 import {
   CLARIFY_REPLY,
   MARKETING_UNAVAILABLE,
 } from '../packages/front-claw/src/role-eval/employee-entry.js';
-import { ACCESS_DENIED } from '../packages/front-claw/src/role-eval/employee-loop.js';
 import {
+  ACCESS_DENIED,
+  ALREADY_CONFIRMED_TEXT,
+  D175_INTERLEAVED_GUIDANCE,
+} from '../packages/front-claw/src/role-eval/employee-loop.js';
+import {
+  ACCESS_POLICY_HIGH_WATER_KEY,
+  ACCESS_POLICY_KEY,
   CAPABILITIES,
   updateAccessPolicy,
   type AccessPolicy,
@@ -287,7 +295,7 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     expect(entries[0]?.ownerPersonId).toBe('p-lin');
   });
 
-  it('② 有 pending 草稿时发营销请求返回 pass 且保留 pending 草稿，随后发「对」成功入账 1 笔', async () => {
+  it('② D175：有 pending 草稿时穿插营销返回 pass 且保留草稿；随后单字「对」拒入账并提示，回复「确认入账」精准入账 1 笔', async () => {
     const fx = await createBridgeFixture();
     cleanups.push(() => fx.bridge.close());
 
@@ -319,8 +327,23 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     expect(JSON.stringify(passed)).not.toContain('postgres://');
     expect('store' in (fx.bridge as unknown as Record<string, unknown>)).toBe(false);
 
-    // 随后发送「对」，原草稿准确入账 1 笔
-    const confirmed = await fx.send('m-wang', '对');
+    // D175 确认歧义门禁：穿插软对话后发单字「对」严禁入账，保留草稿并给出明确二次提示
+    const blockedSingleChar = await fx.send('m-wang', '对');
+    expect(blockedSingleChar.kind).toBe('handled');
+    if (blockedSingleChar.kind !== 'handled') throw new Error('expected handled');
+    const guardReply = blockedSingleChar.replies.join('\n');
+    expect(guardReply).toContain(D175_INTERLEAVED_GUIDANCE);
+    expect(guardReply).toContain('王姐');
+    expect(guardReply).toContain('560');
+    expect(guardReply).toContain(draftBefore!.draftId);
+    expect(guardReply).not.toContain('已入账');
+    expect((await fx.store.getOpenDraft('p-wang'))?.draftId).toBe(
+      draftBefore?.draftId,
+    );
+    expect(await fx.store.listEntries()).toHaveLength(0);
+
+    // 明确回复「确认入账」精准入账 1 笔，且只入账 1 次
+    const confirmed = await fx.send('m-wang', '确认入账');
     expect(confirmed.kind).toBe('handled');
     if (confirmed.kind !== 'handled') throw new Error('expected handled');
     expect(confirmed.replies.join('\n')).toContain('已入账 1 笔');
@@ -329,6 +352,13 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     const entries = await fx.store.listEntries();
     expect(entries).toHaveLength(1);
     expect(entries[0]?.amount).toBe(56000);
+
+    // 再次重复发「对」提示已经入账，不重复写账
+    const duplicateConfirm = await fx.send('m-wang', '对');
+    expect(duplicateConfirm.kind).toBe('handled');
+    if (duplicateConfirm.kind !== 'handled') throw new Error('expected handled');
+    expect(duplicateConfirm.replies).toEqual([ALREADY_CONFIRMED_TEXT]);
+    expect(await fx.store.listEntries()).toHaveLength(1);
   });
 
   it('②-b 有已过期 pending 草稿时发营销请求：结算过期项并携带 expiredReminder 放行', async () => {
@@ -817,5 +847,407 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     expect(outcome.kind).toBe('handled');
     if (outcome.kind !== 'handled') throw new Error('expected handled');
     expect(outcome.replies).toEqual([CLARIFY_REPLY]);
+  });
+
+  it('live 分类请求携带足够 max_tokens 与完整枚举约束，并支持自然句报数出草稿（含 fenced JSON）', async () => {
+    const cfg = resolveOpenDotClassifierConfig({
+      env: {
+        FC_MODEL_MODE: 'live',
+        ANTHROPIC_BASE_URL: 'https://model.example.test',
+        ANTHROPIC_MODEL: 'deepseek-flash',
+        ANTHROPIC_AUTH_TOKEN: 'sk-ant-test-token',
+      },
+    });
+
+    let capturedBody: Record<string, unknown> | undefined;
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          content: [
+            { type: 'thinking', thinking: 'reasoning...' },
+            {
+              type: 'text',
+              text: '```json\n{"intent":"report","object":"performance","action":"report","slots":{"customer":"张姐","amountText":"六百八十块"},"confidence":0.95,"uncertain":false}\n```',
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    cleanups.push(async () => {
+      globalThis.fetch = originalFetch;
+    });
+
+    const classifier = createModelClassifierFromOpenDotConfig(cfg);
+    const fx = await createBridgeFixture({
+      bridgeOptions: {
+        modelClassify: classifier,
+      },
+    });
+    cleanups.push(() => fx.bridge.close());
+
+    const outcome = await fx.send('m-wang', '张姐刚刚做了一个补水项目六百八十块');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(Number(capturedBody?.max_tokens)).toBeGreaterThanOrEqual(1024);
+    expect(String(capturedBody?.system)).toContain('object="performance", action="report"');
+    expect(String(capturedBody?.system)).toContain('amountText, customer, employee, index, period, store');
+
+    expect(outcome.kind).toBe('handled');
+    if (outcome.kind !== 'handled') throw new Error('expected handled');
+    expect(outcome.replies[0]).toContain('张姐');
+    expect(outcome.replies[0]).toContain('680');
+    const draft = await fx.store.getOpenDraft('p-wang');
+    expect(draft).not.toBeNull();
+    expect(await fx.store.listEntries()).toHaveLength(0);
+  });
+
+  it('D175 补充：穿插后「全部确认」入账 1 笔、「取消」作废清标记、新报单替代清标记、未穿插直接「确认入账」', async () => {
+    const fx = await createBridgeFixture();
+    cleanups.push(() => fx.bridge.close());
+
+    // 1. 穿插后回复「全部确认」精准入账 1 笔并清理标记
+    await fx.send('m-wang', '12号测试A店\n420（王姐）');
+    expect((await fx.send('m-wang', '帮我写一条春日促销文案')).kind).toBe('pass');
+    const singleBlocked = await fx.send('m-wang', '对');
+    expect(singleBlocked.kind).toBe('handled');
+    expect(await fx.store.listEntries()).toHaveLength(0);
+
+    const confirmedAll = await fx.send('m-wang', '全部确认');
+    expect(confirmedAll.kind).toBe('handled');
+    if (confirmedAll.kind !== 'handled') throw new Error('expected handled');
+    expect(confirmedAll.replies.join('\n')).toContain('已入账 1 笔');
+    expect(await fx.store.listEntries()).toHaveLength(1);
+
+    // 2. 穿插后回复「取消」作废草稿并清标记
+    await fx.send('m-wang', '12号测试A店\n310（王姐）');
+    expect((await fx.send('m-wang', '再帮我写一条七夕促销文案')).kind).toBe('pass');
+    const cancelled = await fx.send('m-wang', '取消');
+    expect(cancelled.kind).toBe('handled');
+    if (cancelled.kind !== 'handled') throw new Error('expected handled');
+    expect(cancelled.replies.join('\n')).toContain('已取消');
+    expect(await fx.store.getOpenDraft('p-wang')).toBeNull();
+    expect(await fx.store.listEntries()).toHaveLength(1);
+
+    // 3. 穿插后发新报单替代旧草稿，旧标记失效，新草稿允许直接回「对」入账
+    await fx.send('m-wang', '12号测试A店\n250（王姐）');
+    expect((await fx.send('m-wang', '帮我写一条客户回访文案')).kind).toBe('pass');
+    const replaced = await fx.send('m-wang', '12号测试A店\n720（王姐）');
+    expect(replaced.kind).toBe('handled');
+    fx.setNow(new Date('2026-11-12T02:00:05Z'));
+    const directConfirmAfterReplace = await fx.send('m-wang', '对');
+    expect(directConfirmAfterReplace.kind).toBe('handled');
+    if (directConfirmAfterReplace.kind !== 'handled') {
+      throw new Error('expected handled');
+    }
+    expect(directConfirmAfterReplace.replies.join('\n')).toContain('已入账 1 笔');
+    expect(directConfirmAfterReplace.replies.join('\n')).toContain('720');
+    expect(await fx.store.listEntries()).toHaveLength(2);
+
+    // 4. 未穿插时「确认入账」也可直接入账
+    await fx.send('m-lin', '12号测试A店\n180（小林）');
+    const directExplicit = await fx.send('m-lin', '确认入账');
+    expect(directExplicit.kind).toBe('handled');
+    if (directExplicit.kind !== 'handled') throw new Error('expected handled');
+    expect(directExplicit.replies.join('\n')).toContain('已入账 1 笔');
+    expect(await fx.store.listEntries()).toHaveLength(3);
+  });
+
+  it('分类模型配置分离：FC_MODEL_CLASSIFIER_MODEL 与 FC_MODEL_CLASSIFIER_MAX_TOKENS 校验与 stub 保守默认', async () => {
+    // 默认 FC_MODEL_MODE 必须保持 stub，未显式设为 live 时不创建分类器
+    const defaultCfg = resolveOpenDotClassifierConfig({ env: {} });
+    expect(defaultCfg.mode).toBe('stub');
+    expect(defaultCfg.maxTokens).toBe(1024);
+    expect(createModelClassifierFromOpenDotConfig(defaultCfg)).toBeUndefined();
+
+    // FC_MODEL_CLASSIFIER_MODEL 优先覆盖 modelConfig.model 与 ANTHROPIC_MODEL
+    const overridden = resolveOpenDotClassifierConfig({
+      env: {
+        FC_MODEL_MODE: 'live',
+        ANTHROPIC_BASE_URL: 'https://model.example.test',
+        ANTHROPIC_MODEL: 'claude-sonnet-default',
+        ANTHROPIC_AUTH_TOKEN: 'sk-ant-test-token',
+        FC_MODEL_CLASSIFIER_MODEL: 'deepseek-classifier-fast',
+        FC_MODEL_CLASSIFIER_MAX_TOKENS: '2048',
+      },
+      modelConfig: { model: 'ignored-model' },
+    });
+    expect(overridden.model).toBe('deepseek-classifier-fast');
+    expect(overridden.maxTokens).toBe(2048);
+
+    // 边界合法值 256 / 4096 生效，非法值一律回退 1024
+    expect(
+      resolveOpenDotClassifierConfig({
+        env: { FC_MODEL_CLASSIFIER_MAX_TOKENS: '256' },
+      }).maxTokens,
+    ).toBe(256);
+    expect(
+      resolveOpenDotClassifierConfig({
+        env: { FC_MODEL_CLASSIFIER_MAX_TOKENS: '4096' },
+      }).maxTokens,
+    ).toBe(4096);
+    for (const bad of ['', '100', '4097', '-5', '0', '512.5', 'abc']) {
+      expect(
+        resolveOpenDotClassifierConfig({
+          env: { FC_MODEL_CLASSIFIER_MAX_TOKENS: bad },
+        }).maxTokens,
+      ).toBe(1024);
+    }
+
+    // live 请求实际使用覆盖后的 model 与 max_tokens
+    let capturedBody: Record<string, unknown> | undefined;
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                intent: 'unknown',
+                object: null,
+                action: null,
+                slots: {},
+                confidence: 0,
+                uncertain: true,
+              }),
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    cleanups.push(async () => {
+      globalThis.fetch = originalFetch;
+    });
+
+    const classifier = createModelClassifierFromOpenDotConfig(overridden);
+    expect(classifier).toBeTypeOf('function');
+    await classifier!({
+      text: '今天有点不明白的情况',
+      signal: new AbortController().signal,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(capturedBody?.model).toBe('deepseek-classifier-fast');
+    expect(capturedBody?.max_tokens).toBe(2048);
+  });
+
+  it('省略第二人称自查边界：自然问法命中本人进度，查同事/本店/带金额不误伤', async () => {
+    const modelClassify = vi.fn(async () => ({
+      intent: 'unknown',
+      object: null,
+      action: null,
+      slots: {},
+      confidence: 0,
+      uncertain: true,
+    }));
+    const fx = await createBridgeFixture({
+      bridgeOptions: { modelClassify },
+    });
+    cleanups.push(() => fx.bridge.close());
+
+    // 先入账一笔作为本人进度数据源
+    await fx.send('m-lin', '12号测试A店\n380（小林）');
+    await fx.send('m-lin', '对');
+
+    for (const phrase of [
+      '帮我查看今天做了多少业绩',
+      '帮我查今天业绩',
+      '帮我看今天进度',
+    ]) {
+      const res = await fx.send('m-lin', phrase);
+      expect(res.kind, phrase).toBe('handled');
+      if (res.kind !== 'handled') throw new Error('expected handled');
+      expect(res.replies.join('\n'), phrase).toContain('380');
+    }
+    expect(modelClassify).not.toHaveBeenCalled();
+
+    // 查同事业绩：必须被 M03/R3 拒绝（failed / 不能做）
+    const peer = await fx.send('m-wang', '帮我查小林今天业绩');
+    expect(peer.kind).toBe('failed');
+    if (peer.kind !== 'failed') throw new Error('expected failed');
+    expect(peer.replies.join('\n')).toContain('不能做');
+
+    // 查本店汇总：普通员工无权，拒绝并返回 failed，绝不当本人进度
+    const storePerf = await fx.send('m-lin', '帮我查本店今天业绩');
+    expect(storePerf.kind).toBe('failed');
+
+    // 带客户与金额语句：不误判为本人进度查询
+    const withAmount = await fx.send('m-lin', '帮我查张姐 680');
+    expect(withAmount.kind).toBe('handled');
+    if (withAmount.kind !== 'handled') throw new Error('expected handled');
+    expect(withAmount.replies.join('\n')).not.toContain('今天 已做');
+    expect(await fx.store.listEntries()).toHaveLength(1);
+  });
+
+  it('SAFE_MARKETING_DISALLOWED_TOOLS 收紧列表与 authorizeOutbound() 实时 M03 出站复核（无缓存、不泄密）', async () => {
+    expect([...SAFE_MARKETING_DISALLOWED_TOOLS]).toEqual([
+      'Bash',
+      'Write',
+      'Edit',
+      'NotebookEdit',
+      'Task',
+      'TaskOutput',
+      'TaskStop',
+      'WebFetch',
+      'WebSearch',
+      'mcp__miniclaw__*',
+    ]);
+
+    const fx = await createBridgeFixture();
+    cleanups.push(() => fx.bridge.close());
+
+    const authCheck: (req: WeComOutboundAuthRequest) => Promise<WeComOutboundAuthResult> =
+      fx.bridge.authorizeOutbound;
+    expect(typeof authCheck).toBe('function');
+
+    // 1. 正常放行（默认 capability = 'marketing'）
+    const ok1 = await fx.bridge.authorizeOutbound({
+      corpId: CORP_A,
+      memberId: 'm-wang',
+    });
+    expect(ok1).toEqual({
+      allowed: true,
+      policyVersion: 1,
+      personId: 'p-wang',
+      storeId: 's-a',
+    });
+
+    // 2. 跨店不匹配直接拒绝
+    const crossStore = await fx.bridge.authorizeOutbound({
+      corpId: CORP_A,
+      memberId: 'm-wang',
+      storeId: 's-b',
+      capability: 'marketing',
+    });
+    expect(crossStore).toEqual({
+      allowed: false,
+      reason: 'store_out_of_scope',
+    });
+
+    // 3. corpId 不匹配直接拒绝
+    const wrongCorp = await fx.bridge.authorizeOutbound({
+      corpId: CORP_B,
+      memberId: 'm-wang',
+    });
+    expect(wrongCorp).toEqual({
+      allowed: false,
+      reason: 'corp_mismatch',
+    });
+
+    // 4. 实时重读策略：撤权 marketing 后立即拒绝（绝不缓存）
+    const revoked = await updateAccessPolicy(fx.store, {
+      expectedVersion: 1,
+      next: cleanPolicy(2, {
+        wangCapabilities: ['report_self', 'progress_self'],
+      }),
+      actor: 'admin',
+      reason: 'revoke-outbound-marketing',
+      at: '2026-11-12T02:10:00Z',
+    });
+    expect(revoked.ok).toBe(true);
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toEqual({
+      allowed: false,
+      reason: 'capability_denied',
+    });
+
+    // 5. 高水位回滚（旧策略原文写回）必须拒绝
+    await fx.store.updateConfigLocked(ACCESS_POLICY_KEY, [], () => ({
+      [ACCESS_POLICY_KEY]: JSON.stringify(cleanPolicy(1)),
+    }));
+    expect(await fx.store.getConfig(ACCESS_POLICY_HIGH_WATER_KEY)).toBe('2');
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toEqual({
+      allowed: false,
+      reason: 'stale_policy',
+    });
+
+    // 6. 策略损坏（无效 JSON）必须拒绝
+    await fx.store.updateConfigLocked(ACCESS_POLICY_KEY, [], () => ({
+      [ACCESS_POLICY_KEY]: '{broken-json',
+    }));
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toEqual({
+      allowed: false,
+      reason: 'broken_policy',
+    });
+
+    // 恢复高版本有效策略，继续测绑定失效与人员停用
+    const restored = await updateAccessPolicy(fx.store, {
+      expectedVersion: null,
+      next: cleanPolicy(3),
+      actor: 'admin',
+      reason: 'restore-for-binding-test',
+      at: '2026-11-12T02:11:00Z',
+    });
+    expect(restored.ok).toBe(true);
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toEqual({
+      allowed: true,
+      policyVersion: 3,
+      personId: 'p-wang',
+      storeId: 's-a',
+    });
+
+    // 7. 成员停用拒绝
+    const origWang = (await fx.store.getPersonByMember('m-wang'))!;
+    await fx.store.savePerson({ ...origWang, active: false });
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toEqual({
+      allowed: false,
+      reason: 'person_inactive',
+    });
+    await fx.store.savePerson(origWang);
+
+    // 8. 绑定失效拒绝
+    await fx.bindings.saveBinding({
+      botId: BOT_ID,
+      corpId: CORP_A,
+      memberId: 'm-wang',
+      accountId: 'a-wang',
+      version: 2,
+      active: false,
+    });
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toEqual({
+      allowed: false,
+      reason: 'binding_inactive',
+    });
+    await fx.bindings.saveBinding({
+      botId: BOT_ID,
+      corpId: CORP_A,
+      memberId: 'm-wang',
+      accountId: 'a-wang',
+      version: 3,
+      active: true,
+    });
+
+    // 9. 存储抛出含连接串异常时，安全返回 denied 且不泄露 PG 连接串或 store
+    const origGetConfig = fx.store.getConfig.bind(fx.store);
+    fx.store.getConfig = async () => {
+      throw new Error(
+        'pg failure postgres://secret-user:secret-pass@127.0.0.1:5432/front_claw_secret',
+      );
+    };
+    const errResult = await fx.bridge.authorizeOutbound({
+      corpId: CORP_A,
+      memberId: 'm-wang',
+    });
+    fx.store.getConfig = origGetConfig;
+    expect(errResult.allowed).toBe(false);
+    expect(JSON.stringify(errResult)).not.toContain('postgres://');
+    expect(JSON.stringify(errResult)).not.toContain('secret-pass');
+    expect('store' in (fx.bridge as unknown as Record<string, unknown>)).toBe(false);
   });
 });
