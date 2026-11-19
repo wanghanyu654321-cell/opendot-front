@@ -41,7 +41,11 @@ import {
   type WhatsAppConnectionConfig,
   type WhatsAppConnectionState,
 } from './whatsapp.js';
-import type { WeComConnectionConfig } from './wecom.js';
+import type {
+  WeComConnectionConfig,
+  WeComDeliveryOutcomeListener,
+  WeComOutboxDeliveryOutcome,
+} from './wecom.js';
 import { rm } from 'fs/promises';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
@@ -537,6 +541,13 @@ export class IMConnectionManager {
             },
           }
         : {}),
+      ...(opts.isTrustedManagedWorkspaceJid
+        ? {
+            isTrustedManagedWorkspaceJid: (workspaceJid: string) =>
+              inboundAllowed() &&
+              opts.isTrustedManagedWorkspaceJid!(workspaceJid),
+          }
+        : {}),
     };
   }
 
@@ -792,6 +803,80 @@ export class IMConnectionManager {
       // Preserve the historical three-argument connector call shape.
       await channel.sendMessage(chatId, text, localImagePaths);
     }
+  }
+
+  /**
+   * Optional receipt-aware outbound send (currently implemented for WeCom).
+   * Returns `null` for non-WeCom / unsupported channels so callers can keep
+   * using their existing send path untouched.
+   */
+  async sendMessageWithReceipt(
+    jid: string,
+    text: string,
+    opts?: { readonly correlationId?: string },
+  ): Promise<WeComOutboxDeliveryOutcome | null> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return null;
+
+    const chatId = extractProviderTarget(jid);
+    const connectedChannel = this.findChannelForJid(jid, channelType);
+    if (connectedChannel?.sendMessageWithReceipt) {
+      return connectedChannel.sendMessageWithReceipt(chatId, text, opts);
+    }
+    if (channelType !== 'wecom') {
+      return null;
+    }
+
+    const baseJid = channelConversationJid(jid);
+    const scopedAccountId = parseChannelAddress(jid)?.channelAccountId;
+    const group = isDatabaseInitialized()
+      ? getRegisteredGroup(baseJid)
+      : undefined;
+    if (group?.created_by) {
+      const accountId =
+        scopedAccountId ??
+        group.channel_account_id ??
+        getLegacyChannelAccount(
+          group.created_by,
+          'wecom' as Parameters<typeof getLegacyChannelAccount>[1],
+        )?.id;
+      const tracked = this.connections
+        .get(group.created_by)
+        ?.channels.get(this.channelKey('wecom', accountId));
+      if (tracked?.sendMessageWithReceipt) {
+        let principalAllowed = !isDatabaseInitialized();
+        if (!principalAllowed) {
+          try {
+            const user = getUserById(group.created_by);
+            if (user && user.status === 'active') {
+              if (!accountId) {
+                principalAllowed = true;
+              } else {
+                const account = getChannelAccount(accountId);
+                principalAllowed = account
+                  ? Boolean(
+                      account.enabled &&
+                      account.owner_user_id === group.created_by &&
+                      (account.provider as string) === 'wecom',
+                    )
+                  : true;
+              }
+            }
+          } catch {
+            principalAllowed = false;
+          }
+        }
+        if (principalAllowed) {
+          return tracked.sendMessageWithReceipt(chatId, text, opts);
+        }
+      }
+    }
+
+    return {
+      state: 'blocked',
+      reason: 'wecom_channel_not_connected',
+      sentChunkCount: 0,
+    };
   }
 
   /**
@@ -1101,8 +1186,8 @@ export class IMConnectionManager {
       if (account) {
         return Boolean(
           account.enabled &&
-            account.owner_user_id === userId &&
-            account.provider === channelType,
+          account.owner_user_id === userId &&
+          account.provider === channelType,
         );
       }
       if (channelType === 'wecom') {
@@ -1828,6 +1913,8 @@ export class IMConnectionManager {
         chatName: string,
         code: string,
       ) => Promise<boolean>;
+      isTrustedManagedWorkspaceJid?: (workspaceJid: string) => boolean;
+      onDeliveryOutcome?: WeComDeliveryOutcomeListener;
     },
   ): Promise<boolean> {
     if (!config.botId || !config.secret) {
@@ -1859,6 +1946,8 @@ export class IMConnectionManager {
         onAgentMessage: options?.onAgentMessage,
         isChatAuthorized: options?.isChatAuthorized,
         onPairAttempt: options?.onPairAttempt,
+        isTrustedManagedWorkspaceJid: options?.isTrustedManagedWorkspaceJid,
+        onWeComDeliveryOutcome: options?.onDeliveryOutcome,
       },
       accountId,
       options?.scopeIncomingJids,

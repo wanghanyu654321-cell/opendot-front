@@ -51,7 +51,18 @@ import {
   createWeComConnection,
   type WeComConnection,
   type WeComConnectionConfig,
+  type WeComDeliveryOutcomeEvent,
+  type WeComDeliveryOutcomeListener,
+  type WeComOutboundAuthorizePort,
+  type WeComOutboxDeliveryOutcome,
 } from './wecom.js';
+
+export type {
+  WeComDeliveryOutcomeEvent,
+  WeComDeliveryOutcomeListener,
+  WeComOutboundAuthorizePort,
+  WeComOutboxDeliveryOutcome,
+};
 import { logger } from './logger.js';
 import type {
   ChannelMessageMeta,
@@ -170,6 +181,10 @@ export interface IMChannelConnectOpts {
   shouldDeferInbound?: () => boolean;
   /** WeChat iLink authorization/transport lifecycle. */
   onWeChatConnectionStateChange?: (state: WeChatConnectionState) => void;
+  /** WeCom trusted dynamic managed workspace JID validator. */
+  isTrustedManagedWorkspaceJid?: (workspaceJid: string) => boolean;
+  /** WeCom read-only delivery outcome observer (metadata only, never passes message body). */
+  onWeComDeliveryOutcome?: WeComDeliveryOutcomeListener;
 }
 
 export interface IMChannel {
@@ -184,6 +199,11 @@ export interface IMChannel {
     localImagePaths?: string[],
     options?: ChannelMessageDeliveryOptions,
   ): Promise<void>;
+  sendMessageWithReceipt?(
+    chatId: string,
+    text: string,
+    opts?: { readonly correlationId?: string },
+  ): Promise<WeComOutboxDeliveryOutcome>;
   /** Send file to chat (if supported) */
   sendFile?(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendImage?(
@@ -1362,13 +1382,26 @@ export function createWhatsAppChannel(
 
 // ─── WeCom Adapter ──────────────────────────────────────────────
 
-export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
-  let inner: WeComConnection | null = null;
+export interface WeComChannel extends IMChannel {
+  readonly channelType: 'wecom';
+  sendMessageWithReceipt(
+    chatId: string,
+    text: string,
+    opts?: { readonly correlationId?: string },
+  ): Promise<WeComOutboxDeliveryOutcome>;
+}
 
-  const channel: IMChannel = {
+export function createWeComChannel(
+  config: WeComConnectionConfig,
+): WeComChannel {
+  let inner: WeComConnection | null = null;
+  let connectOutcomeListener: WeComDeliveryOutcomeListener | undefined;
+
+  const channel: WeComChannel = {
     channelType: 'wecom',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      connectOutcomeListener = opts.onWeComDeliveryOutcome;
       inner = createWeComConnection(config);
       try {
         return await inner.connect({
@@ -1384,6 +1417,8 @@ export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
           onAgentMessage: opts.onAgentMessage,
           normalizeIncomingJid: opts.normalizeIncomingJid,
           shouldDeferInbound: opts.shouldDeferInbound,
+          isTrustedManagedWorkspaceJid: opts.isTrustedManagedWorkspaceJid,
+          onDeliveryOutcome: opts.onWeComDeliveryOutcome,
         });
       } catch (err) {
         logger.error({ err }, 'WeCom channel connect failed');
@@ -1411,6 +1446,57 @@ export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
         return;
       }
       await inner.sendMessage(chatId, text, localImagePaths);
+    },
+
+    async sendMessageWithReceipt(
+      chatId: string,
+      text: string,
+      opts?: { readonly correlationId?: string },
+    ): Promise<WeComOutboxDeliveryOutcome> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'WeCom channel not connected, skip sending message',
+        );
+        const blocked: WeComOutboxDeliveryOutcome = {
+          state: 'blocked',
+          reason: 'not_connected',
+          sentChunkCount: 0,
+        };
+        const event: WeComDeliveryOutcomeEvent = {
+          botId: config.botId?.trim() ?? '',
+          chatId,
+          ...(opts?.correlationId !== undefined
+            ? { correlationId: opts.correlationId }
+            : {}),
+          outcome: blocked,
+        };
+        if (config.onDeliveryOutcome) {
+          try {
+            config.onDeliveryOutcome(event);
+          } catch (err) {
+            logger.warn(
+              { err, chatId },
+              'WeCom onDeliveryOutcome callback threw',
+            );
+          }
+        }
+        if (
+          connectOutcomeListener &&
+          connectOutcomeListener !== config.onDeliveryOutcome
+        ) {
+          try {
+            connectOutcomeListener(event);
+          } catch (err) {
+            logger.warn(
+              { err, chatId },
+              'WeCom connect onDeliveryOutcome callback threw',
+            );
+          }
+        }
+        return blocked;
+      }
+      return inner.sendMessageWithReceipt(chatId, text, opts);
     },
 
     async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {

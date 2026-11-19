@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { WSClient, WsCmd, type WsFrame } from '@wecom/aibot-node-sdk';
 import {
+  getRegisteredGroup,
   hasStoredMessage,
+  isDatabaseInitialized,
   storeChatMetadata,
   storeMessageDirect,
 } from './db.js';
+import { channelConversationJid } from './channel-address.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
@@ -13,7 +16,7 @@ import {
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
 
-// ─── Cross-Issue Contract Types (Issue #2 & Issue #3) ───────────
+// ─── Cross-Issue Contract Types (Issue #2, #3 & #6) ─────────────
 
 export interface WeComInboundTextEvent {
   readonly reqId: string;
@@ -44,6 +47,48 @@ export type WeComPrecheckPort = (
   event: WeComInboundTextEvent,
 ) => Promise<WeComPrecheckOutcome>;
 
+export type WeComOutboundAuthorizePort = (input: {
+  readonly botId: string;
+  readonly chatId: string;
+  readonly memberId: string;
+  readonly corpId?: string;
+  readonly correlationId?: string;
+}) => Promise<{ readonly allowed: boolean; readonly reason?: string }>;
+
+export type WeComOutboxDeliveryOutcome =
+  | {
+      readonly state: 'accepted';
+      readonly providerMessageId: string;
+      readonly chunkCount: number;
+    }
+  | {
+      readonly state: 'blocked';
+      readonly reason: string;
+      readonly sentChunkCount: 0;
+    }
+  | {
+      readonly state: 'rejected';
+      readonly reason: string;
+      readonly apiErrorCode?: number;
+      readonly sentChunkCount: number;
+    }
+  | {
+      readonly state: 'unknown';
+      readonly reason: string;
+      readonly sentChunkCount: number;
+    };
+
+export interface WeComDeliveryOutcomeEvent {
+  readonly botId: string;
+  readonly chatId: string;
+  readonly correlationId?: string;
+  readonly outcome: WeComOutboxDeliveryOutcome;
+}
+
+export type WeComDeliveryOutcomeListener = (
+  event: WeComDeliveryOutcomeEvent,
+) => void;
+
 // ─── Consumer Lease Port (compatible with packages/front-claw ConsumerLease) ───
 
 export interface WeComConsumerLease {
@@ -72,6 +117,8 @@ export interface WeComConnectionConfig {
   botId: string;
   secret: string;
   precheck?: WeComPrecheckPort;
+  authorizeOutbound?: WeComOutboundAuthorizePort;
+  onDeliveryOutcome?: WeComDeliveryOutcomeListener;
   lease?: WeComConsumerLease;
   /** Optional offline/test WSClient instance or factory */
   client?: WeComSdkClient;
@@ -116,6 +163,8 @@ export interface WeComConnectOpts {
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   normalizeIncomingJid?: (jid: string) => string;
   shouldDeferInbound?: () => boolean;
+  isTrustedManagedWorkspaceJid?: (workspaceJid: string) => boolean;
+  onDeliveryOutcome?: WeComDeliveryOutcomeListener;
 }
 
 export interface WeComConnection {
@@ -126,6 +175,11 @@ export interface WeComConnection {
     text: string,
     localImagePaths?: string[],
   ): Promise<void>;
+  sendMessageWithReceipt(
+    chatId: string,
+    text: string,
+    opts?: { readonly correlationId?: string },
+  ): Promise<WeComOutboxDeliveryOutcome>;
   notify?(
     memberId: string,
     content: string,
@@ -622,7 +676,7 @@ function createBotSender(options: {
 // ─── Helpers ────────────────────────────────────────────────────
 
 /**
- * Parse a WeCom chatId (after or before extractProviderTarget) to extract memberId.
+ * Parse a WeCom chatId (after or before extractProviderTarget) to extract memberId and optional corpId.
  * Supported forms:
  * - `wecom:c2c:${corpId}:${memberId}#account:${botId}`
  * - `wecom:c2c:${corpId}:${memberId}`
@@ -630,7 +684,9 @@ function createBotSender(options: {
  * - `c2c:${memberId}`
  * - `${memberId}`
  */
-export function parseWeComMemberId(chatId: string): string | null {
+export function parseWeComTarget(
+  chatId: string,
+): { memberId: string; corpId?: string } | null {
   const withoutFragment = chatId.split('#')[0]?.trim() ?? '';
   if (!withoutFragment) return null;
   const withoutPrefix = withoutFragment.startsWith('wecom:')
@@ -641,17 +697,22 @@ export function parseWeComMemberId(chatId: string): string | null {
     if (!rest) return null;
     const colonIdx = rest.indexOf(':');
     if (colonIdx === -1) {
-      return rest.trim() || null;
+      const memberId = rest.trim();
+      return memberId ? { memberId } : null;
     }
     const corpId = rest.slice(0, colonIdx).trim();
     const memberId = rest.slice(colonIdx + 1).trim();
     if (!corpId || !memberId) return null;
-    return memberId;
+    return { memberId, corpId };
   }
   if (withoutPrefix.startsWith('group:')) {
     return null;
   }
-  return withoutPrefix.includes(':') ? null : withoutPrefix;
+  return withoutPrefix.includes(':') ? null : { memberId: withoutPrefix };
+}
+
+export function parseWeComMemberId(chatId: string): string | null {
+  return parseWeComTarget(chatId)?.memberId ?? null;
 }
 
 function splitUtf8Chunks(text: string, maxBytes: number): string[] {
@@ -715,8 +776,73 @@ export function createWeComConnection(
   let leaseRenewTimer: ReturnType<typeof setInterval> | null = null;
   let stopping = false;
   let closed = true;
+  let activeConnectOpts: WeComConnectOpts | null = null;
   const admittedPassKeys = new Set<string>();
+  const bootstrappedDynamicChatJids = new Set<string>();
   const MAX_ADMITTED_PASS_KEYS = 2048;
+
+  function rememberBoundedKey(set: Set<string>, key: string): void {
+    set.add(key);
+    if (set.size > MAX_ADMITTED_PASS_KEYS) {
+      const oldest = set.values().next().value;
+      if (oldest !== undefined) set.delete(oldest);
+    }
+  }
+
+  function isWeComChatRegistered(jid: string): boolean {
+    try {
+      if (
+        typeof isDatabaseInitialized === 'function' &&
+        !isDatabaseInitialized()
+      ) {
+        return false;
+      }
+      if (typeof getRegisteredGroup !== 'function') {
+        return false;
+      }
+      const baseJid = channelConversationJid(jid);
+      return Boolean(
+        getRegisteredGroup(jid) ??
+        (baseJid !== jid ? getRegisteredGroup(baseJid) : undefined),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function emitDeliveryOutcome(
+    chatId: string,
+    outcome: WeComOutboxDeliveryOutcome,
+    correlationId?: string,
+  ): void {
+    const event: WeComDeliveryOutcomeEvent = {
+      botId,
+      chatId,
+      ...(correlationId !== undefined ? { correlationId } : {}),
+      outcome,
+    };
+    if (config.onDeliveryOutcome) {
+      try {
+        config.onDeliveryOutcome(event);
+      } catch (err) {
+        logger.warn(
+          { err, botId, chatId },
+          'WeCom onDeliveryOutcome callback threw',
+        );
+      }
+    }
+    const connectListener = activeConnectOpts?.onDeliveryOutcome;
+    if (connectListener && connectListener !== config.onDeliveryOutcome) {
+      try {
+        connectListener(event);
+      } catch (err) {
+        logger.warn(
+          { err, botId, chatId },
+          'WeCom connect onDeliveryOutcome callback threw',
+        );
+      }
+    }
+  }
 
   function disconnectSync(): void {
     if (closed && !client && !leaseCheckTimer && !leaseRenewTimer) return;
@@ -819,32 +945,89 @@ export function createWeComConnection(
     return true;
   }
 
-  async function sendProactiveText(
+  async function sendProactiveTextWithReceipt(
     chatId: string,
     memberId: string,
     text: string,
-  ): Promise<void> {
+    opts?: { readonly corpId?: string; readonly correlationId?: string },
+  ): Promise<WeComOutboxDeliveryOutcome> {
     const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!trimmed) {
+      return { state: 'blocked', reason: 'empty_message', sentChunkCount: 0 };
+    }
     const chunks = splitUtf8Chunks(trimmed, MAX_BOT_CONTENT_BYTES - 384);
+    if (chunks.length === 0) {
+      return { state: 'blocked', reason: 'empty_message', sentChunkCount: 0 };
+    }
+
+    const corpId = opts?.corpId ?? config.defaultCorpId;
+    let sentChunkCount = 0;
+    let lastAckReqId = '';
+
+    const partialOrBlocked = (reason: string): WeComOutboxDeliveryOutcome =>
+      sentChunkCount === 0
+        ? { state: 'blocked', reason, sentChunkCount: 0 }
+        : { state: 'unknown', reason, sentChunkCount };
+
     for (const chunk of chunks) {
-      if (!ensureLeaseHeld()) return;
+      if (!ensureLeaseHeld()) {
+        return partialOrBlocked('lease_lost');
+      }
       if (stopping || closed || !sender || !sdk?.ready()) {
         logger.warn(
           { botId, chatId },
           'WeCom channel not connected, skip sending message',
         );
-        return;
+        return partialOrBlocked('not_connected');
       }
 
+      let preSendDeniedReason: string | null = null;
       const scope: BotReadScope = {
         signal: AbortSignal.timeout(sendTimeoutMs),
         deadline: performance.now() + sendTimeoutMs,
       };
 
       const outcome = await sender.notify(memberId, chunk, scope, async () => {
-        if (stopping || closed || !ensureLeaseHeld() || !sdk?.ready()) {
+        if (!ensureLeaseHeld()) {
+          preSendDeniedReason = 'lease_lost';
+          throw new Error('lease_lost');
+        }
+        if (stopping || closed || !sdk?.ready()) {
+          preSendDeniedReason = 'not_connected';
           throw new Error('channel_closed');
+        }
+        if (config.authorizeOutbound) {
+          let decision: { readonly allowed: boolean; readonly reason?: string };
+          try {
+            decision = await config.authorizeOutbound({
+              botId,
+              chatId,
+              memberId,
+              ...(corpId !== undefined ? { corpId } : {}),
+              ...(opts?.correlationId !== undefined
+                ? { correlationId: opts.correlationId }
+                : {}),
+            });
+          } catch (err) {
+            preSendDeniedReason =
+              err instanceof Error && err.message.trim()
+                ? err.message.trim()
+                : 'authorize_outbound_failed';
+            throw err;
+          }
+          if (!decision || decision.allowed !== true) {
+            preSendDeniedReason =
+              decision?.reason?.trim() || 'outbound_unauthorized';
+            throw new Error(preSendDeniedReason);
+          }
+          if (!ensureLeaseHeld()) {
+            preSendDeniedReason = 'lease_lost';
+            throw new Error('lease_lost');
+          }
+          if (stopping || closed || !sdk?.ready()) {
+            preSendDeniedReason = 'not_connected';
+            throw new Error('channel_closed');
+          }
         }
       });
 
@@ -854,28 +1037,131 @@ export function createWeComConnection(
             botId,
             chatId,
             memberId,
+            sentChunkCount,
             detail: outcome.detail,
           },
           'WeCom proactive sendMessage ACK timed out (state=unknown); not retrying or throwing',
         );
-        return;
+        return {
+          state: 'unknown',
+          reason: outcome.detail,
+          sentChunkCount,
+        };
       }
 
-      if (outcome.state !== 'accepted') {
+      if (outcome.state === 'rejected') {
         logger.warn(
           {
             botId,
             chatId,
             memberId,
+            sentChunkCount,
             state: outcome.state,
             apiErrorCode: outcome.apiErrorCode,
             detail: outcome.detail,
           },
           'WeCom proactive sendMessage was not accepted',
         );
-        return;
+        return {
+          state: 'rejected',
+          reason: outcome.detail,
+          ...(typeof outcome.apiErrorCode === 'number'
+            ? { apiErrorCode: outcome.apiErrorCode }
+            : {}),
+          sentChunkCount,
+        };
       }
+
+      if (outcome.state !== 'accepted') {
+        const reason = preSendDeniedReason ?? outcome.detail;
+        logger.warn(
+          {
+            botId,
+            chatId,
+            memberId,
+            sentChunkCount,
+            state: outcome.state,
+            apiErrorCode: outcome.apiErrorCode,
+            detail: reason,
+          },
+          'WeCom proactive sendMessage was not accepted',
+        );
+        return partialOrBlocked(reason);
+      }
+
+      sentChunkCount += 1;
+      const ackReqId = outcome.ackReqId?.trim() ?? '';
+      if (!ackReqId) {
+        return {
+          state: 'unknown',
+          reason: 'missing_ack_req_id',
+          sentChunkCount,
+        };
+      }
+      lastAckReqId = ackReqId;
     }
+
+    return {
+      state: 'accepted',
+      providerMessageId: lastAckReqId,
+      chunkCount: sentChunkCount,
+    };
+  }
+
+  async function executeSendWithReceipt(
+    chatId: string,
+    text: string,
+    opts?: { readonly correlationId?: string },
+  ): Promise<WeComOutboxDeliveryOutcome> {
+    if (!ensureLeaseHeld()) {
+      const blocked: WeComOutboxDeliveryOutcome = {
+        state: 'blocked',
+        reason: 'lease_lost',
+        sentChunkCount: 0,
+      };
+      emitDeliveryOutcome(chatId, blocked, opts?.correlationId);
+      return blocked;
+    }
+    if (stopping || closed || !sender || !sdk?.ready()) {
+      logger.warn(
+        { botId, chatId },
+        'WeCom channel not connected, skip sending message',
+      );
+      const blocked: WeComOutboxDeliveryOutcome = {
+        state: 'blocked',
+        reason: 'not_connected',
+        sentChunkCount: 0,
+      };
+      emitDeliveryOutcome(chatId, blocked, opts?.correlationId);
+      return blocked;
+    }
+
+    const target = parseWeComTarget(chatId);
+    if (!target) {
+      logger.warn(
+        { botId, chatId },
+        'Invalid WeCom chatId format, skip sending message',
+      );
+      const blocked: WeComOutboxDeliveryOutcome = {
+        state: 'blocked',
+        reason: 'invalid_chat_id',
+        sentChunkCount: 0,
+      };
+      emitDeliveryOutcome(chatId, blocked, opts?.correlationId);
+      return blocked;
+    }
+
+    const outcome = await sendProactiveTextWithReceipt(
+      chatId,
+      target.memberId,
+      text,
+      {
+        corpId: target.corpId,
+        correlationId: opts?.correlationId,
+      },
+    );
+    emitDeliveryOutcome(chatId, outcome, opts?.correlationId);
+    return outcome;
   }
 
   async function handleInboundFrame(
@@ -1023,6 +1309,20 @@ export function createWeComConnection(
       return;
     }
 
+    const passDedupeKey = `${outcome.corpId}\0${botId}\0${inboundEvent.memberId}\0${inboundEvent.messageId}`;
+    if (admittedPassKeys.has(passDedupeKey)) {
+      logger.debug(
+        {
+          botId,
+          corpId: outcome.corpId,
+          memberId: inboundEvent.memberId,
+          messageId: inboundEvent.messageId,
+        },
+        'Duplicate WeCom inbound pass message ignored',
+      );
+      return;
+    }
+
     const rawJid = `wecom:c2c:${outcome.corpId}:${inboundEvent.memberId}`;
     const jid = opts.normalizeIncomingJid
       ? opts.normalizeIncomingJid(rawJid)
@@ -1035,62 +1335,97 @@ export function createWeComConnection(
         : new Date().toISOString();
     const senderId = `wecom:${inboundEvent.memberId}`;
 
-    storeChatMetadata(jid, timestamp, chatName);
-    opts.onNewChat(jid, chatName);
+    const candidateWorkspaceJid = outcome.workspaceJid?.trim() || undefined;
+    const hasTrustedDynamicWorkspace = Boolean(
+      candidateWorkspaceJid &&
+      opts.isTrustedManagedWorkspaceJid?.(candidateWorkspaceJid) === true,
+    );
+    if (
+      candidateWorkspaceJid &&
+      opts.isTrustedManagedWorkspaceJid &&
+      !hasTrustedDynamicWorkspace
+    ) {
+      logger.warn(
+        { botId, jid, workspaceJid: candidateWorkspaceJid },
+        'Untrusted WeCom outcome.workspaceJid ignored; falling back to admitted route',
+      );
+    }
 
-    let targetJid = outcome.workspaceJid || jid;
-    let agentId: string | null = null;
-    if (opts.resolveEffectiveChatJid) {
+    const tryResolveRoute = () => {
+      if (!opts.resolveEffectiveChatJid) {
+        return { targetJid: jid, routing: null };
+      }
       try {
-        const resolved = resolveAdmittedChannelRoute(
-          jid,
-          opts.resolveEffectiveChatJid,
-        );
-        if (!resolved) {
-          logger.warn(
-            { jid },
-            'WeCom message dropped: binding resolver rejected route',
-          );
-          return;
-        }
-        targetJid = resolved.targetJid;
-        agentId = resolved.routing?.agentId ?? null;
+        return resolveAdmittedChannelRoute(jid, opts.resolveEffectiveChatJid);
       } catch (err) {
         if (err instanceof ChannelRouteRejectedError) {
-          logger.warn(
-            { jid },
-            'WeCom message dropped: binding resolver rejected route',
-          );
-          return;
+          return null;
         }
         throw err;
       }
+    };
+
+    let resolved: ReturnType<typeof tryResolveRoute>;
+    if (hasTrustedDynamicWorkspace) {
+      resolved = tryResolveRoute();
+      if (
+        !resolved &&
+        !isWeComChatRegistered(jid) &&
+        !bootstrappedDynamicChatJids.has(jid)
+      ) {
+        rememberBoundedKey(bootstrappedDynamicChatJids, jid);
+        opts.onNewChat(jid, chatName);
+        resolved = tryResolveRoute();
+      }
+      if (!resolved) {
+        logger.warn(
+          { jid },
+          'WeCom message dropped: binding resolver rejected route',
+        );
+        return;
+      }
+      storeChatMetadata(jid, timestamp, chatName);
+    } else {
+      storeChatMetadata(jid, timestamp, chatName);
+      opts.onNewChat(jid, chatName);
+      resolved = tryResolveRoute();
+      if (!resolved) {
+        logger.warn(
+          { jid },
+          'WeCom message dropped: binding resolver rejected route',
+        );
+        return;
+      }
+    }
+
+    let targetJid = resolved.targetJid;
+    let agentId: string | null = resolved.routing?.agentId ?? null;
+    if (hasTrustedDynamicWorkspace && candidateWorkspaceJid) {
+      targetJid = candidateWorkspaceJid;
+      agentId = null;
     }
 
     if (targetJid !== jid) {
       storeChatMetadata(targetJid, timestamp, chatName);
     }
-    const passDedupeKey = `${targetJid}\0${inboundEvent.messageId}`;
-    let alreadyStored = admittedPassKeys.has(passDedupeKey);
-    if (!alreadyStored) {
-      try {
-        alreadyStored = hasStoredMessage?.(targetJid, inboundEvent.messageId) === true;
-      } catch {
-        alreadyStored = false;
-      }
+    let alreadyStored = false;
+    try {
+      alreadyStored =
+        hasStoredMessage?.(targetJid, inboundEvent.messageId) === true ||
+        (targetJid !== jid &&
+          hasStoredMessage?.(jid, inboundEvent.messageId) === true);
+    } catch {
+      alreadyStored = false;
     }
     if (alreadyStored) {
+      rememberBoundedKey(admittedPassKeys, passDedupeKey);
       logger.debug(
         { botId, targetJid, messageId: inboundEvent.messageId },
         'Duplicate WeCom inbound pass message ignored',
       );
       return;
     }
-    admittedPassKeys.add(passDedupeKey);
-    if (admittedPassKeys.size > MAX_ADMITTED_PASS_KEYS) {
-      const oldest = admittedPassKeys.values().next().value;
-      if (oldest !== undefined) admittedPassKeys.delete(oldest);
-    }
+    rememberBoundedKey(admittedPassKeys, passDedupeKey);
 
     storeMessageDirect(
       inboundEvent.messageId,
@@ -1123,16 +1458,19 @@ export function createWeComConnection(
     }
 
     if (outcome.expiredReminder?.trim()) {
-      await sendProactiveText(
+      const reminderOutcome = await sendProactiveTextWithReceipt(
         jid,
         inboundEvent.memberId,
         outcome.expiredReminder.trim(),
+        { corpId: outcome.corpId },
       );
+      emitDeliveryOutcome(jid, reminderOutcome);
     }
   }
 
   return {
     async connect(opts: WeComConnectOpts): Promise<boolean> {
+      activeConnectOpts = opts;
       if (!botId || !secret) {
         logger.info('WeCom botId/secret not configured, skipping connection');
         return false;
@@ -1285,15 +1623,30 @@ export function createWeComConnection(
         return;
       }
 
-      const memberId = parseWeComMemberId(chatId);
-      if (!memberId) {
+      const target = parseWeComTarget(chatId);
+      if (!target) {
         logger.warn(
           { botId, chatId },
           'Invalid WeCom chatId format, skip sending message',
         );
         return;
       }
-      await sendProactiveText(chatId, memberId, text);
+      if (!text.trim()) return;
+      const outcome = await sendProactiveTextWithReceipt(
+        chatId,
+        target.memberId,
+        text,
+        { corpId: target.corpId },
+      );
+      emitDeliveryOutcome(chatId, outcome);
+    },
+
+    async sendMessageWithReceipt(
+      chatId: string,
+      text: string,
+      opts?: { readonly correlationId?: string },
+    ): Promise<WeComOutboxDeliveryOutcome> {
+      return executeSendWithReceipt(chatId, text, opts);
     },
 
     async notify(
@@ -1302,7 +1655,13 @@ export function createWeComConnection(
       scope: BotReadScope,
       beforeSend: () => Promise<void>,
     ): Promise<BotSendOutcome> {
-      if (!ensureLeaseHeld() || stopping || closed || !sender || !sdk?.ready()) {
+      if (
+        !ensureLeaseHeld() ||
+        stopping ||
+        closed ||
+        !sender ||
+        !sdk?.ready()
+      ) {
         return {
           state: 'blocked',
           apiErrorCode: null,
@@ -1311,12 +1670,17 @@ export function createWeComConnection(
         };
       }
 
-      const outcome = await sender.notify(memberId, content, scope, async () => {
-        if (!ensureLeaseHeld() || stopping || closed || !sdk?.ready()) {
-          throw new Error('channel_closed');
-        }
-        await beforeSend();
-      });
+      const outcome = await sender.notify(
+        memberId,
+        content,
+        scope,
+        async () => {
+          if (!ensureLeaseHeld() || stopping || closed || !sdk?.ready()) {
+            throw new Error('channel_closed');
+          }
+          await beforeSend();
+        },
+      );
 
       if (outcome.state === 'unknown') {
         logger.warn(
