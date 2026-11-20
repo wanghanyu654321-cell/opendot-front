@@ -1,16 +1,16 @@
 import { capturePendingArrival } from './pending-order.js';
 import { createHash } from 'node:crypto';
 import { businessDate, DEFAULT_BUSINESS_CUTOFF, DEFAULT_TIME_ZONE } from './metrics.js';
-import { classifyWithSemantic, decideRoute, type RouteDecision, type SemanticClassifier } from './intent-router.js';
+import { classifyWithSemantic, decideRoute, hasSoftRoleWords, isStoreIntent, oralProjectReportLine, type Classification, type RouteDecision, type SemanticClassifier } from './intent-router.js';
 import { createRequestBudget, type TerminalState, type WorkResult } from './request-budget.js';
 import { createRouteLog, type RouteLogRecord } from './route-log.js';
 import type { EmployeeMessage, EmployeeLoopResult, PreflightReply } from './employee-loop.js';
 import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-handler.js';
 import type { Capability } from './access-policy.js';
 import { checkGateNow } from './commit-gate.js';
-import { ACCESS_DENIED, REPORT_HINT, appointmentAskKey } from './employee-loop.js';
+import { ACCESS_DENIED, REPORT_HINT, appointmentAskKey, appointmentTimeAskKey, isExplicitConfirmCommand } from './employee-loop.js';
 import { parseAddNewChoice, parseAskManagerChoice, parseCorrectionPick, parseCorrectionCommand, parseTargetCommand } from './ledger-commands.js';
-import { parseAppointmentRequest } from './appointments.js';
+import { parseAppointmentRequest, parseStandaloneAppointmentTime } from './appointments.js';
 import { extractReport } from './report-extract.js';
 import { isStandardAmountLine } from './amount-guard.js';
 import { parseLooseReport, parseReportText } from './report-parse.js';
@@ -22,7 +22,7 @@ import {
   type ModelClassifier, type ModelClassification, type ModelRuntimeConfig,
 } from './model-classify.js';
 
-import { courtesyReply, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, NOT_TODAY_REPLY, pastDayReportPhrase, scopeRefusal } from './scope-refusal.js';
+import { courtesyReply, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, NOT_TODAY_REPLY, otherStoreShortNames, pastDayReportPhrase, scopeRefusal } from './scope-refusal.js';
 import { stripNegatedMakeupPhrases } from './standard-line.js';
 import { textLevelImpurity } from './confirmable-draft-gate.js';
 
@@ -103,7 +103,9 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
    */
   async function marketingActor(memberId: string, expected?: Person): Promise<Person | null> {
     const person = await options.resolve(memberId);
-    if (!(person?.active && person.memberId === memberId && Array.isArray(person.roles) && person.roles.includes('marketing'))) return null;
+    if (!person?.active || person.memberId !== memberId) return null;
+    if (!(passthroughMarketing && options.accessPolicy === true)
+        && !(Array.isArray(person.roles) && person.roles.includes('marketing'))) return null;
     const current = await options.store.getPersonByMember(memberId);
     if (!current || current.personId !== person.personId) return null;
     if (options.accessPolicy !== true) return current;
@@ -121,14 +123,20 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
   }
 
   /** R3：越权/跨店判定。身份按当前人员行；能力与入账门同一判定（非策略模式按档位：员工档无查他人/全店能力）。 */
-  async function refusalFor(memberId: string, text: string): Promise<string | null> {
+  async function refusalFor(memberId: string, text: string, managedQuery = false): Promise<string | null> {
     const person = await options.resolve(memberId);
     if (!person?.active || person.memberId !== memberId) return null;
     const actor = await options.store.getPersonByMember(memberId);
     if (!actor || actor.personId !== person.personId) return null;
     // 策略缺失/损坏/无授权时不给「不能做」的细分原因（原流程按入口门统一拒绝或澄清）。
     if (options.accessPolicy === true && !(await checkGateNow(options.store, { actor, capability: null, storeIds: [actor.storeId], policyMode: true, platform: options.platformCapabilities, nowMs: () => options.now().getTime() })).ok) return null;
+    if (managedQuery && !otherStoreShortNames(text, actor.storeName).length) return null;
     const people = await options.store.listPeople();
+    if (managedQuery) {
+      // 显式指定目录原名的管理查询仍由 M03 判定门店权限。
+      const named = /^(?:经营汇总|门店汇总|本店汇总|本月汇总|(?:今天)?谁(?:还)?没报)\s+(\S+)$/.exec(text.trim())?.[1];
+      if (named && people.some(p => p.storeName === named)) return null;
+    }
     const allowed = async (capability: Capability, storeId: string) => options.accessPolicy === true
       ? (await checkGateNow(options.store, { actor, capability, storeIds: [storeId], policyMode: true, platform: options.platformCapabilities, nowMs: () => options.now().getTime() })).ok
       : actor.tier !== 'employee';
@@ -155,9 +163,14 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline }, { text: reply, kind });
         return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
       };
-      const classified = await classifyWithSemantic(input.text, {
-        businessDay: businessDate(options.now(), cutoff, timeZone), semantic: router.semantic, signal: child.signal, deadline: child.deadline,
-      });
+      const clockReply = parseStandaloneAppointmentTime(input.text);
+      const clockActor = clockReply && options.accessPolicy === true ? await options.store.getPersonByMember(input.memberId) : null;
+      const askedTime = clockActor && (await options.store.getConfig(appointmentTimeAskKey(clockActor, input)))?.trim();
+      const classified: Classification = askedTime
+        ? { label: 'followup', intents: ['followup'], source: 'rule', reason: 'single' }
+        : await classifyWithSemantic(input.text, {
+          businessDay: businessDate(options.now(), cutoff, timeZone), semantic: router.semantic, signal: child.signal, deadline: child.deadline,
+        });
       if ((classified.source === 'semantic' || classified.reason === 'semantic-rejected' || classified.reason === 'semantic-timeout') && !isDeterministicStub(router.semantic)) modelCalled = true;
       const marketing = router.marketing;
       const marketingEnabled = Boolean(marketing?.enabled || passthroughMarketing);
@@ -179,8 +192,10 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       }
       if ((decision.target === 'clarify' || decision.target === 'store') && pastDayReportPhrase(input.text, today)) return preflightResponse(NOT_TODAY_REPLY, 'ask');
       // R3/R4：越权/跨店/设目标 等 → 直接「不能做」+原因（店务路径进循环前也判一次）。
-      if ((decision.target === 'clarify' || decision.target === 'store') && !isManagedQueryPhrase(input.text)) {
-        const refused = await refusalFor(input.memberId, input.text);
+      const managedQuery = isManagedQueryPhrase(input.text);
+      const hasStoreShorthand = otherStoreShortNames(input.text, '').length > 0;
+      if (hasStoreShorthand || (!managedQuery && (decision.target === 'clarify' || decision.target === 'store'))) {
+        const refused = await refusalFor(input.memberId, input.text, managedQuery);
         if (refused) return preflightResponse(refused);
       }
       // R4：待答的预约称呼、或「改 N」选笔 —— 分类器可能当成澄清，仍进店务循环，避免丢掉上下文。
@@ -188,7 +203,7 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         const actor = await options.store.getPersonByMember(input.memberId);
         const asked = actor ? (await options.store.getConfig(appointmentAskKey(actor, input)))?.trim() : '';
         const appt = parseAppointmentRequest(input.text, new Date(), 'Asia/Shanghai');
-        if (asked || input.text.trim() === '确认入账' || parseCorrectionPick(input.text) || parseAddNewChoice(input.text) || parseAskManagerChoice(input.text)
+        if (asked || isExplicitConfirmCommand(input.text.trim()) || parseCorrectionPick(input.text) || parseAddNewChoice(input.text) || parseAskManagerChoice(input.text)
             || isSelfProgressQuery(input.text) || isStorePerfQuery(input.text)
             || isManagedQueryPhrase(input.text)
             || (appt && (appt.kind === 'request' || appt.kind === 'needs_time' || appt.kind === 'past' || appt.kind === 'invalid'))) {
@@ -198,7 +213,8 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       // R7：规则快路径只保留抽取完整/标准行报单、已能直接办的查询模板、改账/目标命令、预约与跟进。
       // 仅关键词命中、入口实际办不成的，改走模型分类（不扩关键词表）。
       if (decision.target === 'store' && decision.label !== 'followup' && decision.label !== 'appointment') {
-        const completeReport = extractReport(input.text).status === 'complete' || isStandardAmountLine(input.text)
+        const completeReport = oralProjectReportLine(input.text) !== null
+          || extractReport(input.text).status === 'complete' || isStandardAmountLine(input.text)
           || parseReportText(input.text, today).status === 'complete'
           || parseLooseReport(input.text, today).status === 'complete';
         const knownQuery = isSelfProgressQuery(input.text) || isStorePerfQuery(input.text) || isManagedQueryPhrase(input.text)
@@ -238,6 +254,9 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
             : 'progress' as const;
           if (label === 'chitchat') decision = { target: 'chitchat', label: 'chitchat', intents: ['chitchat'] };
           else if (label === 'marketing') {
+            if (hasSoftRoleWords(input.text) && classified.intents.some(isStoreIntent) && !classified.intents.includes('marketing')) {
+              return preflightResponse(MULTI_REPLY, 'ask');
+            }
             if (!grantedActor && marketingEnabled) grantedActor = await marketingActor(input.memberId);
             decision = decideRoute({ label: 'marketing', intents: ['marketing'], source: 'semantic', reason: 'semantic' }, { marketingEnabled, marketingGranted: !!grantedActor });
           } else decision = { target: 'store', label, intents: [label === 'progress' ? 'progress' : label === 'correction' ? 'correction' : label === 'appointment' ? 'appointment' : 'report'] };

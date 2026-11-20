@@ -1,6 +1,6 @@
 import type { Capability } from './access-policy.js';
 import type { Person } from './performance-store.js';
-import { looksLikeAppointment } from './appointments.js';
+import { looksLikeAppointment, withoutAppointmentCoaching } from './appointments.js';
 
 /**
  * R3：通用的「不能做」规则与几类直接答复（不针对任何具体原句）。
@@ -32,11 +32,29 @@ export interface RefusalContext {
   allowed: (capability: Capability, storeId: string) => Promise<boolean>;
 }
 
-/** 文本里点名的他店（目录里的门店名，不含本店）。 */
+const STORE_SHORT_NAME = /(?:测试)?(?:[一二三四五六七八九十]|(?<![a-z0-9])[2-9a-z])店(?!长|员|务|铺|面)|分店|总店|外店|他店|别的店|其他店/gi;
+
+/** 识别显式门店简称，并排除本店名称中的简称。 */
+export function otherStoreShortNames(text: string, ownStoreName: string): string[] {
+  const own = flatOf(ownStoreName).toLowerCase();
+  return [...flatOf(text).matchAll(STORE_SHORT_NAME)].map(([name]) => name)
+    .filter(name => !own.includes(name.toLowerCase().replace(/^测试/, '')));
+}
+
+/** 文本里点名的他店，简称优先回显目录中的门店名。 */
 export function otherStoresNamed(text: string, people: readonly Person[], actor: Person): string[] {
-  const flat = flatOf(text);
-  const names = [...new Set(people.map(p => p.storeName).filter(name => typeof name === 'string' && name.trim() && name !== actor.storeName))];
-  return names.filter(name => flat.includes(name) && !actor.storeName.includes(name));
+  const flat = flatOf(text).toLowerCase();
+  const own = flatOf(actor.storeName).toLowerCase();
+  const names = [...new Set(people.filter(p => p.storeId !== actor.storeId).map(p => p.storeName).filter(name => typeof name === 'string' && name.trim()))]
+    .map(name => ({ name, normalized: flatOf(name).toLowerCase() })).filter(({ normalized }) => !own.includes(normalized));
+  const named = names.filter(({ normalized }) => flat.includes(normalized));
+  const stores = new Set(named.map(({ name }) => name));
+  for (const shortName of otherStoreShortNames(text, actor.storeName)) {
+    const suffix = shortName.toLowerCase();
+    if (named.some(({ normalized }) => normalized.endsWith(suffix))) continue;
+    stores.add(names.find(({ normalized }) => normalized.endsWith(suffix))?.name ?? shortName);
+  }
+  return [...stores];
 }
 /** 文本里点名的本店同事（目录里的显示名，不含本人）。 */
 export function colleaguesNamed(text: string, people: readonly Person[], actor: Person): Person[] {
@@ -290,7 +308,7 @@ export function clauseKind(part: string): ClauseKind | null {
   if (!flat || flat.length < 2) return null;
   if (selfProgressPhrase(part) || /查(?:我|本人).*(?:进度|业绩|入账)/.test(flat)) return 'progress';
   if (/改成|改为|更正|撤回|撤销|那笔改|这笔改/.test(flat)) return 'correction';
-  if (looksLikeAppointment(part) || /(?:预约|登记.{0,8}点)/.test(flat)) return 'appointment';
+  if (looksLikeAppointment(part) || /(?:预约|登记.{0,8}点)/.test(withoutAppointmentCoaching(flat))) return 'appointment';
   if (/海报|文案|朋友圈|小红书|宣传|推广|种草|标语/.test(flat)) return 'marketing';
   if (/目标/.test(flat) && /定|设|改|调/.test(flat)) return 'target';
   if (/(?:报|记|登|算我|我的单|先给我报)/.test(flat) && /(?:\d|[一二三四五六七八九十百千万])/.test(flat)) return 'report';
@@ -329,8 +347,9 @@ export function leftoverNote(text: string, handled: ClauseKind): string | null {
 /** 预约只用预约分句解析客户，避免串用前半句报单的客人。 */
 export function appointmentClause(text: string): string {
   const tail = compoundTail(text);
-  if (tail && (looksLikeAppointment(tail) || /预约|登记.{0,8}点/.test(flatOf(tail)))) return tail;
+  if (tail && (looksLikeAppointment(tail) || /预约|登记.{0,8}点/.test(withoutAppointmentCoaching(flatOf(tail))))) return tail;
   const head = compoundHead(text);
-  if (head !== text && (looksLikeAppointment(head) || /预约/.test(flatOf(head))) && tail && !looksLikeAppointment(tail) && !/预约/.test(flatOf(tail))) return head;
+  if (head !== text && (looksLikeAppointment(head) || /预约/.test(withoutAppointmentCoaching(flatOf(head))))
+      && tail && !looksLikeAppointment(tail) && !/预约/.test(withoutAppointmentCoaching(flatOf(tail)))) return head;
   return text;
 }

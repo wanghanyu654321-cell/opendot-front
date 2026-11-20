@@ -6,7 +6,7 @@ export interface TrainingSummary {title:string;sha256:string;fileName:string;sco
 export interface TrainingDocument {sha256:string;fileName:string;category:string;evidenceLevel:'secondary_summary'|'provided_training_text';}
 export const TRAINING_USAGE='teaching_training_only';
 const categories=['资料总览','家访实操','认知成长','组织诊断','案例研讨'];
-function validScope(scope:TrainingScope){return scope&&typeof scope.accountId==='string'&&!!scope.accountId&&typeof scope.workspaceJid==='string'&&scope.workspaceJid==='web:local-training';}
+function validScope(scope:TrainingScope){return scope&&typeof scope.accountId==='string'&&!!scope.accountId&&typeof scope.workspaceJid==='string'&&(scope.workspaceJid==='web:local-training'||/^web:wecom-front-claw(?::[a-z0-9_-]+)+$/i.test(scope.workspaceJid));}
 function sameScope(a:TrainingScope,b:TrainingScope){return validScope(a)&&validScope(b)&&a.accountId===b.accountId&&a.workspaceJid===b.workspaceJid;}
 export function parseTrainingSummary(text:string,hash:string,scope:TrainingScope,fileName:string):TrainingSummary {
  if(typeof text!=='string'||!text.trim()||Buffer.byteLength(text)>256000||!validScope(scope)||!fileName.endsWith('.md')||/[\\/:]/.test(fileName))throw Error('invalid_training_source');

@@ -14,7 +14,7 @@ import {
 } from './performance-store.js';
 import { parseAddNewChoice, parseAskManagerChoice, parseCorrectionCommand, parseCorrectionPick, parseTargetCommand } from './ledger-commands.js';
 import {
-  APPOINTMENT_RECIPIENTS_KEY, appointmentContentId, appointmentReminderId, askConfirmTodayReply, describeWhen, designatedRecipient, parseAppointmentRequest, reminderBody, shortAppointmentNo, UNNAMED_CUSTOMER,
+  APPOINTMENT_RECIPIENTS_KEY, appointmentContentId, appointmentReminderId, askConfirmTodayReply, describeWhen, designatedRecipient, parseAppointmentRequest, parseStandaloneAppointmentTime, reminderBody, shortAppointmentNo, UNNAMED_CUSTOMER,
 } from './appointments.js';
 import { monthKey } from './metrics.js';
 import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-handler.js';
@@ -38,6 +38,7 @@ import { customerNameConflicts } from './customer-conflict.js';
 import { advancePendingSlot, pendingConfirmationReminder, pendingExpired, reportLabels, type SavedNewCustomerAsk, type PendingReportAdmission } from './pending-slot.js';
 import { validateModelChain, isReadOnlyQuery, type ModelClassification } from './model-classify.js';
 import { modelReportCandidate } from './model-report-candidate.js';
+import { oralProjectReportLine } from './intent-router.js';
 
 
 export const EMPLOYEE_LOOP_CONFIG = 'employee-loop:m01';
@@ -116,7 +117,8 @@ const d160Key = (personId: string, sessionId: string) => `employee-loop:d160-las
 export const d175InterleavedKey = (personId: string, sessionId: string) => `employee-loop:d175-interleaved:${personId}:${sessionId}`;
 export const D175_INTERLEAVED_GUIDANCE =
   '刚才穿插了其他对话，为避免误入账，单字「对」暂不直接确认；请回复「确认入账」或「全部确认」入账，或回复「取消」。';
-const isConfirmCommand = (text: string): boolean => text === '对' || text === '确认入账' || text === '全部确认';
+export const isExplicitConfirmCommand = (text: string): boolean => text === '确认入账' || text === '确认认账' || text === '全部确认';
+const isConfirmCommand = (text: string): boolean => text === '对' || isExplicitConfirmCommand(text);
 export const DENIED = 'Front Claw：仅支持本人或同店同事的报数、本人确认与进度；当前身份或对象不符合要求（跨店不能代报），没有写入。';
 /** R7：找店长改——只提示、零写入。 */
 export const ASK_MANAGER_HINT = 'Front Claw：请联系本店店长修改已有的那笔单。这条不会改账，也没有写入。';
@@ -184,6 +186,24 @@ function customerAnswer(text: string): string | null {
   return null;
 }
 export const appointmentAskKey = (actor: Person, input: { sessionId?: string }) => `employee-loop:appointment-ask:${actor.personId}:${input.sessionId ?? ''}`;
+export const appointmentTimeAskKey = (actor: Person, input: { sessionId?: string }) => `employee-loop:appointment-time-ask:${actor.personId}:${input.sessionId ?? ''}`;
+type AppointmentTimeAsk = {
+  text: string;
+  issuedSequence: string;
+  issuedAt: string;
+  bindingVersion: number;
+  accountId: string;
+  storeId: string;
+};
+
+function readAppointmentTimeAsk(raw: string | null): AppointmentTimeAsk | null {
+  if (!raw?.trim()) return null;
+  try {
+    const ask = JSON.parse(raw) as AppointmentTimeAsk | null;
+    return typeof ask?.text === 'string' && typeof ask.issuedSequence === 'string' && Number.isFinite(Date.parse(ask.issuedAt))
+      ? ask : null;
+  } catch { return null; }
+}
 const DONT_REGISTER = /不用登记|不要登记|不用改单|不要改单|不用改(?:单|了)?|别登记|不用办|不要办|只是?吐槽|我就吐槽|我就说说/;
 
 const NOT_FOUND_OR_DENIED = 'Front Claw：查不到，或你没有权限查看。';
@@ -226,6 +246,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   const { store, resolve, now, onOutbound, onEmployeeTrace } = options;
   /** R3（A-P1-1）：本条消息的全部消费者写入都经这里（带 M07 epoch）。 */
   const writesFor = (input?: EmployeeMessage) => consumerWrites(store, input?.fence, () => now().getTime());
+  const appointmentTimeWrites = new Map<string, Promise<'saved' | 'superseded' | 'cancelled'>>();
   const tools = createAssistantTools({ store, now, cutoff, timeZone });
   const policyMode = options.accessPolicy === true;
   const platform = options.platformCapabilities;
@@ -595,14 +616,39 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   }
   const addDay = (date: string, days: number) => { const [y, m, d] = date.split('-').map(Number); return new Date(Date.UTC(y!, m! - 1, d! + days)).toISOString().slice(0, 10); };
   /** M05：预约草稿（回显日期/星期/时间/顾客/项目/提醒对象），「对」后才登记。 */
-  async function appointmentDraft(actor: Person, text: string, input: EmployeeMessage, fingerprint: string, today: string): Promise<Draft | string | undefined> {
-    const parsed = parseAppointmentRequest(text, now(), timeZone);
+  async function appointmentDraft(actor: Person, text: string, input: EmployeeMessage, fingerprint: string, today: string,
+    parsed = parseAppointmentRequest(text, now(), timeZone)): Promise<Draft | string | undefined> {
     if (!parsed) return undefined;
     if (!policyMode) return 'Front Claw：预约登记当前未开放，没有写入。';
     // 先鉴权：无登记能力者不读预约表、不读指定店长配置。
     if (!await can(actor, 'appointment_submit', actor.storeId)) return ACCESS_DENIED;
     if (parsed.kind === 'ask_confirm_today') return askConfirmTodayReply(parsed.customer);
-    if (parsed.kind === 'needs_time') return 'Front Claw：预约要说清几点，例如「明天下午3点王姐来做护理」。没有登记。';
+    if (parsed.kind === 'needs_time') {
+      const { sequence } = await input.pendingArrival!;
+      const ask: AppointmentTimeAsk = {
+        text, issuedSequence: sequence, issuedAt: now().toISOString(), bindingVersion: input.bindingVersion!,
+        accountId: actor.accountId, storeId: actor.storeId,
+      };
+      const key = appointmentTimeAskKey(actor, input);
+      const previous = appointmentTimeWrites.get(key);
+      const write = (async () => {
+        await previous?.catch(() => {});
+        const current = readAppointmentTimeAsk(await store.getConfig(key));
+        if (current && !sequenceBefore(current.issuedSequence, sequence)) return 'superseded';
+        if (input.signal?.aborted || performance.now() >= (input.deadline ?? Infinity)) return 'cancelled';
+        await writesFor(input).putOperationRecord(key, JSON.stringify(ask));
+        return 'saved';
+      })();
+      appointmentTimeWrites.set(key, write);
+      try {
+        const result = await write;
+        if (result === 'cancelled') return 'Front Claw：请求已取消或超时，未开始新写入。';
+        if (result === 'superseded') return 'Front Claw：已有更新的预约追问，请按最新提示回复时间。没有登记。';
+      } finally {
+        if (appointmentTimeWrites.get(key) === write) appointmentTimeWrites.delete(key);
+      }
+      return 'Front Claw：预约要说清几点，例如「明天下午3点王姐来做护理」。没有登记。';
+    }
     if (parsed.kind === 'invalid') return 'Front Claw：预约的日期或时间写法不对，例如「11月20号下午3点」。没有登记。';
     if (parsed.kind === 'past') return `Front Claw：${describeWhen(parsed)} 已经过了，没有登记。请说清日期，例如「明天下午3点」。`;
     const item = parsed.item;
@@ -954,7 +1000,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     const active = () => !input.signal?.aborted && performance.now() < (input.deadline ?? Infinity);
     let abandonedPendingReminder = '';
     let expiredPendingReminder = '';
-    let pendingSnapshot: { drafts: Draft[]; ask: SavedNewCustomerAsk | null } | undefined;
+    let pendingSnapshot: { actorId: string; drafts: Draft[]; ask: SavedNewCustomerAsk | null } | undefined;
     const response: { kind: 'ask' | 'reply'; occupiesPending: boolean } = { kind: 'reply', occupiesPending: false };
     const askReply = (reply: string) => { response.kind = 'ask'; return reply; };
     let askRaw: string | null | undefined;
@@ -1013,7 +1059,22 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       if (expiredSlot.blocked) return 'Front Claw：请求已取消或草稿版本已变化，请查原操作结果。';
       drafts = expiredSlot.drafts;
       if (expiredSlot.expired.length > 0 && active()) await clearInterleaved(actor);
-      pendingSnapshot = structuredClone({ drafts, ask: expiredSlot.pendingAsk });
+      pendingSnapshot = structuredClone({ actorId: actor.personId, drafts, ask: expiredSlot.pendingAsk });
+      const replay = drafts.find(d => meta(d)?.messageId === input.messageId || meta(d)?.actionMessageId === input.messageId);
+      const timeAskKey = appointmentTimeAskKey(actor, input);
+      const askedTimeRaw = policyMode && !replay ? await store.getConfig(timeAskKey) : null;
+      const timeAsk = readAppointmentTimeAsk(askedTimeRaw);
+      let clockReply: string | null = null;
+      const arrivedSequence = (await input.pendingArrival!).sequence;
+      if (timeAsk && sequenceBefore(timeAsk.issuedSequence, arrivedSequence)) {
+        if (!active()) return 'Front Claw：请求已取消或超时，未开始新写入。';
+        const { compareAndSetPendingAsk } = writesFor(input);
+        const consumed = await compareAndSetPendingAsk(timeAskKey, askedTimeRaw!, '', { arrivedSequence });
+        if (consumed && preflightReply === undefined && timeAsk.bindingVersion === input.bindingVersion
+            && timeAsk.accountId === actor.accountId && timeAsk.storeId === actor.storeId) {
+          clockReply = parseStandaloneAppointmentTime(text);
+        }
+      }
       // D185：过期追问的肯定答复只返回已消费的 D176；不落入通用提示或 D143。
       if (expiredSlot.expiredAsk && (isYesNewCustomerReply(text) || /^(?:好的?)[。.!！]?$/.test(text.normalize('NFKC')))) {
         const reply = expiredPendingReminder; expiredPendingReminder = ''; return reply;
@@ -1062,12 +1123,11 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
         return resultText(found);
       }
-      // R18 / D160：除「对/确认入账/全部确认」外的任何消息都清掉「刚确认过」标记。
+      // R18 / D160：确认指令保留「刚确认过」标记，其余消息清掉。
       if (!isConfirmCommand(text) && (await store.getConfig(d160Key(actor.personId, input.sessionId)))?.trim()) {
         await writesFor(input).putOperationRecord(d160Key(actor.personId, input.sessionId), '');
       }
       const fingerprint = hash([text]);
-      const replay = drafts.find(d => meta(d)?.messageId === input.messageId || meta(d)?.actionMessageId === input.messageId);
       if (replay) {
         operationId = replay.draftId;
         const context = meta(replay)!;
@@ -1278,7 +1338,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
           return `${actor.storeName}\n${resultText(savedYes)}`;
         }
       }
-      if (isConfirmCommand(text) || text === '取消') {
+      const interleavedDraftId = (text === '对' || text === '确认') && pending.length === 1
+        ? (await store.getConfig(d175InterleavedKey(actor.personId, input.sessionId)))?.trim() : null;
+      const interleaved = !!interleavedDraftId && interleavedDraftId === pending[0]?.draftId;
+      if (isConfirmCommand(text) || (text === '确认' && interleaved) || text === '取消') {
         // R4：上一消费者失权后补偿不能改当前持有者的草稿，可能留下 confirming。
         // 当前持有者回「对」接手提交、「取消」关闭，避免草稿卡死；提交仍走同一入账门。
         if (pending.length === 0) {
@@ -1335,12 +1398,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
 请回复「新增一笔」或「改 N」，或回「取消」。不要直接回「对」。`;
         }
         // D175：穿插软对话后的 pending 草稿，禁止单字「对」直接落账，要求「确认入账」或「全部确认」。
-        if (text === '对') {
-          const interleavedId = (await store.getConfig(d175InterleavedKey(actor.personId, input.sessionId)))?.trim();
-          if (interleavedId && interleavedId === draft.draftId) {
-            return interleavedConfirmGuardReply(draft);
-          }
-        }
+        if (text === '对' && interleaved) return interleavedConfirmGuardReply(draft);
         const next = { ...draft, status: text === '取消' ? 'void' : 'confirming',
           closedAt: text === '取消' ? now().toISOString() : null,
           payload: { ...draft.payload, employeeContext: {
@@ -1418,7 +1476,8 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         text = candidate;
       }
       // R8：标准行先走同一份语法（D125）。否定/小额小数追问（D122/D123），非今天拒（D124）。
-      const std = tryStandardReport(text, today);
+      const oralProjectLine = oralProjectReportLine(text);
+      const std = tryStandardReport(oralProjectLine ?? text, today);
       const modelAsk = async () => askReply(formatMaybeReportAsk(text, await collectConfirmedLedgerNames(store, actor.storeId)));
       // R18 / 移交项 3：D146 未见否定补报、D147 客户位残片的「先问」结论来自单闸模块（textLevelImpurity，与闸内同一函数），
       // 这里只负责在 D81 之前给出原措辞，不自己判断。
@@ -1455,10 +1514,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       // R2：宽松行解析会把同一行里的第二笔（「张姐680（小王）；李姐980（小美）」）吞进备注 → 这种情况改用自然句抽取，抽不清就澄清，绝不静默丢笔。
       const looseFirst = parseReportText(text, today).status === 'none' ? parseLooseReport(text, today) : { status: 'none' as const };
       const looseSwallowed = looseFirst.status === 'complete' && looseFirst.report.entries.some(item => /\d/.test(item.note ?? ''));
-      const natural = parseReportText(text, today).status === 'none' && (looseFirst.status !== 'complete' || looseSwallowed) ? extractReport(text) : { status: 'none' as const };
+      const natural = !oralProjectLine && parseReportText(text, today).status === 'none' && (looseFirst.status !== 'complete' || looseSwallowed) ? extractReport(text) : { status: 'none' as const };
       // R4（D104）：上次问过客人称呼，本次是回答。
       const askedRaw = (await store.getConfig(appointmentAskKey(actor, input)))?.trim();
-      if (askedRaw) {
+      if (askedRaw && !clockReply) {
         await writesFor(input).putOperationRecord(appointmentAskKey(actor, input), '');
         const noName = isNoNameAnswer(text);
         const named = noName ? null : customerAnswer(text);
@@ -1499,10 +1558,12 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         // 不是称呼回答：已清掉待问状态，按新消息继续。
       }
       // M05 预约：标准报数清单优先（带「金额（员工）」行的不当预约）。
-      if (natural.status === 'none' && parseReportText(text, today).status === 'none' && parseLooseReport(text, today).status !== 'complete') {
-        const src = appointmentClause(text);
-        const flatSrc = text.normalize('NFKC').replace(/\s+/g, '');
-        if (DONT_REGISTER.test(flatSrc) && (parseAppointmentRequest(src, now(), timeZone) || /约/.test(flatSrc))) {
+      if (clockReply || (natural.status === 'none' && parseReportText(text, today).status === 'none' && parseLooseReport(text, today).status !== 'complete')) {
+        const timeFollowup = clockReply && timeAsk ? { clock: clockReply, originalText: timeAsk.text, requestedAt: new Date(timeAsk.issuedAt) } : undefined;
+        const src = timeFollowup ? `${timeFollowup.originalText} ${timeFollowup.clock}` : appointmentClause(text);
+        const flatSrc = (clockReply ? src : text).normalize('NFKC').replace(/\s+/g, '');
+        const parsedApptAsk = parseAppointmentRequest(src, now(), timeZone, timeFollowup);
+        if (DONT_REGISTER.test(flatSrc) && (parsedApptAsk || /约/.test(flatSrc))) {
           return 'Front Claw：好的，没有登记或改单。';
         }
         if (/取消/.test(flatSrc) && /约/.test(flatSrc) && !/重新约|再约|改约/.test(flatSrc) && text.trim() !== '取消') {
@@ -1510,7 +1571,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         }
         // R4/R6（D104）：没写客人称呼 → 先问一次。「有个客人」不算已回答；必须写出称呼或明确「没留名」。
         // 先鉴权/策略：无权限或未开放时不提问、不写待问状态（与 appointmentDraft 一致）。
-        const parsedApptAsk = parseAppointmentRequest(src, now(), timeZone);
+        if (parsedApptAsk && (pending.length || drafts.some(d => d.status === 'confirming'))) return 'Front Claw：请先确认或取消当前草稿，结果未知时查原操作号。';
         if (parsedApptAsk?.kind === 'request' && !parsedApptAsk.item.customerNamed) {
           const alreadyUnnamed = /没留名|未留名|没有名字|没有称呼/.test(src.normalize('NFKC').replace(/\s+/g, ''));
           if (!alreadyUnnamed) {
@@ -1520,8 +1581,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
             return askReply(clarifyQuestion('missing_customer'));
           }
         }
-        if (parseAppointmentRequest(src, now(), timeZone) && (pending.length || drafts.some(d => d.status === 'confirming'))) return 'Front Claw：请先确认或取消当前草稿，结果未知时查原操作号。';
-        const built = await appointmentDraft(actor, src, input, fingerprint, today);
+        const built = await appointmentDraft(actor, src, input, fingerprint, today, parsedApptAsk);
         if (typeof built === 'string') return built;
         if (built) {
           operationId = built.draftId;
@@ -1662,11 +1722,11 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
           if (fromModel.access) tag.access = fromModel.access;
           return fromModel.kind === 'ask' ? askReply(fromModel.reply) : fromModel.reply;
         }
-        return askReply(withLeftover(`Front Claw：行尾备注「${modelNotes[0]}」需要确认后再记。没有写入任何账目。`, text, 'report'));
+        return askReply(withLeftover(`Front Claw：行尾备注「${modelNotes[0]}」需要确认后再记（请去掉该备注直接重发「客户 金额」，单回「确认」不会入账）。没有写入任何账目。`, text, 'report'));
       }
       // R18 / D152 单闸（唯一出口）：在 D131 二选一、D139 新客户追问、建草稿之前算一次。二选一草稿（选「新增」后变成可确认草稿）、
       // 「是新客户」回「是」后出的草稿、以及直接出的草稿，都必须拿着这张通行证组装；闸不过一律先问。
-      // D155：自然句抽取（extractReport）的条目不是纯标准行，source='natural'，离线不开闸。
+      // D155：自由叙述抽取仍属 natural。已完整匹配单笔口语格式的项目报数沿用标准行校验。
       const gateEntriesFor = (): GateEntry[] => report.entries.map((item, i) => ({
         customer: item.customer,
         employeeName: (item as { self?: boolean }).self || !item.employeeName.trim() ? item.employeeName : (managerTitle(item) ? targets[i]!.displayName : item.employeeName),
@@ -1757,7 +1817,24 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       return withLeftover(head, text, 'report');
     };
     let text: string;
-    try { text = await run(); }
+    let pendingReminder = '';
+    try {
+      text = await run();
+      // D182：追问未占用新挂起位时，回显原挂起项使用的确认口令。
+      if (response.kind === 'ask' && !response.occupiesPending && pendingSnapshot) {
+        const { actorId, drafts, ask } = pendingSnapshot;
+        const at = now();
+        const pendingReports = drafts.filter(d => d.status === 'pending' && d.kind === 'report' && !pendingExpired(d.expiresAt, at));
+        const interleavedId = pendingReports.length ? (await store.getConfig(d175InterleavedKey(actorId, input.sessionId ?? '')))?.trim() : null;
+        pendingReminder = [
+          ...pendingReports.map(draft => {
+            const reply = pendingConfirmationReminder([draft], null, at);
+            return draft.draftId === interleavedId ? reply.replaceAll('还在等你回「对」确认。', '还在等你回「确认入账」或「全部确认」确认。') : reply;
+          }),
+          pendingConfirmationReminder([], ask, at),
+        ].filter(Boolean).join('\n');
+      }
+    }
     catch (error) {
       if (error instanceof AccessRevoked) text = gateReasons.get(input) === 'policy_changed' ? POLICY_CHANGED : ACCESS_DENIED;
       // R3（A-P1-1）：消费租约已被接管/过期 → 统一入口拒绝写入（零写入）；适配器同样不回复。
@@ -1773,9 +1850,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     }
     if (isConfirmCommand(input.text.trim()) && text === DRAFT_EXPIRED_REREPORT) expiredPendingReminder = '';
     if (abandonedPendingReminder) text = `${abandonedPendingReminder}\n${text}`;
-    // D182 唯一判定：追问未保存新挂起项，沿用本轮 preflight 的有效挂起位；D179 始终最后追加。
-    const pendingReminder = pendingSnapshot ? pendingConfirmationReminder(pendingSnapshot.drafts, pendingSnapshot.ask, now()) : '';
-    if (response.kind === 'ask' && !response.occupiesPending && pendingReminder) text += `\n${pendingReminder}`;
+    if (pendingReminder) text += `\n${pendingReminder}`;
     if (expiredPendingReminder) text += `${text ? '\n' : ''}${expiredPendingReminder}`;
     try { onEmployeeTrace?.({ messageId: input.messageId ?? '', ...(operationId ? { operationId } : {}), elapsedMs: performance.now() - started, outcome, ledgerSettled }); } catch { /* 观测故障不改变账目 */ }
     // 生成最终回复与平台投递分开；投递中断不能回滚已提交业务。

@@ -88,6 +88,15 @@ const NOT_SURNAME = /[有个位的约点是给和跟来去要请半刻号日月�
 const DATE_WORD = /大后天|后天|明天|明日|明儿|今天|今日|今晚|今早|(?:下下?|这|本)?(?:周|星期|礼拜)[一二三四五六日天1-7]|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号]/;
 const TIME_RE = new RegExp(`(\\d{1,2})[:：](\\d{2})|(${NUM})点(?:(半)|(一刻)|(三刻)|(${NUM})分?)?`);
 
+const DAYPART = /上午|早上|早晨|清早|中午|下午|午后|傍晚|晚上|夜里/;
+const STANDALONE_TIME = new RegExp(`^(?:${DAYPART.source})?(?:${TIME_RE.source})$`);
+
+/** 确认整句是钟点答复，保留时段供预约解析使用。 */
+export function parseStandaloneAppointmentTime(text: string): string | null {
+  const clock = text.normalize('NFKC').replace(/\s+/g, '');
+  return STANDALONE_TIME.test(clock) && resolveTime(clock, true) ? clock : null;
+}
+
 /** 不能当客户名的动词、时间词、项目词。没有明确称呼时不要拿这些来填名字。 */
 const NOT_A_CUSTOMER_NAME = /^(?:过来|到店|来店|来做|来看|来了|到了|开始|登记|预约|再来|先来|会来|要来|有人|客人|顾客|客户|明天|后天|今天|今日|明日|上午|下午|晚上|中午|早上|今晚|今早|护理|剪发|做头|项目|套餐|半点|一刻|过来做|到店做|来护理|来剪|来按摩|过去|先到)$/;
 const TIME_OR_VERB_CHARS = /^[来到去做过给帮请要会想点分半刻时早晚上下午]+$/;
@@ -122,8 +131,11 @@ const COMMON_SURNAME = /[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高�
  * 「今天+客人」类问句没有预约动词则不当预约，交给模型分类。 */
 /** 明确的预约动词。仅「今天+客人」没有钟点、没有这类动词时不当预约（D127）。 */
 const APPOINTMENT_CUE = /预约|约了|约一下|约个|帮我约|帮.{0,4}约|给我约|登记预约/;
+const APPOINTMENT_COACHING = /预约\s*(?:(?:客户|顾客|客人)\s*)?(?:(?:接待|沟通|流程|登记|咨询)\s*)?(?:话术|带教|演练|课件)/g;
+export const withoutAppointmentCoaching = (text: string): string => text.replace(APPOINTMENT_COACHING, '');
+
 export function looksLikeAppointment(text: string): boolean {
-  const raw = typeof text === 'string' ? text.trim() : '';
+  const raw = typeof text === 'string' ? withoutAppointmentCoaching(text).trim() : '';
   const flat = raw.replace(/\s+/g, '');
   if (!flat || flat.length > 200 || MARKETING_HINT.test(flat)) return false;
   if (parseAppointmentUtterance(raw)) return true;
@@ -196,7 +208,7 @@ function resolveDate(flat: string, today: string): string | null {
 }
 
 /** 时间：不带上下午时 1–7 点按下午（门店营业时段，默认值待拍板）；中午 1–5 点按下午；返回 HH:MM 或 null。 */
-function resolveTime(flat: string): string | null | undefined {
+function resolveTime(flat: string, standalone = false): string | null | undefined {
   const t = TIME_RE.exec(flat);
   if (!t) return undefined;
   let hour: number, minute: number;
@@ -210,7 +222,7 @@ function resolveTime(flat: string): string | null | undefined {
   const pm = /下午|午后|傍晚|晚上|今晚|夜里|晚/.test(before), am = /上午|早上|早晨|清早|今早|早/.test(before), noon = /中午/.test(before);
   if (pm && hour < 12) hour += 12;
   else if (noon && hour < 6) hour += 12;
-  else if (!pm && !am && !noon && hour >= 1 && hour <= 7) hour += 12;
+  else if (!pm && !am && !noon && !(standalone && t[1] !== undefined) && hour >= 1 && hour <= 7) hour += 12;
   if (hour > 23 || minute < 0 || minute > 59) return null;
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 }
@@ -219,17 +231,25 @@ function resolveTime(flat: string): string | null | undefined {
  * M05：解析一句预约。先沿用旧格式「预约 名字 HH:MM 备注」（parseAppointmentUtterance），否则按自然语言。
  * 空格不影响结果；没有时间 → needs_time；时间已过 → past；日期/时间写法无效 → invalid；不像预约 → null。
  */
-export function parseAppointmentRequest(text: string, now: Date, timeZone: string): AppointmentParse | null {
+export function parseAppointmentRequest(text: string, now: Date, timeZone: string, timeFollowup?: {
+  clock: string; originalText: string; requestedAt: Date;
+}): AppointmentParse | null {
   const raw = typeof text === 'string' ? text.trim() : '';
   if (!raw || raw.length > 200) return null;
   const legacy = parseAppointmentUtterance(raw);
   const flat = raw.replace(/\s+/g, '');
+  const original = timeFollowup?.originalText.replace(/\s+/g, '') ?? flat;
   // D127：没有标准预约说法（也没有旧格式）则不当预约。
   if (!legacy && !looksLikeAppointment(raw)) return null;
   const today = zonedToday(now, timeZone);
   const source = legacy ? legacy.whenText.replace(/\s+/g, '') : flat;
-  const date = resolveDate(source, today.date);
-  const time = resolveTime(source);
+  const date = timeFollowup
+    ? resolveDate(original, zonedToday(timeFollowup.requestedAt, timeZone).date)
+    : resolveDate(source, today.date);
+  const clockReply = timeFollowup?.clock;
+  // 明确答复的时段或 24 小时制优先。单说「4点」时沿用上轮的时段。
+  const time = clockReply && (DAYPART.test(clockReply) || clockReply.includes(':'))
+    ? resolveTime(clockReply, true) : resolveTime(source);
   if (time === undefined) {
     // D129：「今天周老师来店」无钟点、无项目、无预约动词 → 先问，不直接记预约。
     // 「明天有客人要来」仍走 needs_time（M05）。
@@ -244,8 +264,17 @@ export function parseAppointmentRequest(text: string, now: Date, timeZone: strin
   if (date === null || time === null) return { kind: 'invalid' };
   const [hh, mm] = time.split(':').map(Number);
   if (date < today.date || (date === today.date && hh! * 60 + mm! <= today.minutes)) return { kind: 'past', date, time };
-  const who = legacy ? { name: legacy.customer, named: true } : customerOf(flat);
-  const project = legacy ? legacy.note : (/(?:来做|过来做|做个?|做一?下)([\u4e00-\u9fa5A-Za-z]{1,8})/.exec(flat)?.[1] ?? '');
+  const explicitName = legacy?.customer ?? (timeFollowup && /^预约\s+(\S+)\s+/.exec(timeFollowup.originalText)?.[1]);
+  const who = explicitName && (!timeFollowup || acceptableCustomerName(explicitName))
+    ? { name: explicitName, named: true } : customerOf(original);
+  const projectText = timeFollowup ? original.replace(/预约$/, '') : original;
+  const spokenProject = /(?:来做|过来做|做个?|做一?下)([\u4e00-\u9fa5A-Za-z]{1,8})/.exec(projectText)?.[1];
+  let project = legacy && !timeFollowup ? legacy.note : spokenProject ?? '';
+  if (timeFollowup && !project && who.named) {
+    const remainder = original.replace(who.name, '').replace(DATE_WORD, '').replace(DAYPART, '');
+    const namedProject = /^(?:预约([\u4e00-\u9fa5A-Za-z]{1,8})|([\u4e00-\u9fa5A-Za-z]{1,8})预约)$/.exec(remainder);
+    project = namedProject?.[1] ?? namedProject?.[2] ?? '';
+  }
   return { kind: 'request', item: { customer: who.name, customerNamed: who.named, whenText: `${date} ${time}`, note: project, date, time } };
 }
 

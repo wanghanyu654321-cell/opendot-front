@@ -1,9 +1,11 @@
 import { ENTRY_LINE_PATTERN, normalizeReportText, parseLooseReport, parseReportText } from './report-parse.js';
-import { looksLikeAppointment, parseAppointmentRequest, parseAppointmentUtterance } from './appointments.js';
+import { looksLikeAppointment, parseAppointmentRequest, parseAppointmentUtterance, withoutAppointmentCoaching } from './appointments.js';
 import { parseCorrectionCommand, parseCorrectionPick, parseTargetCommand } from './ledger-commands.js';
-import { ambiguityOf, extractReport, type UnclearReason } from './report-extract.js';
+import { ambiguityOf, extractReport, HONORIFIC, type UnclearReason } from './report-extract.js';
 import { clarifyQuestion } from './clarify.js';
-import { courtesyKind, isVent } from './scope-refusal.js';
+import { compoundHead, compoundTail, courtesyKind, isSelfProgressQuery, isStorePerfQuery, isVent } from './scope-refusal.js';
+import { classifyStandardRemark } from './standard-line.js';
+import { projectNamesForStore } from './remark-whitelist.js';
 
 /**
  * M02 意图路由：规则快路径 + 至多一次受限语义分类。
@@ -32,18 +34,32 @@ export interface MarketingPolicy { marketingEnabled: boolean; marketingGranted: 
 
 const ORDER: readonly Intent[] = ['report', 'followup', 'progress', 'result', 'appointment', 'summary', 'correction', 'target', 'marketing', 'chitchat'];
 // D172：否定新客户追问也进入原店务循环，由持久追问状态决定是否撤销。
-const SHORT_CONFIRM = /^(?:对|对的|确认|确认保存|是|是的|不是|好|好的|嗯|嗯嗯|没错|可以|ok|取消|全部确认)[。.!！~～]*$/i;
+const SHORT_CONFIRM = /^(?:对|对的|确认|确认入账|确认认账|确认保存|是|是的|不是|好|好的|嗯|嗯嗯|没错|可以|ok|取消|全部确认)[。.!！~～]*$/i;
 const ENTRY_LINE = ENTRY_LINE_PATTERN;
 const REPORT_WORDS = /报数|报一下|要报|报.{0,4}的?数|记一下|记上|帮我记|开单|做了\s*\d|成交\s*\d|报.{0,3}业绩/;
 const RESULT_WORDS = /入账结果|入账了[吗没么]?|入账成功|入账.{0,2}[没吗]|那笔.{0,6}入账/;
 const PROGRESS_WORDS = /^(?:今天)?进度$|^[^\s的]{1,12}的(?:今天|本月)?进度$|(?:我|本人)(?:的)?(?:今天|本月|这个月|这月)?(?:的)?(?:进度|业绩|目标|完成)|(?:我|本人).{0,6}(?:做了多少|完成多少|完成了多少|多少业绩)/;
 const SUMMARY_WORDS = /汇总|经营汇总|门店.{0,6}(?:业绩|数据|情况)|全店|谁(?:还)?没报|排名|排行/;
 const APPOINT_WORDS = /^预约|确认预约|预约列表|预约结果|约(?:今|明|后|周|下|星期|礼拜)|帮.{0,6}约|我的预约|登记的预约|^查.{0,8}预约$|^(?:今天|明天|本店)的?预约$/;
-const MARKETING_WORDS = /文案|小红书|朋友圈|海报|种草|推广|营销|宣传|标语|口号|推文|公众号|抖音|短视频|脚本|活动方案|广告语/;
+const LEGACY_MARKETING_WORDS = /文案|小红书|朋友圈|海报|种草|推广|营销|宣传|标语|口号|推文|公众号|抖音|短视频|脚本|活动方案|广告语/;
+const SOFT_ROLE_WORDS = /话术|客诉|带教|家访|五步法|演练|课件|复盘建议|经营诊断|投流复盘|团购诊断/;
+const MARKETING_WORDS = new RegExp(`${LEGACY_MARKETING_WORDS.source}|${SOFT_ROLE_WORDS.source}`);
+export const hasSoftRoleWords = (text: string): boolean => SOFT_ROLE_WORDS.test(text.replace(/\s+/g, ''));
 const CHITCHAT = /^(?:你好|您好|在吗|在不在|hi|hello|哈喽|早|早安|早上好|中午好|下午好|晚上好|晚安|谢谢|谢谢你|多谢|辛苦了|辛苦|哈+|呵呵|你是谁|你叫什么)[呀啊哈!！。.~～]*$/i;
 const WEATHER = /天气/;
 
 function today(): string { return new Date().toISOString().slice(0, 10); }
+
+const ORAL_PROJECT_REPORT = new RegExp(`^([\\u4e00-\\u9fa5](?:${HONORIFIC}))[ \\t]*(?:(?:刚刚?)?做了[ \\t]*)?([\\u4e00-\\u9fa5]{1,32})[ \\t]*(\\d+[ \\t]*(?:元|块钱?)?)$`);
+
+/** 只有客户称呼、白名单项目和一个金额组成的单笔口语，才转成标准行。 */
+export function oralProjectReportLine(text: string): string | null {
+  const match = ORAL_PROJECT_REPORT.exec(normalizeReportText(text).trim());
+  if (!match) return null;
+  const [, customer, project, amount] = match;
+  if (!projectNamesForStore().some(name => project!.startsWith(name)) || classifyStandardRemark(project!) !== 'allow') return null;
+  return `${customer}：${amount} ${project}`;
+}
 
 /** 规则分类：只看文本，不看库。 */
 export function classifyIntent(raw: string, context: { businessDay?: string } = {}): Classification {
@@ -52,7 +68,7 @@ export function classifyIntent(raw: string, context: { businessDay?: string } = 
   if (!text || text.length > 2000) return { label: 'clarify', intents: [], source: 'rule', reason: 'no-signal' };
   // R3a：吐槽/情绪类（无金额、无店务动作/客人/预约时间）→ 闲聊短答，先于其他判定（例如「客户真多」不当预约）。
   if (isVent(text)) return { label: 'chitchat', intents: ['chitchat'], source: 'rule', reason: 'single' };
-  const body = text.replace(/^报数\s*/, '');
+  const body = oralProjectReportLine(text) ?? text.replace(/^报数\s*/, '');
   const strict = parseReportText(body, context.businessDay ?? today()).status;
   // R1：无日期标题的标准行（「王姨 1.2k（小林）」）同样按解析文法判定，不加关键词。
   const parsed = strict !== 'none' ? strict : parseLooseReport(body, context.businessDay ?? today()).status === 'complete' ? 'complete' : 'none';
@@ -64,10 +80,12 @@ export function classifyIntent(raw: string, context: { businessDay?: string } = 
   if (PROGRESS_WORDS.test(flat) && !hits.has('result')) hits.add('progress');
   if (SUMMARY_WORDS.test(flat)) hits.add('summary');
   // M05：自然语言来店（「明天三点有个客人要来」）→ 预约；带「金额（员工）」行的仍是报数。
-  const appointmentLike = looksLikeAppointment(text) && !ENTRY_LINE.test(text);
-  if (parseAppointmentUtterance(text) || APPOINT_WORDS.test(flat) || appointmentLike) hits.add('appointment');
+  const appointmentText = withoutAppointmentCoaching(text);
+  const appointmentLike = looksLikeAppointment(appointmentText) && !ENTRY_LINE.test(text);
+  if (parseAppointmentUtterance(appointmentText) || appointmentLike || APPOINT_WORDS.test(appointmentText.replace(/\s+/g, ''))) hits.add('appointment');
   if (appointmentLike) hits.delete('report');
-  if (MARKETING_WORDS.test(flat)) hits.add('marketing');
+  const legacyMarketing = LEGACY_MARKETING_WORDS.test(flat);
+  if (legacyMarketing) hits.add('marketing');
   // R3：纯客套话（致谢/寒暄/道别，去掉语气词与表情后不剩别的）→ 闲聊，短答。
   if (CHITCHAT.test(flat) || courtesyKind(text) !== null || (WEATHER.test(flat) && hits.size === 0)) hits.add('chitchat');
   // M04：明确指向“刚才/上一笔/第N笔”的改账、撤回 → 更正；正文里的“报数/入账/进度”字眼只是对象，不另算意图。
@@ -76,6 +94,12 @@ export function classifyIntent(raw: string, context: { businessDay?: string } = 
   // M04：带金额的目标设置 → target（不带金额的“目标”仍是进度查询）。
   const target = parseTargetCommand(text, context.businessDay ?? today());
   if (target) { hits.add('target'); hits.delete('progress'); hits.delete('report'); }
+  if (!legacyMarketing && MARKETING_WORDS.test(flat) && !STORE_INTENTS.some(intent => hits.has(intent))) {
+    const clauses = [compoundHead(text), compoundTail(text) ?? ''];
+    if (clauses.some(isSelfProgressQuery)) hits.add('progress');
+    else if (clauses.some(isStorePerfQuery)) hits.add('summary');
+    else hits.add('marketing');
+  }
   // 汇总明确时，“业绩”类进度不另算一个意图。
   if (hits.has('summary') && hits.has('progress') && !/我|本人/.test(flat)) hits.delete('progress');
   // 一份完整清单就是报数，正文里的其他字眼（如备注）不改变意图。
