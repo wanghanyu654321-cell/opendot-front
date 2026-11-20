@@ -97,15 +97,27 @@ import { DATA_DIR as tmp } from '../src/config.js';
 
 import * as db from '../src/db.js';
 import { resolveStickyChannelOwner } from '../src/channel-session-owner.js';
+import { createHash } from 'node:crypto';
+import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
 import { IMConnectionManager } from '../src/im-manager.js';
 import { runHostAgent } from '../src/container-runner.js';
+import { ChannelTurnRuntime } from '../src/channel-turn-runtime.js';
+import { getChannelOutboxItem } from '../src/channel-reliability-store.js';
+import { resolveEffectiveSkills } from '../src/effective-skill-resolver.js';
+import {
+  HostObservability,
+  observeWeComAgentTurn,
+} from '../src/personal-agent/host-observability.js';
 import type { RegisteredGroup } from '../src/types.js';
 import {
   BRIDGE_AGENT_GUARDRAIL_DENIED_REPLY,
   SAFE_MARKETING_DISALLOWED_TOOLS,
   validateTargetAgentProfile,
 } from '../src/wecom-front-claw-bridge.js';
-import { STALE_CONSUMER } from '../packages/front-claw/src/role-eval/employee-loop.js';
+import {
+  D175_INTERLEAVED_GUIDANCE,
+  STALE_CONSUMER,
+} from '../packages/front-claw/src/role-eval/employee-loop.js';
 import {
   decodeStatus,
   encodeStatus,
@@ -115,8 +127,12 @@ import {
   WECOM_MANAGED_WORKSPACE_FOLDER,
   WECOM_MANAGED_WORKSPACE_JID,
   WECOM_SAFE_PROFILE_NAME,
+  deliverWeComTextViaOutbox,
   deriveEmployeeWeComWorkspace,
   isWeComManagedWorkspaceFolder,
+  normalizeWeComObservationErrorCategory,
+  normalizeWeComObservationGateReason,
+  normalizeWeComObservationRoute,
   startWeComFrontClawRuntime,
 } from '../src/wecom-front-claw-runtime.js';
 import {
@@ -170,6 +186,10 @@ interface SentWireFrame {
 function createOfflineWsClient(options: {
   botId?: string;
   suppressAck?: (frame: SentWireFrame) => boolean;
+  ackFor?: (
+    frame: SentWireFrame,
+    index: number,
+  ) => { errcode: number; errmsg?: string } | null;
 } = {}) {
   const botId = options.botId ?? BOT_ID;
   const client = new WSClient({
@@ -190,17 +210,25 @@ function createOfflineWsClient(options: {
 
   const sent: SentWireFrame[] = [];
   let suppressAck = options.suppressAck ?? (() => false);
+  let ackFor = options.ackFor;
 
   const mockWs = {
     readyState: 3,
     send(raw: string) {
       const parsed = JSON.parse(raw) as SentWireFrame;
+      const frameIndex = sent.length;
       sent.push(parsed);
-      if (!suppressAck(parsed)) {
+      const ack = ackFor
+        ? ackFor(parsed, frameIndex)
+        : suppressAck(parsed)
+          ? null
+          : { errcode: 0 };
+      if (ack !== null) {
         queueMicrotask(() => {
           wsManager.handleFrame({
             headers: { req_id: parsed.headers.req_id },
-            errcode: 0,
+            errcode: ack.errcode,
+            ...(ack.errmsg !== undefined ? { errmsg: ack.errmsg } : {}),
             body: {},
           });
         });
@@ -237,6 +265,17 @@ function createOfflineWsClient(options: {
     sent,
     setSuppressAck(fn: (frame: SentWireFrame) => boolean) {
       suppressAck = fn;
+      ackFor = undefined;
+    },
+    setAckFor(
+      fn:
+        | ((
+            frame: SentWireFrame,
+            index: number,
+          ) => { errcode: number; errmsg?: string } | null)
+        | undefined,
+    ) {
+      ackFor = fn;
     },
     emitInboundText(params: {
       reqId: string;
@@ -965,25 +1004,47 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     await new Promise((r) => setTimeout(r, 120));
     expect(passInboundSeen).toBe(1);
 
-    // 4. D175 preserved + concurrent 对 confirmations -> exactly 1 ledger entry
+    // 4. D175 preserved after interleaved marketing -> single-char 对 is blocked with reminder; explicit 确认入账 / 全部确认 commits 1 entry
+    offline.emitInboundText({
+      reqId: 'req-confirm-single',
+      msgid: 'msg-confirm-single',
+      userid: 'm-zhao',
+      content: '对',
+    });
+    await waitUntil(() =>
+      offline.sent.some((f) => f.headers.req_id === 'req-confirm-single'),
+    );
+    const singleReply = JSON.stringify(
+      offline.sent.find((f) => f.headers.req_id === 'req-confirm-single')
+        ?.body ?? '',
+    );
+    expect(singleReply).toContain(D175_INTERLEAVED_GUIDANCE);
+    expect(singleReply).toContain('560');
+    expect(singleReply).not.toContain('已入账');
+    expect(
+      (await world.store.listEntries()).filter(
+        (e) => e.reporterPersonId === 'p-zhao',
+      ),
+    ).toHaveLength(0);
+
     offline.emitInboundText({
       reqId: 'req-confirm-1',
       msgid: 'msg-confirm-dup',
       userid: 'm-zhao',
-      content: '对',
+      content: '确认入账',
     });
     offline.emitInboundText({
       reqId: 'req-confirm-2',
       msgid: 'msg-confirm-2',
       userid: 'm-zhao',
-      content: '对',
+      content: '确认入账',
     });
-    // Also replay same messageId for 对
+    // Also replay same messageId for 确认入账
     offline.emitInboundText({
       reqId: 'req-confirm-replay',
       msgid: 'msg-confirm-dup',
       userid: 'm-zhao',
-      content: '对',
+      content: '确认入账',
     });
 
     await waitUntil(async () => {
@@ -1013,22 +1074,92 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(confirmReplayReply).toContain('已入账');
     expect(confirm2Reply).not.toContain('已入账');
 
-    // Verify src/index.ts assembly & Phase 1 shutdown closes wecomFrontClawRuntime cleanly
+    // Second D175 cycle verifying 全部确认 commits 1 entry after interleaved marketing blocks single-char 对
+    offline.emitInboundText({
+      reqId: 'req-draft-2',
+      msgid: 'msg-draft-2',
+      userid: 'm-zhao',
+      content: '12号测试B店\n680（小赵）',
+    });
+    await waitUntil(() =>
+      offline.sent.some((f) => f.headers.req_id === 'req-draft-2'),
+    );
+    offline.emitInboundText({
+      reqId: 'req-pass-2',
+      msgid: 'msg-pass-2',
+      userid: 'm-zhao',
+      content: '帮我写春季补水朋友圈文案',
+    });
+    await waitUntil(() =>
+      db
+        .getMessagesSince(zhaoWorkspace.jid, { timestamp: '', id: '' })
+        .some((m) => m.id === 'msg-pass-2'),
+    );
+    offline.emitInboundText({
+      reqId: 'req-confirm-single-2',
+      msgid: 'msg-confirm-single-2',
+      userid: 'm-zhao',
+      content: '对',
+    });
+    await waitUntil(() =>
+      offline.sent.some((f) => f.headers.req_id === 'req-confirm-single-2'),
+    );
+    expect(
+      JSON.stringify(
+        offline.sent.find((f) => f.headers.req_id === 'req-confirm-single-2')
+          ?.body ?? '',
+      ),
+    ).toContain(D175_INTERLEAVED_GUIDANCE);
+    expect(
+      (await world.store.listEntries()).filter(
+        (e) => e.reporterPersonId === 'p-zhao',
+      ),
+    ).toHaveLength(1);
+
+    offline.emitInboundText({
+      reqId: 'req-confirm-all',
+      msgid: 'msg-confirm-all',
+      userid: 'm-zhao',
+      content: '全部确认',
+    });
+    await waitUntil(() =>
+      offline.sent.some((f) => f.headers.req_id === 'req-confirm-all'),
+    );
+    expect(
+      JSON.stringify(
+        offline.sent.find((f) => f.headers.req_id === 'req-confirm-all')
+          ?.body ?? '',
+      ),
+    ).toContain('已入账');
+    const finalZhaoEntries = (await world.store.listEntries()).filter(
+      (e) => e.reporterPersonId === 'p-zhao',
+    );
+    expect(finalZhaoEntries).toHaveLength(2);
+    expect(finalZhaoEntries.map((e) => e.amount)).toEqual([56000, 68000]);
+
+    // Verify src/index.ts assembly & Phase 1 shutdown closes wecomFrontClawRuntime cleanly (CRLF-safe)
     const indexSrc = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),
       'utf8',
     );
     const pauseIdx = indexSrc.indexOf('imManager.pauseInbound()');
     const closeIdx = indexSrc.indexOf('wecomFrontClawRuntime');
-    const shutdownCloseIdx = indexSrc.indexOf(
-      'wecomFrontClawRuntime\n',
-      pauseIdx,
+    const shutdownCloseMatch = /wecomFrontClawRuntime\r?\n/.exec(
+      indexSrc.slice(pauseIdx),
     );
-    const disconnectAllIdx = indexSrc.indexOf('imManager\n      .disconnectAll()', pauseIdx);
+    const disconnectAllMatch = /imManager\r?\n\s*\.disconnectAll\(\)/.exec(
+      indexSrc.slice(pauseIdx),
+    );
     expect(pauseIdx).toBeGreaterThan(0);
     expect(closeIdx).toBeGreaterThan(0);
+    expect(shutdownCloseMatch).not.toBeNull();
+    expect(disconnectAllMatch).not.toBeNull();
+    const shutdownCloseIdx = pauseIdx + shutdownCloseMatch!.index;
+    const disconnectAllIdx = pauseIdx + disconnectAllMatch!.index;
     expect(shutdownCloseIdx).toBeGreaterThan(pauseIdx);
     expect(disconnectAllIdx).toBeGreaterThan(shutdownCloseIdx);
+    expect(indexSrc).toContain('deliverWeComTextViaOutbox');
+    expect(indexSrc).toContain('observeWeComAgentTurn');
     expect(
       fs.existsSync(
         path.join(
@@ -1542,7 +1673,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         else process.env[key] = value;
       }
     }
-  });
+  }, 15_000);
 
   test(
     'Gate 6: passive reply and M06 proactive notification unknown ACK timeouts do not retry and remain queryable',
@@ -1725,6 +1856,919 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     },
     15_000,
   );
+
+  test('Outbox × WeCom receipt: unknown / partial multi-chunk locks uncertain without replay, chunk-1 rejected fails definitively, and 4-stage telemetry correlates with ASCII enums', async () => {
+    expect(normalizeWeComObservationRoute('快通道')).toBe('fast_path');
+    expect(normalizeWeComObservationRoute('模型')).toBe('model');
+    expect(normalizeWeComObservationRoute('追问')).toBe('clarify');
+    expect(normalizeWeComObservationRoute('包含顾客张三')).toBe('unknown_route');
+    expect(normalizeWeComObservationGateReason('通过')).toBe('accepted');
+    expect(normalizeWeComObservationGateReason('客户张三5800元')).toBe(
+      'redacted',
+    );
+    expect(normalizeWeComObservationErrorCategory('超时')).toBe('timeout');
+    expect(normalizeWeComObservationErrorCategory('秘钥明文')).toBe('redacted');
+
+    const now = () => new Date(Date.UTC(2026, 10, 12, 6, 0, 0));
+    const world = await createSeededMemoryWorld(now);
+    const offline = createOfflineWsClient();
+    const imManager = new IMConnectionManager();
+    const groupsMap: Record<string, RegisteredGroup> = {};
+    const wiring = createRuntimeWiringHarness(groupsMap);
+
+    const spanExporter = new InMemorySpanExporter();
+    const observer = new HostObservability({
+      publicKey: 'pk-e2e-wecom',
+      secretKey: 'sk-e2e-never-export',
+      baseUrl: 'https://langfuse.example.test/',
+      installationId: 'inst-wecom-e2e',
+      sampleRate: 1,
+      exporter: spanExporter,
+    });
+    activeCleanups.push(() => observer.close());
+
+    const runtime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-outbox',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+      },
+      imManager,
+      ...wiring,
+      startMaintenance: false,
+      wecomConnection: {
+        client: offline.client,
+        sendTimeoutMs: 60,
+        leaseCheckIntervalMs: 50,
+      },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-outbox', ttlMs: 5000, renewMs: 1000 },
+        modelClassify: async () => ({
+          intent: 'marketing',
+          object: null,
+          action: null,
+          slots: {},
+          confidence: 0.96,
+          uncertain: false,
+        }),
+      },
+    });
+    expect(runtime).not.toBeNull();
+    activeCleanups.push(async () => {
+      await runtime!.close();
+      await imManager.disconnectAll();
+    });
+
+    const zhaoWs = deriveEmployeeWeComWorkspace({
+      corpId: CORP_ID,
+      botId: BOT_ID,
+      memberId: 'm-zhao',
+    });
+    const zhaoC2cJid = `wecom:c2c:${CORP_ID}:m-zhao`;
+
+    // Admit marketing turn so route, registered group, and precheck span are created
+    offline.emitInboundText({
+      reqId: 'req-outbox-in-1',
+      msgid: 'msg-outbox-1',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '我想吸引附近新客进店体验项目',
+    });
+    await waitUntil(() =>
+      db
+        .getMessagesSince(zhaoWs.jid, { timestamp: '', id: '' })
+        .some((m) => m.id === 'msg-outbox-1'),
+    );
+
+    const turn1 = ChannelTurnRuntime.start({
+      provider: 'wecom',
+      accountId: BOT_ID,
+      sourceJid: zhaoC2cJid,
+      chatId: `c2c:${CORP_ID}:m-zhao`,
+      externalMessageId: 'msg-outbox-1',
+    });
+    activeCleanups.push(() => {
+      turn1.interrupt('test_cleanup');
+    });
+
+    const countSendMsgs = () =>
+      offline.sent.filter((f) => f.cmd === WsCmd.SEND_MSG).length;
+
+    // (a) Accepted -> Outbox delivered with real WeCom providerMessageId + idempotent replay
+    const okRes = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: '秋季护理文案草稿正文',
+      correlationId: 'msg-outbox-1',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turn1.runId,
+        ordinal: 1,
+        kind: 'text',
+        payload: { text: '秋季护理文案草稿正文' },
+        idempotencyKey: `${turn1.runId}:ok-1`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(okRes.status).toBe('delivered');
+    expect(okRes.reused).toBe(false);
+    expect(okRes.receipt?.providerMessageId).toMatch(/^aibot_send_msg_/);
+    expect(getChannelOutboxItem(okRes.itemId)?.status).toBe('delivered');
+    expect(countSendMsgs()).toBe(1);
+
+    const okReplay = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: '秋季护理文案草稿正文',
+      correlationId: 'msg-outbox-1',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turn1.runId,
+        ordinal: 1,
+        kind: 'text',
+        payload: { text: '秋季护理文案草稿正文' },
+        idempotencyKey: `${turn1.runId}:ok-1`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(okReplay.status).toBe('delivered');
+    expect(okReplay.reused).toBe(true);
+    expect(countSendMsgs()).toBe(1);
+
+    // Emit matching agent_turn span for msg-outbox-1 before unknown locks turn1
+    const boundProfile = db.getAgentProfileForWorkspace(
+      zhaoWs.folder,
+      'admin-e2e',
+    );
+    observeWeComAgentTurn({
+      correlationId: 'msg-outbox-1',
+      workspaceFolder: zhaoWs.folder,
+      profileId: boundProfile?.id,
+      durationMs: 125,
+      status: 'success',
+      inputTokens: 280,
+      outputTokens: 90,
+    });
+
+    // (b) SEND_MSG ACK timeout (unknown) -> Outbox locked as uncertain and automatic replay blocked
+    offline.setAckFor(() => null);
+    const unknownRes = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: '超时未确认文案',
+      correlationId: 'msg-outbox-1',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turn1.runId,
+        ordinal: 2,
+        kind: 'text',
+        payload: { text: '超时未确认文案' },
+        idempotencyKey: `${turn1.runId}:timeout-2`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(unknownRes.status).toBe('uncertain');
+    expect(getChannelOutboxItem(unknownRes.itemId)?.status).toBe('uncertain');
+    expect(turn1.complete()).toBe(false);
+    expect(countSendMsgs()).toBe(2);
+
+    // Restore healthy ACKs: retrying same key OR sibling ordinal on same turn must remain blocked (0 sends)
+    offline.setAckFor(() => ({ errcode: 0 }));
+    const replayBlocked = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: '超时未确认文案',
+      correlationId: 'msg-outbox-1',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turn1.runId,
+        ordinal: 2,
+        kind: 'text',
+        payload: { text: '超时未确认文案' },
+        idempotencyKey: `${turn1.runId}:timeout-2`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(replayBlocked.status).toBe('uncertain');
+    const siblingBlocked = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: '同回合后续消息',
+      correlationId: 'msg-outbox-1',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turn1.runId,
+        ordinal: 3,
+        kind: 'text',
+        payload: { text: '同回合后续消息' },
+        idempotencyKey: `${turn1.runId}:sibling-3`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(siblingBlocked.status).toBe('uncertain');
+    expect(countSendMsgs()).toBe(2);
+
+    // (c) Multi-chunk partial rejected (chunk 1 accepted, chunk 2 rejected -> sentChunkCount=1) -> uncertain, no replay
+    const turnPartialRej = ChannelTurnRuntime.start({
+      provider: 'wecom',
+      accountId: BOT_ID,
+      sourceJid: zhaoC2cJid,
+      chatId: `c2c:${CORP_ID}:m-zhao`,
+      externalMessageId: 'msg-outbox-partial-rej',
+    });
+    activeCleanups.push(() => {
+      turnPartialRej.interrupt('test_cleanup');
+    });
+    const baseSentPartialRej = offline.sent.length;
+    offline.setAckFor((_f, idx) =>
+      idx === baseSentPartialRej
+        ? { errcode: 0 }
+        : { errcode: 40003, errmsg: 'chunk2_rejected' },
+    );
+    const twoChunkRejectText = 'A'.repeat(16001);
+    const partialRejRes = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: twoChunkRejectText,
+      correlationId: 'msg-outbox-partial-rej',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turnPartialRej.runId,
+        ordinal: 1,
+        kind: 'text',
+        payload: { text: 'two-chunk-reject' },
+        idempotencyKey: `${turnPartialRej.runId}:partial-rej`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(countSendMsgs()).toBe(4);
+    expect(partialRejRes.status).toBe('uncertain');
+    expect(partialRejRes.error).toContain('sent_chunks=1');
+    expect(getChannelOutboxItem(partialRejRes.itemId)?.status).toBe(
+      'uncertain',
+    );
+    offline.setAckFor(() => ({ errcode: 0 }));
+    const partialRejReplay = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: twoChunkRejectText,
+      correlationId: 'msg-outbox-partial-rej',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turnPartialRej.runId,
+        ordinal: 1,
+        kind: 'text',
+        payload: { text: 'two-chunk-reject' },
+        idempotencyKey: `${turnPartialRej.runId}:partial-rej`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(partialRejReplay.status).toBe('uncertain');
+    expect(countSendMsgs()).toBe(4);
+
+    // (d) Multi-chunk partial unknown (chunk 1 accepted, chunk 2 timeout) -> uncertain, no replay
+    const turnPartialUnk = ChannelTurnRuntime.start({
+      provider: 'wecom',
+      accountId: BOT_ID,
+      sourceJid: zhaoC2cJid,
+      chatId: `c2c:${CORP_ID}:m-zhao`,
+      externalMessageId: 'msg-outbox-partial-unk',
+    });
+    activeCleanups.push(() => {
+      turnPartialUnk.interrupt('test_cleanup');
+    });
+    const baseSentPartialUnk = offline.sent.length;
+    offline.setAckFor((_f, idx) =>
+      idx === baseSentPartialUnk ? { errcode: 0 } : null,
+    );
+    const twoChunkUnkText = 'B'.repeat(16001);
+    const partialUnkRes = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: twoChunkUnkText,
+      correlationId: 'msg-outbox-partial-unk',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turnPartialUnk.runId,
+        ordinal: 1,
+        kind: 'text',
+        payload: { text: 'two-chunk-unknown' },
+        idempotencyKey: `${turnPartialUnk.runId}:partial-unk`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(countSendMsgs()).toBe(6);
+    expect(partialUnkRes.status).toBe('uncertain');
+    expect(partialUnkRes.error).toContain('sent_chunks=1');
+    offline.setAckFor(() => ({ errcode: 0 }));
+    const partialUnkReplay = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: twoChunkUnkText,
+      correlationId: 'msg-outbox-partial-unk',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turnPartialUnk.runId,
+        ordinal: 1,
+        kind: 'text',
+        payload: { text: 'two-chunk-unknown' },
+        idempotencyKey: `${turnPartialUnk.runId}:partial-unk`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(partialUnkReplay.status).toBe('uncertain');
+    expect(countSendMsgs()).toBe(6);
+
+    // (e) Chunk-1 rejected (sentChunkCount=0) -> DefinitiveChannelDeliveryError -> Outbox failed (not uncertain)
+    const turnChunk1Rej = ChannelTurnRuntime.start({
+      provider: 'wecom',
+      accountId: BOT_ID,
+      sourceJid: zhaoC2cJid,
+      chatId: `c2c:${CORP_ID}:m-zhao`,
+      externalMessageId: 'msg-outbox-chunk1-rej',
+    });
+    activeCleanups.push(() => {
+      turnChunk1Rej.interrupt('test_cleanup');
+    });
+    offline.setAckFor(() => ({ errcode: 40003, errmsg: 'invalid_userid' }));
+    const chunk1RejRes = await deliverWeComTextViaOutbox({
+      imManager,
+      targetJid: zhaoC2cJid,
+      text: '首块拒收文案',
+      correlationId: 'msg-outbox-chunk1-rej',
+      outbox: {
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: zhaoC2cJid,
+        chatId: `c2c:${CORP_ID}:m-zhao`,
+        rootId: null,
+        threadId: null,
+        turnRunId: turnChunk1Rej.runId,
+        ordinal: 1,
+        kind: 'text',
+        payload: { text: 'chunk1-rejected' },
+        idempotencyKey: `${turnChunk1Rej.runId}:chunk1-rej`,
+        owner: 'e2e-outbox',
+      },
+    });
+    expect(countSendMsgs()).toBe(7);
+    expect(chunk1RejRes.status).toBe('failed');
+    expect(chunk1RejRes.error).toContain('wecom_rejected:sdk_ack_rejected');
+    expect(getChannelOutboxItem(chunk1RejRes.itemId)?.status).toBe('failed');
+
+    // Also emit a rule-matched fast-path marketing message to verify fast_path telemetry
+    offline.emitInboundText({
+      reqId: 'req-outbox-fast-1',
+      msgid: 'msg-outbox-fast-1',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '帮我写秋季护理推广文案',
+    });
+    await waitUntil(() =>
+      db
+        .getMessagesSince(zhaoWs.jid, { timestamp: '', id: '' })
+        .some((m) => m.id === 'msg-outbox-fast-1'),
+    );
+
+    // Verify 4 correlated dot.wecom.* spans sharing msg-outbox-1 correlation_ref with zero plaintext leakage
+    await observer.flush();
+    const expectedRef = createHash('sha256')
+      .update('msg-outbox-1')
+      .digest('hex')
+      .slice(0, 24);
+    const expectedFastRef = createHash('sha256')
+      .update('msg-outbox-fast-1')
+      .digest('hex')
+      .slice(0, 24);
+    const allSpans = spanExporter.getFinishedSpans();
+    const correlatedSpans = allSpans.filter((s) =>
+      JSON.stringify(s.attributes).includes(expectedRef),
+    );
+    expect(correlatedSpans.map((s) => s.name)).toEqual(
+      expect.arrayContaining([
+        'dot.wecom.precheck',
+        'dot.wecom.agent_turn',
+        'dot.wecom.outbound_auth',
+        'dot.wecom.delivery',
+      ]),
+    );
+    const precheckSpan = correlatedSpans.find(
+      (s) => s.name === 'dot.wecom.precheck',
+    )!;
+    const precheckAttrStr = JSON.stringify(precheckSpan.attributes);
+    expect(
+      JSON.parse(
+        String(precheckSpan.attributes['langfuse.observation.metadata.route']),
+      ),
+    ).toBe('clarify');
+    expect(precheckAttrStr).not.toContain('"redacted"');
+
+    const fastPrecheckSpan = allSpans.find(
+      (s) =>
+        s.name === 'dot.wecom.precheck' &&
+        JSON.stringify(s.attributes).includes(expectedFastRef),
+    )!;
+    expect(fastPrecheckSpan).toBeDefined();
+    expect(
+      JSON.parse(
+        String(
+          fastPrecheckSpan.attributes['langfuse.observation.metadata.route'],
+        ),
+      ),
+    ).toBe('fast_path');
+    expect(JSON.stringify(fastPrecheckSpan.attributes)).not.toContain(
+      '"redacted"',
+    );
+
+    const serializedAllSpans = JSON.stringify(allSpans.map((s) => s.attributes));
+    for (const secret of [
+      'msg-outbox-1',
+      'msg-outbox-fast-1',
+      'm-zhao',
+      BOT_ID,
+      'sk-e2e-never-export',
+      '我想吸引附近新客进店体验项目',
+      '帮我写秋季护理推广文案',
+      '秋季护理文案草稿正文',
+      '超时未确认文案',
+      'AAAA',
+      'BBBB',
+    ]) {
+      expect(serializedAllSpans).not.toContain(secret);
+    }
+  }, 15_000);
+
+  test('Outbound M03 recheck blocks in-flight slow Agent result after permission revocation (blocked, zero physical wire send)', async () => {
+    const now = () => new Date(Date.UTC(2026, 10, 12, 6, 0, 0));
+    const world = await createSeededMemoryWorld(now);
+    const offline = createOfflineWsClient();
+    const imManager = new IMConnectionManager();
+    const groupsMap: Record<string, RegisteredGroup> = {};
+    const wiring = createRuntimeWiringHarness(groupsMap);
+
+    const spanExporter = new InMemorySpanExporter();
+    const observer = new HostObservability({
+      publicKey: 'pk-e2e-revoke',
+      secretKey: 'sk-e2e-revoke-secret',
+      baseUrl: 'https://langfuse.example.test/',
+      installationId: 'inst-revoke-e2e',
+      sampleRate: 1,
+      exporter: spanExporter,
+    });
+    activeCleanups.push(() => observer.close());
+
+    let markAgentEntered!: () => void;
+    const agentEntered = new Promise<void>((resolve) => {
+      markAgentEntered = resolve;
+    });
+    let releaseAgentResult!: () => void;
+    const gateAgentResult = new Promise<void>((resolve) => {
+      releaseAgentResult = resolve;
+    });
+    let pendingOutboxPromise: Promise<
+      Awaited<ReturnType<typeof deliverWeComTextViaOutbox>>
+    > | null = null;
+
+    const runtime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-revoke',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+      },
+      imManager,
+      ...wiring,
+      startMaintenance: false,
+      onMessage: (chatJid) => {
+        markAgentEntered();
+        pendingOutboxPromise = (async () => {
+          await gateAgentResult;
+          const turn = ChannelTurnRuntime.start({
+            provider: 'wecom',
+            accountId: BOT_ID,
+            sourceJid: chatJid,
+            chatId: `c2c:${CORP_ID}:m-zhao`,
+            externalMessageId: 'msg-revoke-inflight-1',
+          });
+          activeCleanups.push(() => {
+            turn.interrupt('test_cleanup');
+          });
+          const res = await deliverWeComTextViaOutbox({
+            imManager,
+            targetJid: chatJid,
+            text: '撤权后严禁外发的营销回复',
+            correlationId: 'msg-revoke-inflight-1',
+            outbox: {
+              provider: 'wecom',
+              accountId: BOT_ID,
+              sourceJid: chatJid,
+              chatId: `c2c:${CORP_ID}:m-zhao`,
+              rootId: null,
+              threadId: null,
+              turnRunId: turn.runId,
+              ordinal: 1,
+              kind: 'text',
+              payload: { text: '撤权后严禁外发的营销回复' },
+              idempotencyKey: `${turn.runId}:revoke-1`,
+              owner: 'e2e-revoke',
+            },
+          });
+          turn.complete();
+          return res;
+        })();
+      },
+      wecomConnection: {
+        client: offline.client,
+        sendTimeoutMs: 60,
+        leaseCheckIntervalMs: 50,
+      },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-revoke', ttlMs: 5000, renewMs: 1000 },
+        modelClassify: async () => ({
+          intent: 'marketing',
+          object: null,
+          action: null,
+          slots: {},
+          confidence: 0.99,
+          uncertain: false,
+        }),
+      },
+    });
+    expect(runtime).not.toBeNull();
+    activeCleanups.push(async () => {
+      releaseAgentResult();
+      await runtime!.close();
+      await imManager.disconnectAll();
+    });
+
+    offline.emitInboundText({
+      reqId: 'req-revoke-1',
+      msgid: 'msg-revoke-inflight-1',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '帮我写会员日文案',
+    });
+
+    await agentEntered;
+
+    // Revoke marketing capability in PG M03 policy while Agent turn is in flight
+    const basePolicy = buildPolicy(1);
+    const revoked = await updateAccessPolicy(world.store, {
+      expectedVersion: 1,
+      next: {
+        ...basePolicy,
+        version: 2,
+        members: {
+          ...basePolicy.members,
+          'p-zhao': {
+            role: 'employee',
+            storeIds: ['s-b'],
+            status: 'active',
+            capabilities: [],
+          },
+        },
+      },
+      actor: 'e2e-admin',
+      reason: 'revoke_marketing_in_flight',
+      at: now().toISOString(),
+    });
+    expect(revoked.ok).toBe(true);
+
+    releaseAgentResult();
+    expect(pendingOutboxPromise).not.toBeNull();
+    const outboxResult = await pendingOutboxPromise!;
+
+    expect(outboxResult.status).toBe('failed');
+    expect(outboxResult.error).toContain('wecom_blocked:capability_denied');
+    expect(getChannelOutboxItem(outboxResult.itemId)?.status).toBe('failed');
+    expect(offline.sent.filter((f) => f.cmd === WsCmd.SEND_MSG)).toHaveLength(
+      0,
+    );
+
+    await observer.flush();
+    const expectedRef = createHash('sha256')
+      .update('msg-revoke-inflight-1')
+      .digest('hex')
+      .slice(0, 24);
+    const spans = spanExporter
+      .getFinishedSpans()
+      .filter((s) => JSON.stringify(s.attributes).includes(expectedRef));
+    const authSpan = spans.find((s) => s.name === 'dot.wecom.outbound_auth');
+    const deliverySpan = spans.find((s) => s.name === 'dot.wecom.delivery');
+    expect(authSpan).toBeDefined();
+    expect(
+      JSON.parse(
+        String(authSpan!.attributes['langfuse.observation.metadata.reason']),
+      ),
+    ).toBe('capability_denied');
+    expect(
+      JSON.parse(
+        String(authSpan!.attributes['langfuse.observation.metadata.allowed']),
+      ),
+    ).toBe(false);
+    expect(deliverySpan).toBeDefined();
+    expect(
+      JSON.parse(
+        String(
+          deliverySpan!.attributes['langfuse.observation.metadata.outbox_status'],
+        ),
+      ),
+    ).toBe('failed');
+    expect(
+      JSON.parse(
+        String(
+          deliverySpan!.attributes['langfuse.observation.metadata.wecom_state'],
+        ),
+      ),
+    ).toBe('blocked');
+  }, 15_000);
+
+  test('Single managed marketing skill switch (FRONT_CLAW_WECOM_MARKETING_SKILL_ID) selects sole skill with minimal toolset and fails closed on invalid skill', async () => {
+    const now = () => new Date(Date.UTC(2026, 10, 12, 6, 0, 0));
+    const world = await createSeededMemoryWorld(now);
+    const offline = createOfflineWsClient();
+    const imManager = new IMConnectionManager();
+    const groupsMap: Record<string, RegisteredGroup> = {};
+    const wiring = createRuntimeWiringHarness(groupsMap);
+
+    const testUserSkillsDir = path.join(tmp, 'skills', 'admin-e2e-skill-test');
+    const decoyHostSkillsDir = path.join(tmp, 'host-claude-decoy', 'skills');
+    fs.mkdirSync(path.join(decoyHostSkillsDir, 'host-only-skill'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(decoyHostSkillsDir, 'host-only-skill', 'SKILL.md'),
+      '---\nname: host-only-skill\ndescription: decoy host skill\n---\n# Host\n',
+    );
+    fs.mkdirSync(path.join(testUserSkillsDir, 'unrelated-skill'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(testUserSkillsDir, 'unrelated-skill', 'SKILL.md'),
+      '---\nname: unrelated-skill\ndescription: decoy unrelated managed skill\n---\n# Unrelated\n',
+    );
+
+    const runtime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-skill-on',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        FRONT_CLAW_WECOM_MARKETING_SKILL_ID: 'beauty-local-content',
+      },
+      imManager,
+      ...wiring,
+      userSkillsDir: testUserSkillsDir,
+      startMaintenance: false,
+      wecomConnection: { client: offline.client, leaseCheckIntervalMs: 50 },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-skill-1', ttlMs: 5000, renewMs: 1000 },
+        modelClassify: async () => ({
+          intent: 'marketing',
+          object: null,
+          action: null,
+          slots: {},
+          confidence: 0.99,
+          uncertain: false,
+        }),
+      },
+    });
+    expect(runtime).not.toBeNull();
+    expect(runtime!.marketingSkillId).toBe('beauty-local-content');
+
+    offline.emitInboundText({
+      reqId: 'req-skill-1',
+      msgid: 'msg-skill-1',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '帮我写防晒套餐种草文案',
+    });
+    const zhaoWs = deriveEmployeeWeComWorkspace({
+      corpId: CORP_ID,
+      botId: BOT_ID,
+      memberId: 'm-zhao',
+    });
+    await waitUntil(() =>
+      db
+        .getMessagesSince(zhaoWs.jid, { timestamp: '', id: '' })
+        .some((m) => m.id === 'msg-skill-1'),
+    );
+
+    const enabledProfile = db.getAgentProfileForWorkspace(
+      zhaoWs.folder,
+      'admin-e2e',
+    );
+    expect(enabledProfile).toBeDefined();
+    expect(enabledProfile!.name).toBe(WECOM_SAFE_PROFILE_NAME);
+    expect(enabledProfile!.is_default).toBe(false);
+    expect(enabledProfile!.runtime_policy.context.source).toBe('managed');
+    expect(enabledProfile!.runtime_policy.mcp.mode).toBe('disabled');
+    expect(enabledProfile!.runtime_policy.skills).toEqual({
+      mode: 'custom',
+      ids: ['beauty-local-content'],
+      host: { mode: 'disabled', ids: [] },
+    });
+
+    const manifest = resolveEffectiveSkills({
+      layers: [
+        { source: 'host', root: decoyHostSkillsDir },
+        { source: 'managed', root: testUserSkillsDir },
+      ],
+      managedPolicy: enabledProfile!.runtime_policy.skills,
+      hostPolicy: enabledProfile!.runtime_policy.skills.host!,
+    });
+    expect(manifest.missingManagedSkillIds).toEqual([]);
+    expect(manifest.missingHostSkillIds).toEqual([]);
+    expect(manifest.selected.map((s) => s.id)).toEqual([
+      'beauty-local-content',
+    ]);
+
+    expect(
+      validateTargetAgentProfile({
+        profileId: enabledProfile!.id,
+        workspaceJid: zhaoWs.jid,
+        status: enabledProfile!.status,
+        executionMode: 'container',
+        contextSource: enabledProfile!.runtime_policy.context.source,
+        hostSkillsMode: enabledProfile!.runtime_policy.skills.host?.mode,
+        runtimePolicy: {
+          context: enabledProfile!.runtime_policy.context,
+          skills: enabledProfile!.runtime_policy.skills,
+        },
+        disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
+      }),
+    ).toEqual({ ok: true });
+
+    const policy = resolveDisallowedToolSet(
+      {
+        agentProfile: {
+          id: enabledProfile!.id,
+          name: enabledProfile!.name,
+          version: enabledProfile!.version,
+          isDefault: false,
+          identityHash: enabledProfile!.identity_hash,
+          identityPrompt: enabledProfile!.identity_prompt,
+          includeClaudePreset: false,
+          disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
+        },
+      },
+      {},
+    );
+    for (const blocked of [
+      'Bash',
+      'Write',
+      'Edit',
+      'NotebookEdit',
+      'Task',
+      'TaskOutput',
+      'TaskStop',
+      'WebFetch',
+      'WebSearch',
+      'mcp__miniclaw__send_message',
+      'mcp__miniclaw__schedule_task',
+    ]) {
+      expect(isToolDisallowed(blocked, policy.canonicalLower), blocked).toBe(
+        true,
+      );
+    }
+    for (const allowed of ['Read', 'Glob', 'Grep']) {
+      expect(isToolDisallowed(allowed, policy.canonicalLower), allowed).toBe(
+        false,
+      );
+    }
+
+    await runtime!.close();
+    await imManager.disconnectAll();
+
+    // Fail-closed: invalid/unbundled skillId disables skills instead of inheriting or throwing
+    const offlineInvalid = createOfflineWsClient();
+    const imManagerInvalid = new IMConnectionManager();
+    const invalidRuntime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-skill-invalid',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        FRONT_CLAW_WECOM_MARKETING_SKILL_ID: 'training-knowledge',
+      },
+      imManager: imManagerInvalid,
+      ...wiring,
+      userSkillsDir: testUserSkillsDir,
+      startMaintenance: false,
+      wecomConnection: {
+        client: offlineInvalid.client,
+        leaseCheckIntervalMs: 50,
+      },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-skill-2', ttlMs: 5000, renewMs: 1000 },
+      },
+    });
+    expect(invalidRuntime).not.toBeNull();
+    expect(invalidRuntime!.marketingSkillId).toBeNull();
+    const failClosedProfile = db.getAgentProfileForWorkspace(
+      zhaoWs.folder,
+      'admin-e2e',
+    );
+    expect(failClosedProfile!.runtime_policy.skills).toEqual({
+      mode: 'disabled',
+      ids: [],
+      host: { mode: 'disabled', ids: [] },
+    });
+    await invalidRuntime!.close();
+    await imManagerInvalid.disconnectAll();
+
+    // Toggling env off keeps Safe Marketing Profile locked to skills.mode = 'disabled'
+    const offlineOff = createOfflineWsClient();
+    const imManagerOff = new IMConnectionManager();
+    const offRuntime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-skill-off',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        FRONT_CLAW_WECOM_MARKETING_SKILL_ID: '',
+      },
+      imManager: imManagerOff,
+      ...wiring,
+      userSkillsDir: testUserSkillsDir,
+      startMaintenance: false,
+      wecomConnection: {
+        client: offlineOff.client,
+        leaseCheckIntervalMs: 50,
+      },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-skill-3', ttlMs: 5000, renewMs: 1000 },
+      },
+    });
+    expect(offRuntime).not.toBeNull();
+    expect(offRuntime!.marketingSkillId).toBeNull();
+    expect(
+      db.getAgentProfileForWorkspace(zhaoWs.folder, 'admin-e2e')!.runtime_policy
+        .skills,
+    ).toEqual({
+      mode: 'disabled',
+      ids: [],
+      host: { mode: 'disabled', ids: [] },
+    });
+    await offRuntime!.close();
+    await imManagerOff.disconnectAll();
+  }, 15_000);
 });
 
 const pgBin =
