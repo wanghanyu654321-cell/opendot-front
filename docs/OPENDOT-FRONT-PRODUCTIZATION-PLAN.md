@@ -2,7 +2,7 @@
 
 > 关联主仓库：`https://github.com/wanghanyu654321-cell/opendot-front`  
 > 前置总览文档：[OPENDOT-FRONT-MASTER-PLAN.md](./OPENDOT-FRONT-MASTER-PLAN.md)  
-> 对应收敛批次：Issues #5（内核/D175/分类器/出站鉴权）、#6（企微真实回执/跨岗去重/动态工作区）、#7（最小工具策略/四段脱敏观测/单营销 Skill）、#8（最终总装接线、E2E 门禁与试点验收包）
+> 对应收敛批次：Issues #5–#8（P0/P1 单营销受控收敛）+ Issues #9–#12（P2 口语体验、绑定即默认开通、四大软岗位独立工作区 + 7 个净版托管 Skills + 11 份培训知识库与店长只读快照注入）
 
 ---
 
@@ -46,7 +46,8 @@
 | **企微真实回执 Outbox** | `src/wecom.ts`<br>`src/im-channel.ts`<br>`src/im-manager.ts`<br>`src/wecom-front-claw-runtime.ts`<br>`src/index.ts` | 1. `deliverScopedChannelOutput` 对 `wecom` + `text` 走 `deliverWeComTextViaOutbox` 调 `imManager.sendMessageWithReceipt`。<br>2. `accepted` → 返回真实 `providerMessageId` 落 `delivered`；`blocked(0块)` / `rejected(sentChunkCount===0)` → 抛 `DefinitiveChannelDeliveryError`（不设 `retryAt`，直接落 `failed`）；`unknown` 或任意 `sentChunkCount > 0` → 抛普通 `Error` 锁死 `uncertain` 阻断重发。<br>3. 飞书/钉钉/Telegram/QQ/微信/WhatsApp/Discord 与 M06 PG `notification-dispatch.ts` 保持 100% 原样。 |
 | **出站 M03 实时复核** | `src/wecom-front-claw-bridge.ts`<br>`src/wecom-front-claw-runtime.ts`<br>`src/wecom.ts` | `startWeComFrontClawRuntime` 将 `bridge.authorizeOutbound` 注入 `connectUserWeCom(..., { authorizeOutbound })`。发送前（及分块发送每块前）实时重查 PG M03 策略，刚被撤权/停用/跨店失效成员的在途慢路径任务结果必须返回 `blocked`、零物理发信。 |
 | **四段 Langfuse 脱敏观测** | `src/personal-agent/host-observability.ts`<br>`src/wecom-front-claw-runtime.ts`<br>`src/index.ts` | 1. 串通 `dot.wecom.precheck` → `dot.wecom.agent_turn` → `dot.wecom.outbound_auth` → `dot.wecom.delivery`，统一使用脱敏 `correlation_ref = sha256(correlationId).slice(0, 24)`。<br>2. 在 `wecom-front-claw-runtime.ts` 接入 `onObservation` 时，将中文 `route`（`'快通道' | '模型' | '追问'`）归一化为 `'fast_path' | 'model' | 'clarify'`，常见中文 `gateReason` / `errorCategory` 映射为 ASCII 枚举，未知非 ASCII 仍 Fail-Closed 标 `'redacted'`，确保零业务明文与 PII 出境。 |
-| **最小工具集与单营销 Skill** | `container/agent-runner/src/tool-policy.ts`<br>`src/wecom-front-claw-skills.ts`<br>`src/wecom-front-claw-runtime.ts`<br>`src/index.ts` | 1. `isWeComRestrictedTurn` 注入完整 10 项 `SAFE_MARKETING_DISALLOWED_TOOLS`（`Bash`, `Write`, `Edit`, `NotebookEdit`, `Task`, `TaskOutput`, `TaskStop`, `WebFetch`, `WebSearch`, `mcp__miniclaw__*`），`tool-policy.ts` 支持 `mcp__miniclaw__*` 通配拦截。<br>2. 环境变量 `FRONT_CLAW_WECOM_MARKETING_SKILL_ID` 默认空（`skills.mode = 'disabled'`）；设为 `beauty-local-content` 时通过 `ensureBundledWeComMarketingSkill` 做 Fail-Closed 完整性校验并切换 `Safe Marketing Profile` 为 `skills: { mode: 'custom', ids: ['beauty-local-content'], host: { mode: 'disabled', ids: [] } }`，校验失败自动退回 `disabled`。 |
+| **最小工具集与四岗 7 托管 Skills** | `container/agent-runner/src/tool-policy.ts`<br>`src/wecom-front-claw-skills.ts`<br>`src/wecom-front-claw-runtime.ts`<br>`src/index.ts` | 1. `isWeComRestrictedTurn` 注入完整 10 项 `SAFE_MARKETING_DISALLOWED_TOOLS`（`Bash`, `Write`, `Edit`, `NotebookEdit`, `Task`, `TaskOutput`, `TaskStop`, `WebFetch`, `WebSearch`, `mcp__miniclaw__*`），`tool-policy.ts` 支持 `mcp__miniclaw__*` 通配拦截。<br>2. P2 默认开启四大软岗位（`marketing / training / manager_ops / reception_ads`），通过 `deriveWeComEmployeeWorkspace` 派生五元组独立工作区（如 `web:wecom-front-claw:training:<hash>`），并由 `ensureBundledWeComRoleSkills` 按岗 Fail-Closed 挂载 7 个净版托管 Skills（3 营销 + 1 培训 + 1 店长复盘 + 2 接待投流）；同时保留 `FRONT_CLAW_WECOM_MARKETING_SKILL_ID` 与 `FRONT_CLAW_WECOM_ROLE_SKILLS_ENABLED=0` 一键回滚兼容。 |
+| **P2 口语体验、绑定即开通与只读上下文注入** | `packages/front-claw/src/role-eval/*`<br>`src/wecom-front-claw-bridge.ts`<br>`src/wecom.ts` | 1. 4 项真机口语体验：D175 插话后 `确认认账` 容错与尾部提示一致性、项目备注白名单（如「张姐刚做了补水项目680」）直出草稿、「查一下二店业绩」简写跨店拒绝、「王姐明天下午补水预约」→「4点」多轮补时间。<br>2. `FRONT_CLAW_WECOM_AUTO_ROLE_GRANT=1` 默认为已绑定在职员工按 `tier` 自动幂等补齐本店店务与软岗位授权（已撤权/停用绝不复活）。<br>3. `training` 岗自动检索 11 份内置脱敏培训教材章节、`manager_ops` 岗（仅限店长/老板）自动生成本店今日与本月已确认业绩只读快照，由 `wecom.ts` 以受控只读参考块当轮注入。 |
 
 ### 1.3 冻结红线清单（本波严禁擅自打开）
 

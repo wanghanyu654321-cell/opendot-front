@@ -39,8 +39,14 @@ export type WeComPrecheckOutcome =
       readonly accountId: string;
       readonly storeId: string;
       readonly displayName: string;
+      readonly targetRole?:
+        | 'marketing'
+        | 'training'
+        | 'manager_ops'
+        | 'reception_ads';
       readonly workspaceJid?: string;
       readonly expiredReminder?: string;
+      readonly readonlyContext?: string;
     };
 
 export type WeComPrecheckPort = (
@@ -1427,12 +1433,17 @@ export function createWeComConnection(
     }
     rememberBoundedKey(admittedPassKeys, passDedupeKey);
 
+    const readonlyContext = outcome.readonlyContext?.trim();
+    const effectivePassContent = readonlyContext
+      ? `[系统受控只读参考资料（已通过 M03 权限校验，严禁声称已写库或修改账目）]\n${readonlyContext}\n\n[员工本轮提问]\n${inboundEvent.text}`
+      : inboundEvent.text;
+
     storeMessageDirect(
       inboundEvent.messageId,
       targetJid,
       senderId,
       senderName,
-      inboundEvent.text,
+      effectivePassContent,
       timestamp,
       false,
       { sourceJid: jid },
@@ -1445,14 +1456,14 @@ export function createWeComConnection(
         source_jid: jid,
         sender: senderId,
         sender_name: senderName,
-        content: inboundEvent.text,
+        content: effectivePassContent,
         timestamp,
         is_from_me: false,
       },
       agentId ?? undefined,
     );
     notifyNewImMessage();
-    opts.onMessage?.(jid, inboundEvent.text, senderName);
+    opts.onMessage?.(jid, effectivePassContent, senderName);
     if (agentId) {
       opts.onAgentMessage?.(jid, agentId);
     }

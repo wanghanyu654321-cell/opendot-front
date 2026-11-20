@@ -46,7 +46,14 @@ import {
   type WeComFrontClawBridgeOptions,
   createWeComFrontClawBridge,
 } from './wecom-front-claw-bridge.js';
-import { ensureBundledWeComMarketingSkill } from './wecom-front-claw-skills.js';
+import {
+  WECOM_ROLE_SKILL_IDS,
+  WECOM_SOFT_ROLES,
+  type WeComSoftRole,
+  buildWeComTrainingKnowledgeContext,
+  ensureBundledWeComMarketingSkill,
+  ensureBundledWeComRoleSkills,
+} from './wecom-front-claw-skills.js';
 
 export const WECOM_MANAGED_WORKSPACE_JID = 'web:wecom-front-claw';
 export const WECOM_MANAGED_WORKSPACE_FOLDER = 'wecom-front-claw';
@@ -54,22 +61,124 @@ export const WECOM_MANAGED_WORKSPACE_JID_PREFIX = `${WECOM_MANAGED_WORKSPACE_JID
 export const WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX = `${WECOM_MANAGED_WORKSPACE_FOLDER}-`;
 export const WECOM_SAFE_PROFILE_NAME = 'Front Claw Safe Marketing';
 
+export const WECOM_SAFE_ROLE_PROFILE_NAMES: Readonly<
+  Record<WeComSoftRole, string>
+> = {
+  marketing: WECOM_SAFE_PROFILE_NAME,
+  training: 'Front Claw Safe Training',
+  manager_ops: 'Front Claw Safe Manager Ops',
+  reception_ads: 'Front Claw Safe Reception Ads',
+};
+
+const WECOM_SAFE_ROLE_WORKSPACE_LABELS: Readonly<
+  Record<WeComSoftRole, string>
+> = {
+  marketing: '企微内容营销工作区',
+  training: '企微教学培训工作区',
+  manager_ops: '企微店长复盘工作区',
+  reception_ads: '企微接待与投流工作区',
+};
+
+const WECOM_SAFE_ROLE_IDENTITY_PROMPTS: Readonly<
+  Record<WeComSoftRole, string>
+> = {
+  marketing:
+    '你是企业微信非店务营销咨询助手，仅基于当前受控工作区回答内容营销与咨询问题。严禁伪造店务账本、严禁声称已写库或执行脚本。',
+  training:
+    '你是企业微信教学培训与家访带教助手，仅基于受控培训参考资料解答家访五步法、带教演练与组织诊断。严禁伪造店务账本、严禁声称已写库或执行脚本。',
+  manager_ops:
+    '你是企业微信店长经营复盘助手，仅基于系统注入的本店只读经营快照提供复盘诊断与管理建议。严禁伪造店务账本、严禁声称已写库或改账。',
+  reception_ads:
+    '你是企业微信客户接待与投流诊断助手，仅基于当前受控工作区提供接待异议话术与团购投流复盘建议。严禁伪造店务账本、严禁声称已写库或执行脚本。',
+};
+
 const SYSTEM_WECOM_OWNER_ID = 'front-claw-system';
 const DEFAULT_LEASE_CHECK_INTERVAL_MS = 1000;
+
+function isKnownWeComSoftRole(value: string | undefined): value is WeComSoftRole {
+  return Boolean(value && (WECOM_SOFT_ROLES as readonly string[]).includes(value));
+}
+
+export function parseEnabledWeComSoftRoles(
+  raw: string | undefined,
+): ReadonlySet<WeComSoftRole> {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return new Set<WeComSoftRole>(WECOM_SOFT_ROLES);
+  }
+  const parsed = trimmed
+    .split(',')
+    .map((item) => item.trim())
+    .filter(isKnownWeComSoftRole);
+  return new Set<WeComSoftRole>(
+    parsed.length > 0 ? parsed : ['marketing'],
+  );
+}
+
+export function deriveWeComEmployeeWorkspace(ctx: {
+  corpId: string;
+  botId: string;
+  memberId: string;
+  storeId?: string;
+  targetRole?: WeComSoftRole;
+}): { jid: string; folder: string; role: WeComSoftRole } {
+  const role: WeComSoftRole = isKnownWeComSoftRole(ctx.targetRole)
+    ? ctx.targetRole
+    : 'marketing';
+  const normalizedStoreId = ctx.storeId?.trim() || undefined;
+  const seed =
+    role === 'marketing'
+      ? [ctx.corpId, ctx.botId, ctx.memberId]
+      : [
+          ctx.corpId,
+          ctx.botId,
+          ctx.memberId,
+          normalizedStoreId ?? 'default',
+          role,
+        ];
+  const digest = createHash('sha256')
+    .update(JSON.stringify(seed))
+    .digest('hex')
+    .slice(0, 16);
+  if (role === 'marketing') {
+    return {
+      role,
+      jid: `${WECOM_MANAGED_WORKSPACE_JID_PREFIX}${digest}`,
+      folder: `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${digest}`,
+    };
+  }
+  return {
+    role,
+    jid: `${WECOM_MANAGED_WORKSPACE_JID_PREFIX}${role}:${digest}`,
+    folder: `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${role}-${digest}`,
+  };
+}
 
 export function deriveEmployeeWeComWorkspace(ctx: {
   corpId: string;
   botId: string;
   memberId: string;
+  storeId?: string;
+  targetRole?: WeComSoftRole;
 }): { jid: string; folder: string } {
-  const digest = createHash('sha256')
-    .update(JSON.stringify([ctx.corpId, ctx.botId, ctx.memberId]))
-    .digest('hex')
-    .slice(0, 16);
-  return {
-    jid: `${WECOM_MANAGED_WORKSPACE_JID_PREFIX}${digest}`,
-    folder: `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${digest}`,
-  };
+  const { jid, folder } = deriveWeComEmployeeWorkspace(ctx);
+  return { jid, folder };
+}
+
+export function inferWeComRoleFromWorkspaceJid(
+  workspaceJid: string | undefined,
+): WeComSoftRole {
+  if (
+    !workspaceJid ||
+    !workspaceJid.startsWith(WECOM_MANAGED_WORKSPACE_JID_PREFIX)
+  ) {
+    return 'marketing';
+  }
+  const rest = workspaceJid.slice(WECOM_MANAGED_WORKSPACE_JID_PREFIX.length);
+  const colonIdx = rest.indexOf(':');
+  if (colonIdx <= 0) return 'marketing';
+  const candidate = rest.slice(0, colonIdx);
+  return isKnownWeComSoftRole(candidate) ? candidate : 'marketing';
 }
 
 export function isWeComManagedWorkspaceFolder(
@@ -79,8 +188,9 @@ export function isWeComManagedWorkspaceFolder(
     folder === WECOM_MANAGED_WORKSPACE_FOLDER ||
     Boolean(
       folder &&
-        folder.startsWith(WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX) &&
-        folder.length > WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX.length,
+        /^wecom-front-claw-(?:(?:marketing|training|manager_ops|reception_ads)-)?[a-z0-9][a-z0-9_-]*$/i.test(
+          folder,
+        ),
     )
   );
 }
@@ -90,8 +200,9 @@ export function isWeComManagedWorkspaceJid(jid: string | undefined): boolean {
     jid === WECOM_MANAGED_WORKSPACE_JID ||
     Boolean(
       jid &&
-        jid.startsWith(WECOM_MANAGED_WORKSPACE_JID_PREFIX) &&
-        jid.length > WECOM_MANAGED_WORKSPACE_JID_PREFIX.length,
+        /^web:wecom-front-claw:(?:(?:marketing|training|manager_ops|reception_ads):)?[a-z0-9][a-z0-9_-]*$/i.test(
+          jid,
+        ),
     )
   );
 }
@@ -362,6 +473,8 @@ export interface WeComFrontClawRuntimeHandle {
   readonly workspaceJid: string;
   readonly workspaceFolder: string;
   readonly marketingSkillId: string | null;
+  readonly enabledRoles: readonly WeComSoftRole[];
+  readonly roleSkillIds: Readonly<Record<WeComSoftRole, readonly string[]>>;
   readonly bridge: WeComFrontClawBridge;
   readonly dispatchStatus: 'started' | 'disabled' | 'already';
   isConnected(): boolean;
@@ -394,33 +507,38 @@ function resolveWeComOwnerUserId(
   return { userId: SYSTEM_WECOM_OWNER_ID, hasPersistedUser: false };
 }
 
-function buildSafeMarketingRuntimePolicy(marketingSkillId?: string) {
+function buildSafeRoleRuntimePolicy(skillIds: readonly string[]) {
   return {
     context: { source: 'managed' as const },
-    skills: marketingSkillId
-      ? {
-          mode: 'custom' as const,
-          ids: [marketingSkillId],
-          host: { mode: 'disabled' as const, ids: [] as string[] },
-        }
-      : {
-          mode: 'disabled' as const,
-          ids: [] as string[],
-          host: { mode: 'disabled' as const, ids: [] as string[] },
-        },
+    skills:
+      skillIds.length > 0
+        ? {
+            mode: 'custom' as const,
+            ids: [...skillIds],
+            host: { mode: 'disabled' as const, ids: [] as string[] },
+          }
+        : {
+            mode: 'disabled' as const,
+            ids: [] as string[],
+            host: { mode: 'disabled' as const, ids: [] as string[] },
+          },
     mcp: { mode: 'disabled' as const, ids: [] as string[] },
   };
 }
 
-function isSafeMarketingProfile(
+function isSafeRoleProfile(
   profile: AgentProfile | undefined,
-  marketingSkillId?: string,
+  role: WeComSoftRole,
+  skillIds: readonly string[],
 ): boolean {
+  const expectedName = WECOM_SAFE_ROLE_PROFILE_NAMES[role];
+  const expectedPrompt = WECOM_SAFE_ROLE_IDENTITY_PROMPTS[role];
   if (
     !profile ||
     profile.status !== 'active' ||
     profile.is_default !== false ||
-    profile.name !== WECOM_SAFE_PROFILE_NAME ||
+    profile.name !== expectedName ||
+    profile.identity_prompt !== expectedPrompt ||
     profile.runtime_policy.context.source !== 'managed' ||
     profile.runtime_policy.skills.host?.mode !== 'disabled' ||
     profile.runtime_policy.mcp.mode !== 'disabled'
@@ -428,44 +546,47 @@ function isSafeMarketingProfile(
     return false;
   }
   const skills = profile.runtime_policy.skills;
-  if (marketingSkillId) {
+  if (skillIds.length > 0) {
     return (
       skills.mode === 'custom' &&
-      skills.ids.length === 1 &&
-      skills.ids[0] === marketingSkillId
+      skills.ids.length === skillIds.length &&
+      skillIds.every((id, index) => skills.ids[index] === id)
     );
   }
   return skills.mode === 'disabled' && skills.ids.length === 0;
 }
 
-function findOrCreateSafeMarketingProfile(
+function findOrCreateSafeRoleProfile(
   ownerUserId: string,
-  marketingSkillId?: string,
+  role: WeComSoftRole,
+  skillIds: readonly string[],
 ): string {
+  const expectedName = WECOM_SAFE_ROLE_PROFILE_NAMES[role];
+  const expectedPrompt = WECOM_SAFE_ROLE_IDENTITY_PROMPTS[role];
   const existing = listAgentProfilesForUser(ownerUserId).find(
     (profile) =>
       profile.status === 'active' &&
       !profile.is_default &&
-      profile.name === WECOM_SAFE_PROFILE_NAME,
+      profile.name === expectedName,
   );
   if (existing) {
-    if (isSafeMarketingProfile(existing, marketingSkillId)) {
+    if (isSafeRoleProfile(existing, role, skillIds)) {
       return existing.id;
     }
     const updated = updateAgentProfile(existing.id, ownerUserId, {
-      runtimePolicy: buildSafeMarketingRuntimePolicy(marketingSkillId),
+      identityPrompt: expectedPrompt,
+      runtimePolicy: buildSafeRoleRuntimePolicy(skillIds),
     });
     return updated?.id ?? existing.id;
   }
 
   const created = createAgentProfile({
     ownerUserId,
-    name: WECOM_SAFE_PROFILE_NAME,
-    identityPrompt:
-      '你是企业微信非店务营销咨询助手，仅基于当前受控工作区回答内容营销与咨询问题。严禁伪造店务账本、严禁声称已写库或执行脚本。',
+    name: expectedName,
+    identityPrompt: expectedPrompt,
     promptMode: 'replace',
     includeClaudePreset: false,
-    runtimePolicy: buildSafeMarketingRuntimePolicy(marketingSkillId),
+    runtimePolicy: buildSafeRoleRuntimePolicy(skillIds),
   });
   return created.id;
 }
@@ -473,44 +594,66 @@ function findOrCreateSafeMarketingProfile(
 function ensureSafeProfileBinding(
   folder: string,
   ownerUserId: string,
-  marketingSkillId?: string,
+  role: WeComSoftRole,
+  skillIds: readonly string[],
 ): void {
+  const expectedName = WECOM_SAFE_ROLE_PROFILE_NAMES[role];
+  const expectedPrompt = WECOM_SAFE_ROLE_IDENTITY_PROMPTS[role];
   const mappedId = getWorkspaceAgentProfileId(folder);
   const mapped = mappedId ? getAgentProfile(mappedId) : undefined;
-  if (isSafeMarketingProfile(mapped, marketingSkillId)) {
+  if (isSafeRoleProfile(mapped, role, skillIds)) {
     return;
   }
   if (
     mapped &&
     mapped.status === 'active' &&
     !mapped.is_default &&
-    mapped.name === WECOM_SAFE_PROFILE_NAME &&
+    mapped.name === expectedName &&
     mapped.owner_user_id === ownerUserId
   ) {
     const updated = updateAgentProfile(mapped.id, ownerUserId, {
-      runtimePolicy: buildSafeMarketingRuntimePolicy(marketingSkillId),
+      identityPrompt: expectedPrompt,
+      runtimePolicy: buildSafeRoleRuntimePolicy(skillIds),
     });
-    if (updated && isSafeMarketingProfile(updated, marketingSkillId)) {
+    if (updated && isSafeRoleProfile(updated, role, skillIds)) {
       return;
     }
   }
-  const profileId = findOrCreateSafeMarketingProfile(
-    ownerUserId,
-    marketingSkillId,
-  );
+  const profileId = findOrCreateSafeRoleProfile(ownerUserId, role, skillIds);
   assignWorkspaceAgentProfile(folder, profileId, 'assistant');
+}
+
+function defaultManagedFolderForWorkspaceJid(
+  workspaceJid: string,
+): string | undefined {
+  if (workspaceJid === WECOM_MANAGED_WORKSPACE_JID) {
+    return WECOM_MANAGED_WORKSPACE_FOLDER;
+  }
+  if (!workspaceJid.startsWith(WECOM_MANAGED_WORKSPACE_JID_PREFIX)) {
+    return undefined;
+  }
+  const suffix = workspaceJid
+    .slice(WECOM_MANAGED_WORKSPACE_JID_PREFIX.length)
+    .replace(/:/g, '-');
+  return suffix ? `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${suffix}` : undefined;
 }
 
 function ensureManagedWeComWorkspace(params: {
   workspaceJid: string;
   workspaceFolder?: string;
   workspaceName?: string;
+  targetRole?: WeComSoftRole;
   ownerUserId: string;
-  resolveMarketingSkillId?: (ownerUserId: string) => string | undefined;
+  resolveRoleSkillIds?: (
+    ownerUserId: string,
+    role: WeComSoftRole,
+  ) => readonly string[];
   getGroup: (jid: string) => RegisteredGroup | undefined;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   groupsDir: string;
 }): RegisteredGroup | undefined {
+  const role =
+    params.targetRole ?? inferWeComRoleFromWorkspaceJid(params.workspaceJid);
   const existing = params.getGroup(params.workspaceJid);
   if (existing) {
     if (isWeComManagedWorkspaceJid(params.workspaceJid)) {
@@ -528,7 +671,8 @@ function ensureManagedWeComWorkspace(params: {
         ensureSafeProfileBinding(
           migrated.folder,
           params.ownerUserId,
-          params.resolveMarketingSkillId?.(params.ownerUserId),
+          role,
+          params.resolveRoleSkillIds?.(params.ownerUserId, role) ?? [],
         );
         return migrated;
       }
@@ -536,18 +680,16 @@ function ensureManagedWeComWorkspace(params: {
       ensureSafeProfileBinding(
         existing.folder,
         effectiveOwnerId,
-        params.resolveMarketingSkillId?.(effectiveOwnerId),
+        role,
+        params.resolveRoleSkillIds?.(effectiveOwnerId, role) ?? [],
       );
     }
     return existing;
   }
 
-  const defaultFolder =
-    params.workspaceJid === WECOM_MANAGED_WORKSPACE_JID
-      ? WECOM_MANAGED_WORKSPACE_FOLDER
-      : params.workspaceJid.startsWith(WECOM_MANAGED_WORKSPACE_JID_PREFIX)
-        ? `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${params.workspaceJid.slice(WECOM_MANAGED_WORKSPACE_JID_PREFIX.length)}`
-        : undefined;
+  const defaultFolder = defaultManagedFolderForWorkspaceJid(
+    params.workspaceJid,
+  );
   const folder = params.workspaceFolder ?? defaultFolder;
   if (!folder) {
     return undefined;
@@ -558,7 +700,7 @@ function ensureManagedWeComWorkspace(params: {
   });
 
   const group: RegisteredGroup = {
-    name: params.workspaceName ?? '企微内容营销工作区',
+    name: params.workspaceName ?? WECOM_SAFE_ROLE_WORKSPACE_LABELS[role],
     folder,
     added_at: new Date().toISOString(),
     created_by: params.ownerUserId,
@@ -569,7 +711,8 @@ function ensureManagedWeComWorkspace(params: {
   ensureSafeProfileBinding(
     group.folder,
     params.ownerUserId,
-    params.resolveMarketingSkillId?.(params.ownerUserId),
+    role,
+    params.resolveRoleSkillIds?.(params.ownerUserId, role) ?? [],
   );
 
   return group;
@@ -642,44 +785,99 @@ export async function startWeComFrontClawRuntime(
   }
   const ownerUserId = ownerResolution.userId;
 
+  const enabledRolesSet = parseEnabledWeComSoftRoles(
+    env.FRONT_CLAW_WECOM_ENABLED_ROLES,
+  );
+  const enabledRoles = [...enabledRolesSet] as const;
+
+  const hasExplicitMarketingSkillOverride = Object.prototype.hasOwnProperty.call(
+    env,
+    'FRONT_CLAW_WECOM_MARKETING_SKILL_ID',
+  );
   const requestedMarketingSkillId = (
     env.FRONT_CLAW_WECOM_MARKETING_SKILL_ID ?? ''
   ).trim();
-  const marketingSkillByOwner = new Map<string, string | null>();
-  const resolveMarketingSkillForOwner = (
+  const roleSkillsEnabled =
+    (env.FRONT_CLAW_WECOM_ROLE_SKILLS_ENABLED ?? '1').trim() !== '0';
+
+  const roleSkillsByOwner = new Map<string, readonly string[]>();
+  const resolveRoleSkillIdsForOwner = (
     targetOwnerId: string,
-  ): string | undefined => {
-    if (!requestedMarketingSkillId) {
-      return undefined;
-    }
-    if (marketingSkillByOwner.has(targetOwnerId)) {
-      return marketingSkillByOwner.get(targetOwnerId) ?? undefined;
+    role: WeComSoftRole,
+  ): readonly string[] => {
+    const effectiveRole: WeComSoftRole = enabledRolesSet.has(role)
+      ? role
+      : 'marketing';
+    const cacheKey = `${targetOwnerId}:${effectiveRole}`;
+    if (roleSkillsByOwner.has(cacheKey)) {
+      return roleSkillsByOwner.get(cacheKey)!;
     }
     const targetSkillsDir =
       deps.userSkillsDir ?? path.join(DATA_DIR, 'skills', targetOwnerId);
+
+    if (effectiveRole === 'marketing' && hasExplicitMarketingSkillOverride) {
+      if (!requestedMarketingSkillId) {
+        roleSkillsByOwner.set(cacheKey, []);
+        return [];
+      }
+      try {
+        const synced = ensureBundledWeComMarketingSkill({
+          userSkillsDir: targetSkillsDir,
+          skillId: requestedMarketingSkillId,
+        });
+        const ids = [synced.skillId];
+        roleSkillsByOwner.set(cacheKey, ids);
+        return ids;
+      } catch (err) {
+        logger.error(
+          {
+            err,
+            botId,
+            ownerUserId: targetOwnerId,
+            skillId: requestedMarketingSkillId,
+          },
+          'Failed to sync/verify bundled WeCom marketing skill; keeping Safe Marketing Profile skills disabled (fail-closed)',
+        );
+        roleSkillsByOwner.set(cacheKey, []);
+        return [];
+      }
+    }
+
+    if (!roleSkillsEnabled || !enabledRolesSet.has(effectiveRole)) {
+      roleSkillsByOwner.set(cacheKey, []);
+      return [];
+    }
+
     try {
-      const synced = ensureBundledWeComMarketingSkill({
+      const synced = ensureBundledWeComRoleSkills({
         userSkillsDir: targetSkillsDir,
-        skillId: requestedMarketingSkillId,
+        role: effectiveRole,
+        skillIds: WECOM_ROLE_SKILL_IDS[effectiveRole],
       });
-      marketingSkillByOwner.set(targetOwnerId, synced.skillId);
-      return synced.skillId;
+      roleSkillsByOwner.set(cacheKey, synced.skillIds);
+      return synced.skillIds;
     } catch (err) {
       logger.error(
         {
           err,
           botId,
           ownerUserId: targetOwnerId,
-          skillId: requestedMarketingSkillId,
+          role: effectiveRole,
         },
-        'Failed to sync/verify bundled WeCom marketing skill; keeping Safe Marketing Profile skills disabled (fail-closed)',
+        'Failed to sync/verify bundled WeCom role skills; keeping role profile skills disabled (fail-closed)',
       );
-      marketingSkillByOwner.set(targetOwnerId, null);
-      return undefined;
+      roleSkillsByOwner.set(cacheKey, []);
+      return [];
     }
   };
-  const enabledMarketingSkillId =
-    resolveMarketingSkillForOwner(ownerUserId) ?? null;
+
+  const roleSkillIds = {
+    marketing: resolveRoleSkillIdsForOwner(ownerUserId, 'marketing'),
+    training: resolveRoleSkillIdsForOwner(ownerUserId, 'training'),
+    manager_ops: resolveRoleSkillIdsForOwner(ownerUserId, 'manager_ops'),
+    reception_ads: resolveRoleSkillIdsForOwner(ownerUserId, 'reception_ads'),
+  } as const;
+  const enabledMarketingSkillId = roleSkillIds.marketing[0] ?? null;
 
   const workspaceJid =
     env.FRONT_CLAW_WECOM_WORKSPACE_JID?.trim() || WECOM_MANAGED_WORKSPACE_JID;
@@ -687,8 +885,9 @@ export async function startWeComFrontClawRuntime(
   const groupsDir = deps.groupsDir ?? GROUPS_DIR;
   const managedGroup = ensureManagedWeComWorkspace({
     workspaceJid,
+    targetRole: 'marketing',
     ownerUserId,
-    resolveMarketingSkillId: resolveMarketingSkillForOwner,
+    resolveRoleSkillIds: resolveRoleSkillIdsForOwner,
     getGroup: deps.getGroup,
     registerGroup: deps.registerGroup,
     groupsDir,
@@ -696,27 +895,39 @@ export async function startWeComFrontClawRuntime(
 
   const employeeWorkspaceByChat = new Map<
     string,
-    { jid: string; folder: string }
+    { jid: string; folder: string; role: WeComSoftRole }
   >();
   const ensureEmployeeTargetWorkspace = (ctx: {
     corpId: string;
     memberId: string;
+    storeId?: string;
+    targetRole?: WeComSoftRole;
     displayName?: string;
-  }): { jid: string; folder: string } | undefined => {
+  }): { jid: string; folder: string; role: WeComSoftRole } | undefined => {
     if (!managedWorkspaceEnabled) {
       return undefined;
     }
-    const derived = deriveEmployeeWeComWorkspace({
+    const requestedRole: WeComSoftRole =
+      ctx.targetRole && enabledRolesSet.has(ctx.targetRole)
+        ? ctx.targetRole
+        : 'marketing';
+    const derived = deriveWeComEmployeeWorkspace({
       corpId: ctx.corpId,
       botId,
       memberId: ctx.memberId,
+      ...(requestedRole !== 'marketing' && ctx.storeId
+        ? { storeId: ctx.storeId }
+        : {}),
+      targetRole: requestedRole,
     });
+    const label = WECOM_SAFE_ROLE_WORKSPACE_LABELS[derived.role];
     ensureManagedWeComWorkspace({
       workspaceJid: derived.jid,
       workspaceFolder: derived.folder,
-      workspaceName: `企微内容营销工作区 (${ctx.displayName || ctx.memberId})`,
+      workspaceName: `${label} (${ctx.displayName || ctx.memberId})`,
+      targetRole: derived.role,
       ownerUserId,
-      resolveMarketingSkillId: resolveMarketingSkillForOwner,
+      resolveRoleSkillIds: resolveRoleSkillIdsForOwner,
       getGroup: deps.getGroup,
       registerGroup: deps.registerGroup,
       groupsDir,
@@ -756,7 +967,7 @@ export async function startWeComFrontClawRuntime(
       ensureManagedWeComWorkspace({
         workspaceJid: existingJid,
         ownerUserId,
-        resolveMarketingSkillId: resolveMarketingSkillForOwner,
+        resolveRoleSkillIds: resolveRoleSkillIdsForOwner,
         getGroup: deps.getGroup,
         registerGroup: deps.registerGroup,
         groupsDir,
@@ -834,6 +1045,8 @@ export async function startWeComFrontClawRuntime(
         ensureEmployeeTargetWorkspace({
           corpId: ctx.corpId,
           memberId: ctx.memberId,
+          storeId: ctx.storeId,
+          targetRole: ctx.targetRole,
           displayName: ctx.displayName,
         })?.jid ?? workspaceJid),
     resolveTargetProfile:
@@ -843,6 +1056,27 @@ export async function startWeComFrontClawRuntime(
           workspaceJid: ctx.workspaceJid ?? workspaceJid,
           getGroup: deps.getGroup,
         })),
+    resolveTrainingContext:
+      deps.bridgeOptions?.resolveTrainingContext ??
+      ((params) => {
+        if (!enabledRolesSet.has('training')) {
+          return undefined;
+        }
+        try {
+          const result = buildWeComTrainingKnowledgeContext({
+            query: params.query,
+            accountId: params.accountId,
+            workspaceJid: params.workspaceJid,
+          });
+          return result.formattedContext.trim() || undefined;
+        } catch (err) {
+          logger.warn(
+            { err, botId, workspaceJid: params.workspaceJid },
+            'Failed to build WeCom training knowledge context; continuing without training reference',
+          );
+          return undefined;
+        }
+      }),
   };
 
   const rawBridge = await createWeComFrontClawBridge(bridgeOptions);
@@ -1094,6 +1328,8 @@ export async function startWeComFrontClawRuntime(
       ownerUserId,
       workspaceJid,
       marketingSkillId: enabledMarketingSkillId,
+      enabledRoles,
+      roleSkillIds,
       driver: bridge.driver,
       leaseHeld: bridge.leaseHeld(),
       dispatchStatus,
@@ -1108,6 +1344,8 @@ export async function startWeComFrontClawRuntime(
     workspaceJid,
     workspaceFolder: managedGroup?.folder ?? WECOM_MANAGED_WORKSPACE_FOLDER,
     marketingSkillId: enabledMarketingSkillId,
+    enabledRoles,
+    roleSkillIds,
     bridge,
     dispatchStatus,
     isConnected: () =>
