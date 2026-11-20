@@ -179,6 +179,9 @@ jobs:
           npx vitest run \
             tests/wecom-im-channel.test.ts \
             tests/wecom-front-claw-bridge.test.ts \
+            tests/wecom-tool-policy.test.ts \
+            tests/host-observability-wecom.test.ts \
+            tests/wecom-front-claw-skills.test.ts \
             tests/wecom-opendot-e2e.test.ts \
             tests/reproducible-build-contract.test.ts \
             tests/graceful-shutdown-order.test.ts \
