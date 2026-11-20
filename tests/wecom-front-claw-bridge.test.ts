@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   BRIDGE_AGENT_GUARDRAIL_DENIED_REPLY,
   BRIDGE_INCOMPLETE_PROFILE_REPLY,
+  classifyWeComSoftRole,
   createModelClassifierFromOpenDotConfig,
   createWeComFrontClawBridge,
   resolveOpenDotClassifierConfig,
@@ -105,9 +106,12 @@ function cleanPolicy(
 }
 
 interface FixtureOptions {
+  driver?: 'memory' | 'postgres';
   bridgeOptions?: Parameters<typeof createWeComFrontClawBridge>[0];
   people?: Person[];
-  initialPolicy?: AccessPolicy;
+  initialPolicy?: AccessPolicy | null;
+  autoRoleGrant?: '0' | '1';
+  wangTier?: Person['tier'];
   now?: () => Date;
   wrapStore?: (store: ReturnType<typeof createPostgresPerformanceStore>) => ReturnType<typeof createPostgresPerformanceStore>;
 }
@@ -149,7 +153,7 @@ async function createBridgeFixture(opts: FixtureOptions = {}) {
       displayName: '王姐',
       storeId: 's-a',
       storeName: '测试A店',
-      tier: 'employee',
+      tier: opts.wangTier ?? 'employee',
       roles: ['marketing'],
       active: true,
     },
@@ -190,15 +194,18 @@ async function createBridgeFixture(opts: FixtureOptions = {}) {
     active: true,
   });
 
-  const policy = opts.initialPolicy ?? cleanPolicy(1);
-  const policyRes = await updateAccessPolicy(store, {
-    expectedVersion: null,
-    next: policy,
-    actor: 'admin',
-    reason: 'init',
-    at: '2026-11-12T00:00:00Z',
-  });
-  expect(policyRes.ok).toBe(true);
+  const policy =
+    opts.initialPolicy === undefined ? cleanPolicy(1) : opts.initialPolicy;
+  if (policy) {
+    const policyRes = await updateAccessPolicy(store, {
+      expectedVersion: null,
+      next: policy,
+      actor: 'admin',
+      reason: 'init',
+      at: '2026-11-12T00:00:00Z',
+    });
+    expect(policyRes.ok).toBe(true);
+  }
 
   let currentTime = new Date('2026-11-12T02:00:00Z');
   const nowFn = opts.now ?? (() => currentTime);
@@ -208,9 +215,10 @@ async function createBridgeFixture(opts: FixtureOptions = {}) {
     env: {
       FRONT_CLAW_MEM0: '0',
       FRONT_CLAW_DATABASE_URL: 'postgres://secret-user:secret-pass@127.0.0.1:5432/front_claw_secret',
+      FRONT_CLAW_WECOM_AUTO_ROLE_GRANT: opts.autoRoleGrant,
     },
     open: async () => ({
-      driver: 'memory',
+      driver: opts.driver ?? 'memory',
       store,
       bindings,
       close: async () => {},
@@ -253,7 +261,7 @@ async function createBridgeFixture(opts: FixtureOptions = {}) {
     setNow(next: Date) {
       currentTime = next;
     },
-    currentPolicyVersion: policy.version,
+    currentPolicyVersion: policy?.version,
   };
 }
 
@@ -315,6 +323,7 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
       accountId: 'a-wang',
       storeId: 's-a',
       displayName: '王姐',
+      targetRole: 'marketing',
       workspaceJid: 'wecom:c2c:m-wang#account:default',
     });
 
@@ -572,7 +581,7 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
   });
 
   it('⑤ 撤权后拒绝放行（含新消息与重放原 messageId）', async () => {
-    const fx = await createBridgeFixture();
+    const fx = await createBridgeFixture({ autoRoleGrant: '0' });
     cleanups.push(() => fx.bridge.close());
 
     // 撤权前同文可放行
@@ -1098,7 +1107,7 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
       'mcp__miniclaw__*',
     ]);
 
-    const fx = await createBridgeFixture();
+    const fx = await createBridgeFixture({ autoRoleGrant: '0' });
     cleanups.push(() => fx.bridge.close());
 
     const authCheck: (req: WeComOutboundAuthRequest) => Promise<WeComOutboundAuthResult> =
@@ -1249,5 +1258,534 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     expect(JSON.stringify(errResult)).not.toContain('postgres://');
     expect(JSON.stringify(errResult)).not.toContain('secret-pass');
     expect('store' in (fx.bridge as unknown as Record<string, unknown>)).toBe(false);
+  });
+});
+
+describe('Issue #11 企微按档位授权与软岗位路由', () => {
+  const marketingQuery = '帮我写一条朋友圈文案';
+  const reviewQuery = '请给我一些门店经营复盘建议';
+  const reviewDenied = {
+    kind: 'failed',
+    replies: [
+      'Front Claw：店长经营复盘仅对本店店长或老板开放，你当前没有这项权限。没有读取或写入任何账目。',
+    ],
+  };
+  const modelClassify = async () => ({
+    intent: 'marketing',
+    object: null,
+    action: null,
+    slots: {},
+    confidence: 0.99,
+    uncertain: false,
+  });
+
+  it('注入的 PG 存储缺少可锁定身份的事务时，仅按已有策略鉴权', async () => {
+    const fx = await createBridgeFixture({ driver: 'postgres' });
+    cleanups.push(() => fx.bridge.close());
+    expect((await fx.send('m-lin', marketingQuery)).kind).toBe('failed');
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toMatchObject({ allowed: true, policyVersion: 1 });
+    expect(await fx.store.getPersonByMember('m-lin')).toMatchObject({ roles: [] });
+    expect(await fx.store.getConfig(ACCESS_POLICY_HIGH_WATER_KEY)).toBe('1');
+  });
+
+  it('默认开通遇到暂时写入故障时，已授权的本人进度仍由店务处理', async () => {
+    const fx = await createBridgeFixture();
+    cleanups.push(() => fx.bridge.close());
+    vi.spyOn(fx.store, 'updateConfigLocked').mockRejectedValueOnce(new Error('grant-lock-unavailable'));
+    expect(await fx.send('m-lin', '我的进度')).toMatchObject({
+      kind: 'handled',
+      replies: [expect.stringContaining('已做')],
+    });
+    expect(await fx.store.getConfig(ACCESS_POLICY_HIGH_WATER_KEY)).toBe('1');
+  });
+
+  it.each([
+    [
+      'employee',
+      ['report_self', 'progress_self', 'correct_own', 'appointment_submit'],
+    ],
+    [
+      'manager',
+      [
+        'report_self',
+        'report_proxy',
+        'progress_self',
+        'progress_other',
+        'store_summary',
+        'unreported',
+        'target_set',
+        'correct_own',
+        'correct_store',
+        'appointment_submit',
+        'appointment_receive',
+      ],
+    ],
+  ] as const)(
+    '默认补齐 %s 四层策略和员工角色，仅推进一次版本',
+    async (tier, regular) => {
+      const policy = cleanPolicy(1);
+      policy.enterprise = ['report_self'];
+      policy.stores['s-a'] = ['report_self'];
+      policy.roles[tier] = ['report_self'];
+      policy.members['p-wang'] = {
+        role: tier,
+        storeIds: ['s-a'],
+        status: 'active',
+      };
+      const fx = await createBridgeFixture({
+        initialPolicy: policy,
+        wangTier: tier,
+      });
+      cleanups.push(() => fx.bridge.close());
+      const person = (await fx.store.getPersonByMember('m-wang'))!;
+      await fx.store.savePerson({ ...person, roles: [] });
+      const outbound = {
+        corpId: CORP_A,
+        memberId: 'm-wang',
+        capability: 'training',
+      } as const;
+
+      const inboundResult = await fx.send('m-wang', marketingQuery);
+      const outboundResult = await fx.bridge.authorizeOutbound(outbound);
+      expect(inboundResult).toMatchObject({
+        kind: 'pass',
+        targetRole: 'marketing',
+      });
+      expect(outboundResult).toMatchObject({ allowed: true, policyVersion: 2 });
+      expect((await fx.store.getPersonByMember('m-wang'))?.roles).toEqual([
+        'marketing',
+      ]);
+      const saved = JSON.parse(
+        (await fx.store.getConfig(ACCESS_POLICY_KEY))!,
+      ) as AccessPolicy;
+      for (const layer of [
+        saved.enterprise,
+        saved.stores['s-a'],
+        saved.roles[tier],
+        saved.members['p-wang'].capabilities,
+      ]) {
+        expect(layer).toEqual(
+          expect.arrayContaining(['marketing', ...regular]),
+        );
+      }
+      expect(await fx.store.getConfig(ACCESS_POLICY_HIGH_WATER_KEY)).toBe('2');
+      expect(await fx.send('m-wang', marketingQuery)).toMatchObject({
+        kind: 'pass',
+      });
+      expect(await fx.store.getConfig(ACCESS_POLICY_KEY)).toBe(
+        JSON.stringify(saved),
+      );
+    },
+  );
+
+  it('仅出站也为合法 owner 补齐营销授权，并保留既有本店能力', async () => {
+    const policy = cleanPolicy(1);
+    policy.roles.owner = ['store_summary'];
+    policy.members['p-wang'] = {
+      role: 'owner',
+      storeIds: ['s-a'],
+      status: 'active',
+    };
+    const fx = await createBridgeFixture({
+      initialPolicy: policy,
+      wangTier: 'owner',
+      autoRoleGrant: '1',
+    });
+    cleanups.push(() => fx.bridge.close());
+    const person = (await fx.store.getPersonByMember('m-wang'))!;
+    await fx.store.savePerson({ ...person, roles: [] });
+    const request = {
+      corpId: CORP_A,
+      memberId: 'm-wang',
+      targetRole: 'manager_ops',
+    } as const;
+    expect(await fx.bridge.authorizeOutbound(request)).toMatchObject({
+      allowed: true,
+      policyVersion: 2,
+    });
+    expect((await fx.store.getPersonByMember('m-wang'))?.roles).toEqual([
+      'marketing',
+    ]);
+    expect(
+      await fx.bridge.authorizeOutbound({ ...request, storeId: 's-b' }),
+    ).toMatchObject({
+      allowed: false,
+      reason: 'store_out_of_scope',
+    });
+  });
+
+  it.each([
+    { label: 'revoked', status: 'revoked', caps: ['report_self'] },
+    { label: 'suspended', status: 'suspended', caps: ['report_self'] },
+    { label: '空能力列表', status: 'active', caps: [] },
+    {
+      label: '关闭自动开通',
+      status: 'active',
+      caps: ['report_self'],
+      enabled: '0',
+    },
+  ] as const)('$label 时不恢复员工角色或策略', async (testCase) => {
+    const fx = await createBridgeFixture({
+      autoRoleGrant: 'enabled' in testCase ? testCase.enabled : undefined,
+      initialPolicy: cleanPolicy(1, {
+        wangStatus: testCase.status,
+        wangCapabilities: [...testCase.caps],
+      }),
+    });
+    cleanups.push(() => fx.bridge.close());
+    const person = (await fx.store.getPersonByMember('m-wang'))!;
+    await fx.store.savePerson({ ...person, roles: [] });
+    const before = await fx.store.getConfig(ACCESS_POLICY_KEY);
+
+    expect(await fx.send('m-wang', marketingQuery)).toMatchObject({
+      kind: 'failed',
+    });
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
+    ).toMatchObject({ allowed: false });
+    expect(await fx.store.getPersonByMember('m-wang')).toMatchObject({
+      roles: [],
+    });
+    expect(await fx.store.getConfig(ACCESS_POLICY_KEY)).toBe(before);
+    expect(await fx.store.getConfig(ACCESS_POLICY_HIGH_WATER_KEY)).toBe('1');
+  });
+
+  it.each([
+    [null, null],
+    ['{bad-json', '2'],
+    [JSON.stringify(cleanPolicy(1)), '2'],
+    [JSON.stringify(cleanPolicy(1)), 'invalid'],
+  ])('策略或高水位无效时拒绝且保留原数据 %#', async (raw, highWater) => {
+    const fx = await createBridgeFixture({ initialPolicy: null });
+    cleanups.push(() => fx.bridge.close());
+    if (raw !== null)
+      await fx.store.insertConfigIfAbsent(ACCESS_POLICY_KEY, raw);
+    if (highWater !== null) {
+      await fx.store.insertConfigIfAbsent(
+        ACCESS_POLICY_HIGH_WATER_KEY,
+        highWater,
+      );
+    }
+
+    expect(await fx.send('m-lin', marketingQuery)).toMatchObject({
+      kind: 'failed',
+    });
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-lin' }),
+    ).toMatchObject({ allowed: false });
+    expect(await fx.store.getPersonByMember('m-lin')).toMatchObject({
+      roles: [],
+    });
+    expect(await fx.store.getConfig(ACCESS_POLICY_KEY)).toBe(raw);
+    expect(await fx.store.getConfig(ACCESS_POLICY_HIGH_WATER_KEY)).toBe(
+      highWater,
+    );
+  });
+
+  it('策略提交前管理员并发撤权时，保留撤销版本与原员工角色', async () => {
+    const policy = cleanPolicy(1);
+    policy.members['p-lin'].capabilities = ['report_self'];
+    const fx = await createBridgeFixture({ initialPolicy: policy });
+    cleanups.push(() => fx.bridge.close());
+    const update = fx.store.updateConfigLocked.bind(fx.store);
+    const revoked = cleanPolicy(2);
+    revoked.members['p-lin'].status = 'revoked';
+    vi.spyOn(fx.store, 'updateConfigLocked').mockImplementationOnce(
+      async (key, extraKeys, mutate) => {
+        const result = await updateAccessPolicy(fx.store, {
+          expectedVersion: 1,
+          next: revoked,
+          actor: 'admin',
+          reason: 'concurrent-revoke',
+          at: '2026-11-12T02:00:00Z',
+        });
+        expect(result.ok).toBe(true);
+        return update(key, extraKeys, mutate);
+      },
+    );
+
+    expect(
+      await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-lin' }),
+    ).toEqual({ allowed: false, reason: 'inactive' });
+    expect(await fx.store.getConfig(ACCESS_POLICY_KEY)).toBe(
+      JSON.stringify(revoked),
+    );
+    expect(await fx.store.getPersonByMember('m-lin')).toMatchObject({
+      roles: [],
+    });
+  });
+
+  it('区分培训、店长复盘、接待投流及默认营销', () => {
+    expect(classifyWeComSoftRole('家访五步法怎么带教')).toBe('training');
+    expect(classifyWeComSoftRole('请给我日报建议和经营诊断')).toBe(
+      'manager_ops',
+    );
+    expect(classifyWeComSoftRole('怎么处理客诉和嫌贵')).toBe('reception_ads');
+    expect(classifyWeComSoftRole('分析美团投流 roi')).toBe('reception_ads');
+    expect(classifyWeComSoftRole(marketingQuery)).toBe('marketing');
+  });
+
+  it('把软岗位传给两个解析器，且仅培训传入培训只读块', async () => {
+    const workspace = 'wecom:training-workspace';
+    const resolveWorkspaceJid = vi.fn(() => workspace);
+    const resolveTargetProfile = vi.fn(() => ({
+      status: 'active',
+      executionMode: 'container',
+      contextSource: 'managed',
+      hostSkillsMode: 'disabled',
+      disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
+    }));
+    const resolveTrainingContext = vi.fn(
+      async () => '【培训参考】先明确本次家访的学习目标。',
+    );
+    const fx = await createBridgeFixture({
+      bridgeOptions: {
+        modelClassify,
+        resolveWorkspaceJid,
+        resolveTargetProfile,
+        resolveTrainingContext,
+      },
+    });
+    cleanups.push(() => fx.bridge.close());
+    const query = '新人怎么用家访五步法？';
+
+    expect(await fx.send('m-wang', query)).toMatchObject({
+      kind: 'pass',
+      targetRole: 'training',
+      workspaceJid: workspace,
+      readonlyContext: '【培训参考】先明确本次家访的学习目标。',
+    });
+    expect(resolveWorkspaceJid).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        targetRole: 'training',
+      }),
+    );
+    expect(resolveTargetProfile).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        targetRole: 'training',
+        workspaceJid: workspace,
+      }),
+    );
+    expect(resolveTrainingContext).toHaveBeenCalledWith({
+      query,
+      corpId: CORP_A,
+      accountId: 'a-wang',
+      storeId: 's-a',
+      workspaceJid: workspace,
+    });
+    for (const [text, role] of [
+      [marketingQuery, 'marketing'],
+      ['怎么回复客户的嫌贵异议？', 'reception_ads'],
+    ]) {
+      const reply = await fx.send('m-wang', text);
+      expect(reply).toMatchObject({ kind: 'pass', targetRole: role });
+      expect(reply).not.toHaveProperty('readonlyContext');
+    }
+    expect(resolveTrainingContext).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['manager', 'owner'] as const)(
+    '给 %s 的复盘只返回本店已确认业绩汇总',
+    async (tier) => {
+      const policy = cleanPolicy(1);
+      policy.members['p-wang'].role = tier;
+      const fx = await createBridgeFixture({
+        initialPolicy: policy,
+        wangTier: tier,
+        bridgeOptions: { modelClassify },
+      });
+      cleanups.push(() => fx.bridge.close());
+      const otherStore = {
+        ...(await fx.store.getPersonByMember('m-wang'))!,
+        personId: 'p-other',
+        accountId: 'a-other',
+        memberId: 'm-other',
+        storeId: 's-b',
+      };
+      await fx.store.savePerson(otherStore);
+      await fx.store.insertEntries(
+        [
+          {
+            storeId: 's-a',
+            businessDay: '2026-11-12',
+            amount: 12345,
+            status: 'confirmed',
+          },
+          {
+            storeId: 's-a',
+            businessDay: '2026-11-03',
+            amount: 1055,
+            status: 'confirmed',
+          },
+          {
+            storeId: 's-a',
+            businessDay: '2026-11-13',
+            amount: 95000,
+            status: 'confirmed',
+          },
+          {
+            storeId: 's-a',
+            businessDay: '2026-10-31',
+            amount: 90000,
+            status: 'confirmed',
+          },
+          {
+            storeId: 's-a',
+            businessDay: '2026-11-12',
+            amount: 80000,
+            status: 'pending',
+          },
+          {
+            storeId: 's-a',
+            businessDay: '2026-11-12',
+            amount: 70000,
+            status: 'voided',
+          },
+          {
+            storeId: 's-b',
+            businessDay: '2026-11-12',
+            amount: 60000,
+            status: 'confirmed',
+          },
+        ].map((row, index) => ({
+          ...row,
+          status: row.status as 'confirmed' | 'pending' | 'voided',
+          entryId: `internal-entry-${index}`,
+          amountType: 'consultant',
+          customerName: '客户秘密',
+          ownerPersonId: row.storeId === 's-a' ? 'p-wang' : 'p-other',
+          ownerName: '个人业绩人名',
+          reporterPersonId: row.storeId === 's-a' ? 'p-wang' : 'p-other',
+          note: 'postgres://secret-user:secret-pass@localhost/db',
+          disputed: false,
+          createdAt: '2026-11-12T02:00:00Z',
+        })),
+      );
+      const listEntries = vi.spyOn(fx.store, 'listEntries');
+
+      const result = await fx.send('m-wang', reviewQuery);
+      expect(result).toMatchObject({ kind: 'pass', targetRole: 'manager_ops' });
+      if (result.kind !== 'pass') throw new Error('expected pass');
+      expect(result.readonlyContext).toContain('业务日：2026-11-12');
+      expect(result.readonlyContext).toContain(
+        '今日已确认业绩：123.45元（1笔）',
+      );
+      expect(result.readonlyContext).toContain(
+        '本月累计已确认业绩：134元（2笔）',
+      );
+      expect(result.readonlyContext).not.toMatch(
+        /postgres:\/\/|secret-pass|p-wang|s-a|internal-entry|客户秘密|个人业绩人名/,
+      );
+      expect(listEntries).toHaveBeenCalledExactlyOnceWith({ storeId: 's-a' });
+    },
+  );
+
+  it.each(['employee', 'manager'] as const)(
+    '拒绝 %s 无本店复盘权限的入站与出站，且不查账',
+    async (tier) => {
+      const policy = cleanPolicy(1);
+      policy.members['p-wang'].role = tier;
+      policy.members['p-wang'].capabilities = ['marketing', 'report_self'];
+      const fx = await createBridgeFixture({
+        initialPolicy: policy,
+        wangTier: tier,
+        autoRoleGrant: tier === 'manager' ? '0' : undefined,
+        bridgeOptions: { modelClassify },
+      });
+      cleanups.push(() => fx.bridge.close());
+      const listEntries = vi.spyOn(fx.store, 'listEntries');
+
+      expect(await fx.send('m-wang', reviewQuery)).toEqual(reviewDenied);
+      expect(
+        await fx.bridge.authorizeOutbound({
+          corpId: CORP_A,
+          memberId: 'm-wang',
+          capability: 'manager_ops',
+        }),
+      ).toMatchObject({ allowed: false });
+      expect(listEntries).not.toHaveBeenCalled();
+    },
+  );
+
+  it('在汇总读取期间撤掉店长权限时，不放行已读取的上下文', async () => {
+    const policy = cleanPolicy(1);
+    policy.members['p-wang'].role = 'manager';
+    const fx = await createBridgeFixture({
+      initialPolicy: policy,
+      wangTier: 'manager',
+      autoRoleGrant: '0',
+      bridgeOptions: { modelClassify },
+    });
+    cleanups.push(() => fx.bridge.close());
+    vi.spyOn(fx.store, 'listEntries').mockImplementationOnce(async () => {
+      const revoked = { ...policy, version: 2 };
+      revoked.members['p-wang'].capabilities = ['marketing', 'report_self'];
+      expect(
+        (
+          await updateAccessPolicy(fx.store, {
+            expectedVersion: 1,
+            next: revoked,
+            actor: 'admin',
+            reason: 'revoke-summary',
+            at: '2026-11-12T02:00:00Z',
+          })
+        ).ok,
+      ).toBe(true);
+      return [];
+    });
+
+    expect(await fx.send('m-wang', reviewQuery)).toMatchObject({
+      kind: 'failed',
+    });
+    expect(
+      await fx.bridge.authorizeOutbound({
+        corpId: CORP_A,
+        memberId: 'm-wang',
+        targetRole: 'manager_ops',
+      }),
+    ).toMatchObject({ allowed: false, reason: 'capability_denied' });
+  });
+
+  it('目标岗位解析期间撤回营销能力时不读取经营汇总', async () => {
+    const policy = cleanPolicy(1);
+    policy.members['p-wang'].role = 'manager';
+    const fx = await createBridgeFixture({
+      initialPolicy: policy,
+      wangTier: 'manager',
+      autoRoleGrant: '0',
+      bridgeOptions: {
+        modelClassify,
+        resolveTargetProfile: async () => {
+          const next = { ...policy, version: 2 };
+          next.members['p-wang'].capabilities = ['store_summary'];
+          expect(
+            (
+              await updateAccessPolicy(fx.store, {
+                expectedVersion: 1,
+                next,
+                actor: 'admin',
+                reason: 'revoke-marketing',
+                at: '2026-11-12T02:00:00Z',
+              })
+            ).ok,
+          ).toBe(true);
+          return {
+            status: 'active',
+            executionMode: 'container',
+            contextSource: 'managed',
+            hostSkillsMode: 'disabled',
+            disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
+          };
+        },
+      },
+    });
+    cleanups.push(() => fx.bridge.close());
+    const listEntries = vi.spyOn(fx.store, 'listEntries');
+    expect(await fx.send('m-wang', reviewQuery)).toMatchObject({
+      kind: 'failed',
+    });
+    expect(listEntries).not.toHaveBeenCalled();
   });
 });

@@ -27,9 +27,15 @@ export interface WeComInboundTextEvent {
   readonly createTime?: number;
 }
 
+export type WeComSoftRole =
+  | 'marketing'
+  | 'training'
+  | 'manager_ops'
+  | 'reception_ads';
+
 /**
  * Issue #2 / #3 共享企微前置拦截三态输出（与 docs/OPENDOT-FRONT-MASTER-PLAN.md 对齐）。
- * 放行态仅携带最小脱敏员工/门店/工作区身份字段，绝不暴露 Front Claw PG store 或数据库连接串。
+ * 放行态仅携带路由身份和脱敏文本，绝不暴露 Front Claw PG store 或数据库连接串。
  */
 export type WeComPrecheckOutcome =
   | {
@@ -42,8 +48,10 @@ export type WeComPrecheckOutcome =
       readonly accountId: string;
       readonly storeId: string;
       readonly displayName: string;
+      readonly targetRole?: WeComSoftRole;
       readonly workspaceJid?: string;
       readonly expiredReminder?: string;
+      readonly readonlyContext?: string;
     };
 
 export type WeComPrecheckPort = (
@@ -54,7 +62,8 @@ export interface WeComOutboundAuthRequest {
   readonly corpId?: string;
   readonly memberId: string;
   readonly storeId?: string;
-  readonly capability?: 'marketing';
+  readonly capability?: WeComSoftRole;
+  readonly targetRole?: WeComSoftRole;
 }
 
 export type WeComOutboundAuthResult =
@@ -111,6 +120,15 @@ export interface BridgeStoreLike {
   getPersonByMember(memberId: string): Promise<BridgePerson | null>;
   listPeople(): Promise<BridgePerson[]>;
   getPerson?(personId: string): Promise<BridgePerson | null>;
+  savePerson?(person: BridgePerson): Promise<void>;
+  listEntries?(filter: { storeId: string }): Promise<
+    {
+      storeId: string;
+      businessDay: string;
+      status: string;
+      amount: number;
+    }[]
+  >;
   getConfig?(key: string): Promise<string | null>;
   insertConfigIfAbsent?(key: string, value: string): Promise<boolean | void>;
   updateConfigLocked?(
@@ -129,7 +147,19 @@ export interface BridgeOpenedStore {
   driver: 'memory' | 'postgres' | string;
   store: BridgeStoreLike;
   bindings: BridgeBindingStoreLike;
+  /** PostgreSQL adapters can opt into automatic grants using their own transaction. */
+  withGrantTransaction?: (
+    work: (transaction: BridgeGrantTransaction) => Promise<void>,
+  ) => Promise<void>;
   close(): Promise<void>;
+}
+
+export interface BridgeGrantTransaction {
+  /** Both stores use the same transaction and roll back if work throws. */
+  readonly store: BridgeStoreLike;
+  readonly bindings: BridgeBindingStoreLike;
+  /** Called after locking the policy and lease, in the same transaction. */
+  lockIdentity(personId: string, binding: Readonly<BridgeWecomBotBinding>): Promise<void>;
 }
 
 export interface OpenDotClassifierRuntimeConfig {
@@ -166,12 +196,16 @@ export interface AgentProfileGuardrailResult {
   readonly reason?: string;
 }
 
-export interface TargetProfileLookupContext {
+export interface WeComWorkspaceLookupContext {
   readonly corpId: string;
   readonly accountId: string;
   readonly memberId: string;
   readonly storeId: string;
   readonly displayName: string;
+  readonly targetRole?: WeComSoftRole;
+}
+
+export interface TargetProfileLookupContext extends WeComWorkspaceLookupContext {
   readonly tier: 'employee' | 'manager' | 'owner';
   readonly workspaceJid?: string;
 }
@@ -234,8 +268,15 @@ export interface WeComFrontClawBridgeOptions {
   readonly open?: () => Promise<BridgeOpenedStore>;
   /** 放行前解析目标工作区 JID。 */
   readonly resolveWorkspaceJid?: (
-    ctx: Omit<TargetProfileLookupContext, 'workspaceJid' | 'tier'>,
+    ctx: WeComWorkspaceLookupContext,
   ) => Promise<string | undefined> | string | undefined;
+  readonly resolveTrainingContext?: (params: {
+    readonly query: string;
+    readonly corpId: string;
+    readonly accountId: string;
+    readonly storeId: string;
+    readonly workspaceJid?: string;
+  }) => Promise<string | undefined> | string | undefined;
   /**
    * 放行前校验的目标岗位 Profile（与 resolveTargetProfile 二选一）。
    * 未显式提供且未命中 OpenDot 本地 DB 工作区 Profile 时保持安全默认，一旦提供则按 fail-closed 校检。
@@ -302,6 +343,9 @@ export const BRIDGE_EXECUTION_FAILED_REPLY =
 export const BRIDGE_AGENT_GUARDRAIL_DENIED_REPLY =
   'Front Claw：目标岗位 Agent 未通过安全权限校验（已拦截高危工具或宿主机权限），已拒绝放行。';
 
+const MANAGER_REVIEW_DENIED_REPLY =
+  'Front Claw：店长经营复盘仅对本店店长或老板开放，你当前没有这项权限。没有读取或写入任何账目。';
+
 export const SAFE_MARKETING_DISALLOWED_TOOLS = [
   'Bash',
   'Write',
@@ -364,9 +408,35 @@ const MODEL_CLASSIFIER_SYSTEM_PROMPT = [
   '- 查本人业绩/进度：intent="query", object="progress", action="query"；查全店汇总：object="summary", action="query"；查排名：object="ranking", action="query"。',
   '- 改账：intent="amend", object="entry", action="amend"；撤回/作废：intent="withdraw", object="entry", action="cancel"。',
   '- 预约：intent="appointment", object="appointment", action="report"|"query"|"cancel"；目标：intent="target", object="target", action="report"|"query"|"amend"。',
-  '- 客套闲聊：intent="chitchat", object=null, action=null, slots={}；营销文案/非店务创作：intent="marketing", object=null, action=null, slots={}。',
+  '- 客套闲聊：intent="chitchat", object=null, action=null, slots={}。',
+  '- 营销文案、教学培训/家访带教、客服接待/异议话术、投流团购诊断、店长经营复盘建议等非账本咨询：intent="marketing", object=null, action=null, slots={}。纯查账、报数、改账、预约、设目标仍按上面的店务规则分类。',
   'confidence 为 0..1 数值，uncertain 为布尔值；若拿不准或含糊请设为 {"intent":"unknown","object":null,"action":null,"slots":{},"confidence":0,"uncertain":true}。',
 ].join('\n');
+
+export function classifyWeComSoftRole(text: string): WeComSoftRole {
+  if (
+    /培训|带教|家访|五步法|企业诊断|指导员|考核|试卷|演练|新人怎么|课程|作战地图|鱼骨图|热力图|客户盘点|信念|U字形/i.test(
+      text,
+    )
+  ) {
+    return 'training';
+  }
+  if (
+    /复盘|经营诊断|经营分析|门店诊断|日报建议|周报建议|旬总结建议|怎么提升业绩|业绩怎么抓|目标怎么拆|挂零怎么管/.test(
+      text,
+    )
+  ) {
+    return 'manager_ops';
+  }
+  if (
+    /接待话术|怎么接待|客诉|嫌贵|异议|怎么回复客户|退卡安抚|质检|投流|美团|大众点评|团购诊断|\bROI\b|点击率|线索转化/i.test(
+      text,
+    )
+  ) {
+    return 'reception_ads';
+  }
+  return 'marketing';
+}
 
 interface FrontClawBootModule {
   bootFrontClaw: (options: Record<string, unknown>) => Promise<FrontClawBootInstance>;
@@ -388,7 +458,10 @@ interface FrontClawUnifiedModule {
 }
 
 interface FrontClawPendingOrderModule {
-  capturePendingArrival: (store: BridgeStoreLike) => Promise<{ sequence: string }>;
+  capturePendingArrival: (store: BridgeStoreLike) => Promise<{
+    readonly sequence: string;
+    readonly hours: string | null;
+  }>;
 }
 
 interface FrontClawBindingsModule {
@@ -403,20 +476,202 @@ interface FrontClawMem0Module {
   assertMem0Off: (env?: Record<string, string | undefined>) => void;
 }
 
+interface AccessPolicySnapshot {
+  version: number;
+  enterprise: string[];
+  stores: Record<string, string[]>;
+  roles: Record<BridgePerson['tier'], string[]>;
+  members: Record<
+    string,
+    {
+      role: BridgePerson['tier'];
+      status: 'active' | 'suspended' | 'revoked';
+      storeIds: string[];
+      capabilities?: string[];
+    }
+  >;
+}
+
+type RawPolicy = { policy: string | null; highWater: string | null };
+type AccessDecision =
+  | { allowed: true; version: number; role: BridgePerson['tier'] }
+  | { allowed: false; reason: string; version?: number };
+
 interface FrontClawAccessPolicyModule {
+  ACCESS_POLICY_KEY: string;
+  ACCESS_POLICY_HIGH_WATER_KEY: string;
   CAPABILITIES: readonly string[];
   readPolicy: (store: {
     getConfig: (key: string) => Promise<string | null>;
-  }) => Promise<{ policy: string | null; highWater: string | null }>;
+  }) => Promise<RawPolicy>;
+  parseAccessPolicy: (
+    raw: string | null,
+  ) => AccessPolicySnapshot | null | 'missing';
+  updateAccessPolicy: (
+    store: Required<
+      Pick<BridgeStoreLike, 'insertConfigIfAbsent' | 'updateConfigLocked'>
+    >,
+    input: {
+      expectedVersion: number;
+      next: AccessPolicySnapshot;
+      actor: string;
+      reason: string;
+      at: string;
+    },
+  ) => Promise<{ ok: boolean }>;
   decideAccess: (
-    raw: { policy: string | null; highWater: string | null },
+    raw: RawPolicy,
     person: BridgePerson | null,
     capability: string,
     storeId: string,
     platform?: readonly string[],
-  ) =>
-    | { allowed: true; version: number; role: BridgePerson['tier'] }
-    | { allowed: false; reason: string; version?: number };
+  ) => AccessDecision;
+}
+
+const DEFAULT_TIER_CAPABILITIES: Record<
+  BridgePerson['tier'],
+  readonly string[]
+> = {
+  employee: [
+    'marketing',
+    'report_self',
+    'progress_self',
+    'correct_own',
+    'appointment_submit',
+  ],
+  manager: [
+    'marketing',
+    'report_self',
+    'report_proxy',
+    'progress_self',
+    'progress_other',
+    'store_summary',
+    'unreported',
+    'target_set',
+    'correct_own',
+    'correct_store',
+    'appointment_submit',
+    'appointment_receive',
+  ],
+  owner: ['marketing'],
+};
+
+function withCapabilities(
+  current: string[],
+  defaults: readonly string[],
+): string[] {
+  const missing = defaults.filter(
+    (capability) => !current.includes(capability),
+  );
+  return missing.length ? [...current, ...missing] : current;
+}
+
+type ConsumerFence = { key: string; owner: string; epoch: number };
+
+interface GrantStores {
+  store: BridgeStoreLike;
+  bindings: BridgeBindingStoreLike;
+}
+
+interface GrantSqlClient {
+  query<T>(sql: string, params?: readonly unknown[]): Promise<{ rows: T[] }>;
+  transaction<T>(
+    work: (query: GrantSqlClient['query']) => Promise<T>,
+  ): Promise<T>;
+}
+
+interface GrantPgPool {
+  connect(): Promise<{
+    query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }>;
+    release(): void;
+  }>;
+  end(): Promise<void>;
+}
+
+async function openGrantPgPool(
+  env: Record<string, string | undefined>,
+): Promise<GrantPgPool> {
+  const [credentials, db, pg] = await Promise.all([
+    importFrontClawSubpath<{
+      resolveBusinessDatabaseUrl: (env: Record<string, string | undefined>) => {
+        url: string;
+      };
+    }>('role-eval/credential-file.js'),
+    importFrontClawSubpath<{
+      applyDatabaseHost: (url: string, host: string | undefined) => string;
+    }>('role-eval/performance-open.js'),
+    importFrontClawSubpath<{
+      loadPgPool: () => Promise<
+        new (config: { connectionString: string; max: number }) => GrantPgPool
+      >;
+    }>('role-eval/pg-pool.js'),
+  ]);
+  const Pool = await pg.loadPgPool();
+  const { url } = credentials.resolveBusinessDatabaseUrl(env);
+  return new Pool({
+    connectionString: db.applyDatabaseHost(url, env.FRONT_CLAW_DATABASE_HOST),
+    max: 1,
+  });
+}
+
+async function grantTransaction(
+  pool: GrantPgPool,
+  apply: (transaction: BridgeGrantTransaction) => Promise<void>,
+): Promise<void> {
+  const [performance, directory, migration] = await Promise.all([
+    importFrontClawSubpath<{
+      createPostgresPerformanceStore: (
+        client: GrantSqlClient,
+      ) => BridgeStoreLike;
+    }>('role-eval/performance-postgres.js'),
+    importFrontClawSubpath<{
+      createPostgresBindingStore: (
+        client: GrantSqlClient,
+      ) => BridgeBindingStoreLike;
+    }>('role-eval/directory-store.js'),
+    importFrontClawSubpath<{ PERFORMANCE_SCHEMA: string }>(
+      'role-eval/performance-migration.js',
+    ),
+  ]);
+  const connection = await pool.connect();
+  const query: GrantSqlClient['query'] = async <Row>(
+    sql: string,
+    params?: readonly unknown[],
+  ) => {
+    const result = await connection.query(
+      sql,
+      params ? [...params] : undefined,
+    );
+    return { rows: result.rows as Row[] };
+  };
+  // The two stock stores share one transaction, including updateAccessPolicy's nested work.
+  const client: GrantSqlClient = { query, transaction: (work) => work(query) };
+  try {
+    await query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+    await query("SET LOCAL lock_timeout = '2s'");
+    const schema = migration.PERFORMANCE_SCHEMA;
+    await apply({
+      store: performance.createPostgresPerformanceStore(client),
+      bindings: directory.createPostgresBindingStore(client),
+      async lockIdentity(personId, binding) {
+        // Keep the kernel's lock order: config, personnel, then binding.
+        await query(
+          `SELECT person_id FROM ${schema}.performance_people WHERE person_id=$1 FOR UPDATE`,
+          [personId],
+        );
+        await query(
+          `SELECT bot_id FROM ${schema}.wecom_bot_bindings WHERE bot_id=$1 AND member_id=$2 FOR SHARE`,
+          [binding.botId, binding.memberId],
+        );
+      },
+    });
+    await query('COMMIT');
+  } catch (error) {
+    await query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 interface FrontClawLeaseModule {
@@ -470,6 +725,16 @@ interface FrontClawModules {
   lease: FrontClawLeaseModule;
   fencing: FrontClawFencingModule;
   notification: FrontClawNotificationModule;
+  metrics: {
+    businessDate: (now: Date, cutoff: string, timeZone: string) => string;
+  };
+  money: { formatYuan: (cents: number) => string };
+  storeHours: {
+    resolveStoreHours: (
+      raw: string | null,
+      storeId: string,
+    ) => { cutoff: string; timeZone: string } | null;
+  };
 }
 
 interface RoutedResult {
@@ -557,6 +822,9 @@ async function loadFrontClawModules(): Promise<FrontClawModules> {
         lease,
         fencing,
         notification,
+        metrics,
+        money,
+        storeHours,
       ] = await Promise.all([
         importFrontClawSubpath<FrontClawBootModule>('role-eval/front-claw-boot.js'),
         importFrontClawSubpath<FrontClawEntryModule>('role-eval/employee-entry.js'),
@@ -579,6 +847,13 @@ async function loadFrontClawModules(): Promise<FrontClawModules> {
         importFrontClawSubpath<FrontClawNotificationModule>(
           'role-eval/notification-dispatch.js',
         ),
+        importFrontClawSubpath<FrontClawModules['metrics']>(
+          'role-eval/metrics.js',
+        ),
+        importFrontClawSubpath<FrontClawModules['money']>('role-eval/money.js'),
+        importFrontClawSubpath<FrontClawModules['storeHours']>(
+          'role-eval/store-hours.js',
+        ),
       ]);
       return {
         boot,
@@ -592,6 +867,9 @@ async function loadFrontClawModules(): Promise<FrontClawModules> {
         lease,
         fencing,
         notification,
+        metrics,
+        money,
+        storeHours,
       };
     })();
   }
@@ -989,8 +1267,10 @@ export async function createWeComFrontClawBridge(
   options: WeComFrontClawBridgeOptions = {},
 ): Promise<WeComFrontClawBridge> {
   const mods = await loadFrontClawModules();
-  const env = options.env ?? process.env;
+  const env = { ...(options.env ?? process.env) };
+  const open = options.open;
   const now = options.now ?? (() => new Date());
+  const autoRoleGrant = env.FRONT_CLAW_WECOM_AUTO_ROLE_GRANT !== '0';
 
   mods.mem0.assertMem0Off(env);
   const rawCaps =
@@ -1054,6 +1334,8 @@ export async function createWeComFrontClawBridge(
   let bootRef: FrontClawBootInstance | undefined;
   let lease: ReturnType<FrontClawLeaseModule['createConsumerLease']> | undefined;
   let leaseTimer: ReturnType<typeof setInterval> | undefined;
+  let grantPool: Promise<GrantPgPool> | undefined;
+  let withGrantTransaction: BridgeOpenedStore['withGrantTransaction'];
   let closing = false;
   let closed = false;
 
@@ -1069,7 +1351,13 @@ export async function createWeComFrontClawBridge(
       ? { maintenanceIntervalMs: options.maintenanceIntervalMs }
       : {}),
     ...(platformCapabilities ? { platformCapabilities } : {}),
-    ...(options.open ? { open: options.open as () => Promise<never> } : {}),
+    ...(open ? {
+      open: async () => {
+        const opened = await open();
+        withGrantTransaction = opened.withGrantTransaction?.bind(opened);
+        return opened;
+      },
+    } : {}),
     ...(options.onEmployeeTrace ? { onEmployeeTrace: options.onEmployeeTrace } : {}),
     model: {
       complete: async () => ({ type: 'chat', text: 'Front Claw 在。' }),
@@ -1106,6 +1394,12 @@ export async function createWeComFrontClawBridge(
     },
   });
   bootRef = boot;
+  if (!open && boot.driver === 'postgres') {
+    withGrantTransaction = async (work) => {
+      grantPool ??= openGrantPgPool(env);
+      await grantTransaction(await grantPool, work);
+    };
+  }
 
   const leaseEnabled = options.lease?.enabled ?? boot.driver === 'postgres';
   if (leaseEnabled) {
@@ -1144,7 +1438,7 @@ export async function createWeComFrontClawBridge(
   }
 
   async function fenceStillHolds(
-    fence: { key: string; owner: string; epoch: number } | undefined,
+    fence: ConsumerFence | undefined,
   ): Promise<boolean> {
     if (!lease) return true;
     if (!fence || !lease.held() || lease.fence()?.epoch !== fence.epoch) {
@@ -1169,15 +1463,285 @@ export async function createWeComFrontClawBridge(
     readonly person: Readonly<BridgePerson>;
   }
 
+  const readPolicy = (): Promise<RawPolicy> =>
+    mods.accessPolicy.readPolicy({
+      getConfig: (key) => boot.store.getConfig!(key),
+    });
+
+  function decideManagerReview(
+    raw: RawPolicy,
+    person: BridgePerson,
+    storeId: string,
+  ): AccessDecision {
+    if (storeId !== person.storeId)
+      return { allowed: false, reason: 'store_out_of_scope' };
+    if (person.tier !== 'manager' && person.tier !== 'owner') {
+      return { allowed: false, reason: 'capability_denied' };
+    }
+    return mods.accessPolicy.decideAccess(
+      raw,
+      person,
+      'store_summary',
+      storeId,
+      platformCapabilities,
+    );
+  }
+
+  function canUseMarketing(raw: RawPolicy, person: BridgePerson): boolean {
+    return (
+      person.roles.includes('marketing') &&
+      mods.accessPolicy.decideAccess(
+        raw,
+        person,
+        'marketing',
+        person.storeId,
+        platformCapabilities,
+      ).allowed
+    );
+  }
+
+  function planDefaultGrant(
+    raw: RawPolicy,
+    person: BridgePerson,
+  ): { next?: AccessPolicySnapshot; addRole: boolean } | undefined {
+    const { accessPolicy } = mods;
+    const { personId, storeId, tier } = person;
+    const verdict = accessPolicy.decideAccess(
+      raw,
+      person,
+      'marketing',
+      storeId,
+    );
+    if (!verdict.allowed && verdict.reason !== 'capability_denied')
+      return undefined;
+    const policy = accessPolicy.parseAccessPolicy(raw.policy);
+    if (
+      !policy ||
+      policy === 'missing' ||
+      !Object.hasOwn(policy.members, personId)
+    )
+      return undefined;
+    const grant = policy.members[personId]!;
+    if (grant.status !== 'active' || grant.capabilities?.length === 0)
+      return undefined;
+
+    const defaults = DEFAULT_TIER_CAPABILITIES[tier];
+    const storeCaps = Object.hasOwn(policy.stores, storeId)
+      ? policy.stores[storeId]!
+      : [];
+    const enterprise = withCapabilities(policy.enterprise, defaults);
+    const storeDefaults = withCapabilities(storeCaps, defaults);
+    const tierDefaults = withCapabilities(policy.roles[tier], defaults);
+    const memberCaps = grant.capabilities ?? [];
+    let memberDefaults = withCapabilities(memberCaps, defaults);
+    if (
+      memberDefaults !== memberCaps &&
+      tier !== 'owner' &&
+      memberCaps.every((cap) => cap === 'marketing')
+    ) {
+      // Preserve regular permissions inherited through an omitted or opt-in-only list.
+      memberDefaults = withCapabilities(
+        memberDefaults,
+        accessPolicy.CAPABILITIES.filter(
+          (cap) => accessPolicy.decideAccess(raw, person, cap, storeId).allowed,
+        ),
+      );
+    }
+    const addRole = !person.roles.includes('marketing');
+    if (
+      enterprise === policy.enterprise &&
+      storeDefaults === storeCaps &&
+      tierDefaults === policy.roles[tier] &&
+      memberDefaults === memberCaps
+    ) {
+      return addRole ? { addRole } : undefined;
+    }
+    return {
+      addRole,
+      next: {
+        version: policy.version + 1,
+        enterprise,
+        stores: { ...policy.stores, [storeId]: storeDefaults },
+        roles: { ...policy.roles, [tier]: tierDefaults },
+        members: {
+          ...policy.members,
+          [personId]: { ...grant, capabilities: memberDefaults },
+        },
+      },
+    };
+  }
+
+  const policyFromLocked = (
+    locked: Record<string, string | null>,
+  ): RawPolicy => ({
+    policy: locked[mods.accessPolicy.ACCESS_POLICY_KEY] ?? null,
+    highWater: locked[mods.accessPolicy.ACCESS_POLICY_HIGH_WATER_KEY] ?? null,
+  });
+
+  const samePolicy = (a: RawPolicy, b: RawPolicy): boolean =>
+    a.policy === b.policy && a.highWater === b.highWater;
+
+  function grantFenceHolds(
+    locked: Record<string, string | null>,
+    fence?: ConsumerFence,
+  ): boolean {
+    return (
+      !closing &&
+      !closed &&
+      (!lease ||
+        (!!fence &&
+          isLeaseHeld() &&
+          mods.fencing.fenceHolds(
+            mods.fencing.parseLeaseRecord(locked[fence.key] ?? null),
+            fence,
+            now().getTime(),
+          )))
+    );
+  }
+
+  function updateDefaultPolicy(
+    store: BridgeStoreLike,
+    raw: RawPolicy,
+    next: AccessPolicySnapshot,
+    personId: string,
+    fence?: ConsumerFence,
+  ): Promise<{ ok: boolean }> {
+    return mods.accessPolicy.updateAccessPolicy(
+      {
+        // A validated policy already has a high-water row. Never create it here.
+        insertConfigIfAbsent: async () => false,
+        updateConfigLocked: (key, extraKeys, mutate) =>
+          store.updateConfigLocked!(
+            key,
+            fence ? [...extraKeys, fence.key] : extraKeys,
+            (locked) =>
+              samePolicy(raw, policyFromLocked(locked)) &&
+              grantFenceHolds(locked, fence)
+                ? mutate(locked)
+                : null,
+          ),
+      },
+      {
+        expectedVersion: next.version - 1,
+        next,
+        actor: personId,
+        reason: 'wecom-binding-auto-role-grant',
+        at: now().toISOString(),
+      },
+    );
+  }
+
+  const saveMarketingRole = (store: BridgeStoreLike, person: BridgePerson) =>
+    store.savePerson!({
+      ...person,
+      roles: [...new Set([...person.roles, 'marketing'])],
+    });
+
+  async function provisionDefaultGrant(
+    identity: VerifiedIdentity,
+    refreshPerson: (source?: GrantStores) => Promise<BridgePerson | undefined>,
+    fence: ConsumerFence | undefined,
+  ): Promise<void> {
+    const { binding, person } = identity;
+    const store = boot.store;
+    if (
+      !autoRoleGrant ||
+      !store.getConfig ||
+      !store.savePerson ||
+      !store.updateConfigLocked
+    )
+      return;
+    const raw = await readPolicy();
+    if (!planDefaultGrant(raw, person)) return;
+
+    if (withGrantTransaction) {
+      await withGrantTransaction(async (db) => {
+        const { ACCESS_POLICY_KEY, ACCESS_POLICY_HIGH_WATER_KEY } =
+          mods.accessPolicy;
+        const keys = fence
+          ? [ACCESS_POLICY_KEY, fence.key]
+          : [ACCESS_POLICY_KEY];
+        let locked: Record<string, string | null> = {};
+        await db.store.updateConfigLocked!(
+          ACCESS_POLICY_HIGH_WATER_KEY,
+          keys,
+          (snapshot) => {
+            locked = snapshot;
+            return null;
+          },
+        );
+        if (!grantFenceHolds(locked, fence)) return;
+
+        await db.lockIdentity(person.personId, binding);
+        const current = await refreshPerson(db);
+        if (!current || !grantFenceHolds(locked, fence)) return;
+        const raw = policyFromLocked(locked);
+        const plan = planDefaultGrant(raw, current);
+        if (!plan) return;
+        if (
+          plan.next &&
+          !(
+            await updateDefaultPolicy(
+              db.store,
+              raw,
+              plan.next,
+              current.personId,
+              fence,
+            )
+          ).ok
+        ) {
+          throw new Error('role_grant_conflict');
+        }
+        if (plan.addRole) await saveMarketingRole(db.store, current);
+        if (!grantFenceHolds(locked, fence))
+          throw new Error('role_grant_fenced');
+      });
+      return;
+    }
+
+    // Durable adapters must offer an atomic role/policy transaction.
+    if (boot.driver !== 'memory') return;
+    // The in-memory adapter uses the versioned API and re-reads after a lost CAS.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const current = await refreshPerson();
+      if (!current || !(await fenceStillHolds(fence))) return;
+      const raw = await readPolicy();
+      const plan = planDefaultGrant(raw, current);
+      if (!plan) return;
+      if (plan.next) {
+        const saved = await updateDefaultPolicy(
+          store,
+          raw,
+          plan.next,
+          current.personId,
+          fence,
+        );
+        if (saved.ok && !plan.addRole) return;
+        continue;
+      }
+      if (closing || closed || !(await fenceStillHolds(fence))) return;
+      await saveMarketingRole(store, current);
+      return;
+    }
+  }
+
   async function bindingFor(
-    event: Readonly<WeComInboundTextEvent>,
+    event: {
+      readonly botId?: string;
+      readonly corpId?: string;
+      readonly memberId: string;
+    },
+    source: GrantStores = boot,
   ): Promise<{ identity: VerifiedIdentity } | { reason: BindingDenial }> {
-    if (!nonEmpty(event.botId) || !nonEmpty(event.memberId)) {
+    if (
+      (event.botId !== undefined && !nonEmpty(event.botId)) ||
+      !nonEmpty(event.memberId)
+    ) {
       return { reason: 'no_binding' };
     }
     let rows: BridgeWecomBotBinding[];
     try {
-      rows = structuredClone(await boot.bindings.listBindings());
+      rows = structuredClone(await source.bindings.listBindings());
     } catch {
       return { reason: 'invalid_directory' };
     }
@@ -1186,7 +1750,9 @@ export async function createWeComFrontClawBridge(
     }
 
     const memberRows = rows.filter(
-      (row) => row.botId === event.botId && row.memberId === event.memberId,
+      (row) =>
+        row.memberId === event.memberId &&
+        (event.botId === undefined || row.botId === event.botId),
     );
     if (memberRows.length === 0) return { reason: 'no_binding' };
 
@@ -1202,7 +1768,11 @@ export async function createWeComFrontClawBridge(
     let binding: Readonly<BridgeWecomBotBinding>;
     if (event.corpId !== undefined) {
       if (!nonEmpty(event.corpId)) return { reason: 'mismatch' };
-      const corpMatches = snapshots.filter((row) => row.corpId === event.corpId);
+      const corpMatches = snapshots.filter(
+        (row) =>
+          row.corpId === event.corpId &&
+          (event.botId !== undefined || row.active),
+      );
       if (corpMatches.length === 0) return { reason: 'mismatch' };
       if (corpMatches.length !== 1) return { reason: 'ambiguous' };
       binding = corpMatches[0]!;
@@ -1220,14 +1790,16 @@ export async function createWeComFrontClawBridge(
     let person: BridgePerson | null;
     let people: BridgePerson[];
     try {
-      person = structuredClone(await boot.store.getPersonByMember(event.memberId));
-      people = structuredClone(await boot.store.listPeople());
+      person = structuredClone(
+        await source.store.getPersonByMember(event.memberId),
+      );
+      people = structuredClone(await source.store.listPeople());
     } catch {
       return { reason: 'invalid_directory' };
     }
 
     if (!person) return { reason: 'mismatch' };
-    if (!person.active) return { reason: 'inactive' };
+    if (person.active !== true) return { reason: 'inactive' };
     if (
       person.memberId !== binding.memberId ||
       person.accountId !== binding.accountId
@@ -1258,7 +1830,7 @@ export async function createWeComFrontClawBridge(
 
     const current = people.find((p) => p.personId === person!.personId);
     if (
-      !current?.active ||
+      current?.active !== true ||
       current.memberId !== binding.memberId ||
       current.accountId !== binding.accountId ||
       !nonEmpty(current.displayName) ||
@@ -1272,16 +1844,77 @@ export async function createWeComFrontClawBridge(
     return {
       identity: {
         binding,
-        person: Object.freeze(person),
+        person: Object.freeze(current),
       },
     };
   }
 
+  async function refreshBoundPerson(
+    identity: VerifiedIdentity,
+    source: GrantStores = boot,
+    outboundScope?: Pick<WeComOutboundAuthRequest, 'corpId' | 'memberId'>,
+  ): Promise<BridgePerson | undefined> {
+    if (closing || closed || !isLeaseHeld()) return undefined;
+    const { binding, person } = identity;
+    const latest = await bindingFor(outboundScope ?? binding, source);
+    if (
+      !('identity' in latest) ||
+      !mods.bindings.sameBinding(binding, latest.identity.binding)
+    ) {
+      return undefined;
+    }
+    const current = latest.identity.person;
+    return current.personId === person.personId &&
+      current.storeId === person.storeId &&
+      current.tier === person.tier
+      ? current
+      : undefined;
+  }
+
   const employeeQueues = new Map<string, Promise<void>>();
+
+  async function readManagerSnapshot(
+    actor: BridgePerson,
+    rawHours: string | null,
+  ): Promise<string> {
+    const hours = mods.storeHours.resolveStoreHours(rawHours, actor.storeId);
+    if (!hours || !boot.store.listEntries)
+      throw new Error('store_snapshot_unavailable');
+    const today = mods.metrics.businessDate(
+      now(),
+      hours.cutoff,
+      hours.timeZone,
+    );
+    const month = today.slice(0, 7);
+    const rows = await boot.store.listEntries({ storeId: actor.storeId });
+    let todayAmount = 0;
+    let todayCount = 0;
+    let monthAmount = 0;
+    let monthCount = 0;
+    for (const row of rows) {
+      if (row.storeId !== actor.storeId || row.status !== 'confirmed') continue;
+      if (row.businessDay.slice(0, 7) !== month || row.businessDay > today)
+        continue;
+      monthAmount += row.amount;
+      monthCount += 1;
+      if (row.businessDay === today) {
+        todayAmount += row.amount;
+        todayCount += 1;
+      }
+    }
+    return [
+      '【本店只读经营快照（供复盘参考，严禁声称可改账）】',
+      `业务日：${today}`,
+      `今日已确认业绩：${mods.money.formatYuan(todayAmount)}元（${todayCount}笔）`,
+      `本月累计已确认业绩：${mods.money.formatYuan(monthAmount)}元（${monthCount}笔）`,
+    ].join('\n');
+  }
 
   async function processInbound(
     event: Readonly<WeComInboundTextEvent>,
-    pendingArrival: Promise<{ sequence: string }>,
+    pendingArrival: ReturnType<
+      FrontClawPendingOrderModule['capturePendingArrival']
+    >,
   ): Promise<WeComPrecheckOutcome> {
     if (closing || closed || !isLeaseHeld()) {
       return {
@@ -1291,14 +1924,16 @@ export async function createWeComFrontClawBridge(
     }
 
     const activeFence = lease?.fence() ?? undefined;
-    if (activeFence && !(await fenceStillHolds(activeFence))) {
+    if (!(await fenceStillHolds(activeFence))) {
       return {
         kind: 'failed',
         replies: [mods.loop.STALE_CONSUMER || BRIDGE_STALE_CONSUMER_REPLY],
       };
     }
 
-    const resolved = await bindingFor(event);
+    const resolved = nonEmpty(event.botId)
+      ? await bindingFor(event)
+      : { reason: 'no_binding' };
     if (!('identity' in resolved)) {
       return {
         kind: 'failed',
@@ -1311,6 +1946,16 @@ export async function createWeComFrontClawBridge(
     }
 
     const { binding, person } = resolved.identity;
+    const refreshPerson = (source?: GrantStores) =>
+      refreshBoundPerson(resolved.identity, source);
+    try {
+      await provisionDefaultGrant(resolved.identity, refreshPerson, activeFence);
+    } catch {
+      logger.warn('Front Claw automatic role grant failed');
+    }
+    if (closing || closed || !(await fenceStillHolds(activeFence))) {
+      return { kind: 'failed', replies: [mods.loop.STALE_CONSUMER] };
+    }
     const validateBinding = async (): Promise<boolean> => {
       if (closing || closed || !isLeaseHeld()) return false;
       const latest = await bindingFor(event);
@@ -1350,7 +1995,7 @@ export async function createWeComFrontClawBridge(
       ...(activeFence ? { fence: { ...activeFence } } : {}),
     });
 
-    if (activeFence && !(await fenceStillHolds(activeFence))) {
+    if (!(await fenceStillHolds(activeFence))) {
       return {
         kind: 'failed',
         replies: [mods.loop.STALE_CONSUMER || BRIDGE_STALE_CONSUMER_REPLY],
@@ -1378,34 +2023,37 @@ export async function createWeComFrontClawBridge(
     }
 
     if (result.pass === true) {
-      if (!(await validateBinding())) {
+      const actor = await refreshPerson();
+      if (!actor) {
         return {
           kind: 'failed',
           replies: [mods.unified.UNBOUND || BRIDGE_UNBOUND_REPLY],
         };
       }
-      const actor = result.actor ?? person;
-      if (!nonEmpty(actor.displayName) || !nonEmpty(actor.storeName) || !nonEmpty(actor.storeId)) {
+      const targetRole = classifyWeComSoftRole(event.text);
+      const canReview = async (candidate: BridgePerson): Promise<boolean> =>
+        candidate.tier !== 'employee' &&
+        decideManagerReview(await readPolicy(), candidate, candidate.storeId)
+          .allowed;
+      if (targetRole === 'manager_ops' && !(await canReview(actor))) {
         return {
           kind: 'failed',
-          replies: [BRIDGE_INCOMPLETE_PROFILE_REPLY],
+          replies: [MANAGER_REVIEW_DENIED_REPLY],
         };
       }
 
-      const workspaceJid = await options.resolveWorkspaceJid?.({
+      const lookupCtx: WeComWorkspaceLookupContext = {
         corpId: binding.corpId,
         accountId: actor.accountId,
         memberId: event.memberId,
         storeId: actor.storeId,
         displayName: actor.displayName,
-      });
+        targetRole,
+      };
+      const workspaceJid = await options.resolveWorkspaceJid?.(lookupCtx);
 
       const profileCtx: TargetProfileLookupContext = {
-        corpId: binding.corpId,
-        accountId: actor.accountId,
-        memberId: event.memberId,
-        storeId: actor.storeId,
-        displayName: actor.displayName,
+        ...lookupCtx,
         tier: actor.tier,
         ...(workspaceJid ? { workspaceJid } : {}),
       };
@@ -1450,13 +2098,70 @@ export async function createWeComFrontClawBridge(
         }
       }
 
+      let readonlyContext: string | undefined;
+      if (
+        targetRole === 'manager_ops' ||
+        (targetRole === 'training' && options.resolveTrainingContext)
+      ) {
+        const current = await refreshPerson();
+        const raw = await readPolicy();
+        if (!current || !canUseMarketing(raw, current)) {
+          return {
+            kind: 'failed',
+            replies: [mods.entry.MARKETING_UNAVAILABLE],
+          };
+        }
+        if (
+          targetRole === 'manager_ops' &&
+          !decideManagerReview(raw, current, current.storeId).allowed
+        ) {
+          return { kind: 'failed', replies: [MANAGER_REVIEW_DENIED_REPLY] };
+        }
+        if (!(await fenceStillHolds(activeFence))) {
+          return { kind: 'failed', replies: [mods.loop.STALE_CONSUMER] };
+        }
+        if (targetRole === 'manager_ops') {
+          readonlyContext = await readManagerSnapshot(
+            current,
+            (await pendingArrival).hours,
+          );
+        } else {
+          const context = await options.resolveTrainingContext?.({
+            query: event.text,
+            corpId: binding.corpId,
+            accountId: actor.accountId,
+            storeId: actor.storeId,
+            ...(workspaceJid ? { workspaceJid } : {}),
+          });
+          if (nonEmpty(context) && !/postgres(?:ql)?:\/\//i.test(context)) {
+            readonlyContext = context;
+          }
+        }
+      }
+
+      const latest = await refreshPerson();
+      const raw = await readPolicy();
+      if (
+        !latest ||
+        !canUseMarketing(raw, latest) ||
+        (targetRole === 'manager_ops' &&
+          !decideManagerReview(raw, latest, latest.storeId).allowed)
+      ) {
+        return { kind: 'failed', replies: [mods.entry.MARKETING_UNAVAILABLE] };
+      }
+      if (!(await fenceStillHolds(activeFence)) || closing || closed) {
+        return { kind: 'failed', replies: [mods.loop.STALE_CONSUMER] };
+      }
+
       return {
         kind: 'pass',
         corpId: binding.corpId,
         accountId: actor.accountId,
         storeId: actor.storeId,
         displayName: actor.displayName,
+        targetRole,
         ...(workspaceJid ? { workspaceJid } : {}),
+        ...(readonlyContext ? { readonlyContext } : {}),
         ...(result.expiredReminder
           ? { expiredReminder: result.expiredReminder }
           : {}),
@@ -1498,8 +2203,8 @@ export async function createWeComFrontClawBridge(
         try {
           const outcome = await processInbound(frozenEvent, pendingArrival);
           resolveOutcome(outcome);
-        } catch (err) {
-          logger.warn({ err }, 'Front Claw bridge precheck failed unexpectedly');
+        } catch {
+          logger.warn('Front Claw bridge precheck failed unexpectedly');
           resolveOutcome({
             kind: 'failed',
             replies: [BRIDGE_EXECUTION_FAILED_REPLY],
@@ -1528,7 +2233,7 @@ export async function createWeComFrontClawBridge(
         return { allowed: false, reason: 'lease_not_held' };
       }
       const activeFence = lease?.fence() ?? undefined;
-      if (activeFence && !(await fenceStillHolds(activeFence))) {
+      if (!(await fenceStillHolds(activeFence))) {
         return { allowed: false, reason: 'lease_not_held' };
       }
 
@@ -1541,8 +2246,16 @@ export async function createWeComFrontClawBridge(
       if (req.storeId !== undefined && !nonEmpty(req.storeId)) {
         return { allowed: false, reason: 'store_mismatch' };
       }
-      const capability = req.capability ?? 'marketing';
-      if (capability !== 'marketing') {
+      const targetRole = req.targetRole ?? req.capability ?? 'marketing';
+      if (
+        (targetRole !== 'marketing' &&
+          targetRole !== 'training' &&
+          targetRole !== 'manager_ops' &&
+          targetRole !== 'reception_ads') ||
+        (req.capability !== undefined &&
+          req.capability !== 'marketing' &&
+          req.capability !== targetRole)
+      ) {
         return { allowed: false, reason: 'unsupported_capability' };
       }
 
@@ -1626,7 +2339,8 @@ export async function createWeComFrontClawBridge(
       }
 
       if (!person) return { allowed: false, reason: 'person_not_found' };
-      if (!person.active) return { allowed: false, reason: 'person_inactive' };
+      if (person.active !== true)
+        return { allowed: false, reason: 'person_inactive' };
       if (
         person.memberId !== binding.memberId ||
         person.accountId !== binding.accountId
@@ -1653,7 +2367,7 @@ export async function createWeComFrontClawBridge(
       }
       const current = people.find((p) => p.personId === person!.personId);
       if (
-        !current?.active ||
+        current?.active !== true ||
         current.memberId !== binding.memberId ||
         current.accountId !== binding.accountId ||
         !nonEmpty(current.displayName) ||
@@ -1667,27 +2381,44 @@ export async function createWeComFrontClawBridge(
       if (typeof boot.store.getConfig !== 'function') {
         return { allowed: false, reason: 'policy_store_unavailable' };
       }
-      const targetStoreId = req.storeId ?? person.storeId;
-      const rawPolicy = await mods.accessPolicy.readPolicy({
-        getConfig: (key) => boot.store.getConfig!(key),
-      });
+      const targetStoreId = req.storeId ?? current.storeId;
+      if (
+        targetStoreId !== current.storeId &&
+        (targetRole === 'manager_ops' || current.tier !== 'owner')
+      ) {
+        return { allowed: false, reason: 'store_out_of_scope' };
+      }
+      const identity = { binding, person: current };
+      const refreshPerson = (source?: GrantStores) =>
+        refreshBoundPerson(identity, source, req);
+      await provisionDefaultGrant(identity, refreshPerson, activeFence);
+      const actor = await refreshPerson();
+      if (!actor) return { allowed: false, reason: 'person_mismatch' };
+      const rawPolicy = await readPolicy();
       const decision = mods.accessPolicy.decideAccess(
         rawPolicy,
-        person,
-        capability,
+        actor,
+        'marketing',
         targetStoreId,
         platformCapabilities,
       );
       if (!decision.allowed) {
         return { allowed: false, reason: decision.reason };
       }
-      if (activeFence && !(await fenceStillHolds(activeFence))) {
+      if (!actor.roles.includes('marketing')) {
+        return { allowed: false, reason: 'capability_denied' };
+      }
+      if (targetRole === 'manager_ops') {
+        const review = decideManagerReview(rawPolicy, actor, targetStoreId);
+        if (!review.allowed) return { allowed: false, reason: review.reason };
+      }
+      if (!(await fenceStillHolds(activeFence)) || closing || closed) {
         return { allowed: false, reason: 'lease_not_held' };
       }
       return {
         allowed: true,
         policyVersion: decision.version,
-        personId: person.personId,
+        personId: actor.personId,
         storeId: targetStoreId,
       };
     } catch {
@@ -1719,7 +2450,11 @@ export async function createWeComFrontClawBridge(
       boot.stopNotificationDispatch();
       await Promise.allSettled([...employeeQueues.values()]);
       await lease?.release().catch(() => {});
-      await boot.close();
+      try {
+        await (await grantPool?.catch(() => undefined))?.end();
+      } finally {
+        await boot.close();
+      }
       closed = true;
     },
   };
