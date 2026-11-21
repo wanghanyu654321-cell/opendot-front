@@ -127,14 +127,22 @@ import {
   WECOM_MANAGED_WORKSPACE_FOLDER,
   WECOM_MANAGED_WORKSPACE_JID,
   WECOM_SAFE_PROFILE_NAME,
+  WECOM_SAFE_ROLE_PROFILE_NAMES,
   deliverWeComTextViaOutbox,
   deriveEmployeeWeComWorkspace,
+  deriveWeComEmployeeWorkspace,
   isWeComManagedWorkspaceFolder,
+  isWeComManagedWorkspaceJid,
   normalizeWeComObservationErrorCategory,
   normalizeWeComObservationGateReason,
   normalizeWeComObservationRoute,
   startWeComFrontClawRuntime,
 } from '../src/wecom-front-claw-runtime.js';
+import {
+  WECOM_ROLE_SKILL_IDS,
+  type WeComSoftRole,
+} from '../src/wecom-front-claw-skills.js';
+import { parseTrainingSummary } from '../packages/front-claw/src/role-eval/training-knowledge.js';
 import {
   DEFAULT_ALLOWED_TOOLS,
   isToolDisallowed,
@@ -537,6 +545,13 @@ async function createSeededMemoryWorld(now: () => Date) {
         driver: 'postgres' as const,
         store,
         bindings,
+        withGrantTransaction: async (work) => {
+          await work({
+            store,
+            bindings,
+            lockIdentity: async () => {},
+          });
+        },
         close: async () => {},
       };
     },
@@ -2462,12 +2477,12 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     await agentEntered;
 
     // Revoke marketing capability in PG M03 policy while Agent turn is in flight
-    const basePolicy = buildPolicy(1);
+    const basePolicy = buildPolicy(2);
     const revoked = await updateAccessPolicy(world.store, {
-      expectedVersion: 1,
+      expectedVersion: 2,
       next: {
         ...basePolicy,
-        version: 2,
+        version: 3,
         members: {
           ...basePolicy.members,
           'p-zhao': {
@@ -2768,6 +2783,546 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     });
     await offRuntime!.close();
     await imManagerOff.disconnectAll();
+  }, 15_000);
+
+  test('P2 Oral UX E2E: D175 确认认账 typo tolerance & tail reminder consistency, remark-whitelist direct draft, cross-store shorthand refusal, and multi-turn appointment time slot fill', async () => {
+    let nowMs = Date.UTC(2026, 10, 12, 6, 0, 0);
+    const now = () => new Date(nowMs);
+    const world = await createSeededMemoryWorld(now);
+    // Add a second store person so cross-store shorthand "二店" resolves to 测试二店
+    await world.store.savePerson({
+      personId: 'p-other-store',
+      accountId: 'a-other-store',
+      memberId: 'm-other-store',
+      displayName: '二店店长',
+      storeId: 's-a',
+      storeName: '测试二店',
+      tier: 'manager',
+      roles: ['marketing'],
+      active: true,
+    });
+
+    const offline = createOfflineWsClient();
+    const imManager = new IMConnectionManager();
+    const groupsMap: Record<string, RegisteredGroup> = {};
+    const wiring = createRuntimeWiringHarness(groupsMap);
+
+    const runtime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-oral-ux',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+      },
+      imManager,
+      ...wiring,
+      startMaintenance: false,
+      wecomConnection: { client: offline.client, leaseCheckIntervalMs: 50 },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-oral-ux', ttlMs: 5000, renewMs: 1000 },
+        modelClassify: async ({ text }) => {
+          if (text.includes('文案')) {
+            return {
+              intent: 'marketing',
+              object: null,
+              action: null,
+              slots: {},
+              confidence: 0.98,
+              uncertain: false,
+            };
+          }
+          return {
+            intent: 'unknown',
+            object: null,
+            action: null,
+            slots: {},
+            confidence: 0,
+            uncertain: true,
+          };
+        },
+      },
+    });
+    expect(runtime).not.toBeNull();
+    activeCleanups.push(async () => {
+      await runtime!.close();
+      await imManager.disconnectAll();
+    });
+
+    const replyBodyFor = async (reqId: string) => {
+      await waitUntil(() =>
+        offline.sent.some((f) => f.headers.req_id === reqId),
+      );
+      return JSON.stringify(
+        offline.sent.find((f) => f.headers.req_id === reqId)?.body ?? '',
+      );
+    };
+
+    // 1. White-listed project remark: "张姐刚做了补水项目680" -> directly creates pending draft (no "行尾备注「补水项目」需要确认")
+    offline.emitInboundText({
+      reqId: 'req-oral-remark-1',
+      msgid: 'msg-oral-remark-1',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '张姐刚做了补水项目680',
+    });
+    const remarkReply = await replyBodyFor('req-oral-remark-1');
+    expect(remarkReply).toContain('还没入账');
+    expect(remarkReply).toContain('680');
+    expect(remarkReply).not.toContain('行尾备注');
+
+    // 2. Interleave a marketing pass -> single-char "对" is blocked, non-whitelist remark reminder tail uses 「确认入账」或「全部确认」, and typo "确认认账" commits 1 entry
+    offline.emitInboundText({
+      reqId: 'req-oral-interleave-mk',
+      msgid: 'msg-oral-interleave-mk',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '帮我写一条秋冬补水朋友圈文案',
+    });
+    const zhaoMarketingWs = deriveWeComEmployeeWorkspace({
+      corpId: CORP_ID,
+      botId: BOT_ID,
+      memberId: 'm-zhao',
+      targetRole: 'marketing',
+    });
+    await waitUntil(() =>
+      db
+        .getMessagesSince(zhaoMarketingWs.jid, { timestamp: '', id: '' })
+        .some((m) => m.id === 'msg-oral-interleave-mk'),
+    );
+
+    offline.emitInboundText({
+      reqId: 'req-oral-single-dui',
+      msgid: 'msg-oral-single-dui',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '对',
+    });
+    const duiReply = await replyBodyFor('req-oral-single-dui');
+    expect(duiReply).toContain(D175_INTERLEAVED_GUIDANCE);
+    expect(duiReply).not.toContain('已入账');
+
+    // Non-whitelist remark while interleaved draft is pending -> tail reminder must NOT say "回「对」确认", must say "回「确认入账」或「全部确认」确认"
+    offline.emitInboundText({
+      reqId: 'req-oral-tail-hint',
+      msgid: 'msg-oral-tail-hint',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '李姐：2867（小赵）先记着',
+    });
+    const tailHintReply = await replyBodyFor('req-oral-tail-hint');
+    expect(tailHintReply).toContain('还在等你回「确认入账」或「全部确认」确认');
+    expect(tailHintReply).not.toContain('还在等你回「对」确认');
+
+    // Typo tolerance: "确认认账" commits the 680 draft exactly once
+    offline.emitInboundText({
+      reqId: 'req-oral-typo-confirm',
+      msgid: 'msg-oral-typo-confirm',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '确认认账',
+    });
+    const typoConfirmReply = await replyBodyFor('req-oral-typo-confirm');
+    expect(typoConfirmReply).toContain('已入账 1 笔');
+    const zhaoEntries = (await world.store.listEntries()).filter(
+      (e) => e.reporterPersonId === 'p-zhao',
+    );
+    expect(zhaoEntries).toHaveLength(1);
+    expect(zhaoEntries[0]!.amount).toBe(68000);
+
+    // 3. Cross-store shorthand refusal: "查一下二店业绩" -> refused as cross-store, never returns own store summary
+    offline.emitInboundText({
+      reqId: 'req-oral-cross-store',
+      msgid: 'msg-oral-cross-store',
+      userid: 'm-wang-yj',
+      corpid: CORP_ID,
+      content: '查一下二店业绩',
+    });
+    const crossStoreReply = await replyBodyFor('req-oral-cross-store');
+    expect(crossStoreReply).toContain('不能做——只能办本店（测试B店）的事');
+    expect(crossStoreReply).toContain('测试二店');
+
+    // 4. Multi-turn appointment time slot completion: "王姐明天下午补水预约" -> asks time -> "4点" -> creates pending draft for 16:00 -> "对" registers appointment
+    offline.emitInboundText({
+      reqId: 'req-oral-appt-ask',
+      msgid: 'msg-oral-appt-ask',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '王姐明天下午补水预约',
+    });
+    const apptAskReply = await replyBodyFor('req-oral-appt-ask');
+    expect(apptAskReply).toContain('预约要说清几点');
+
+    offline.emitInboundText({
+      reqId: 'req-oral-appt-fill',
+      msgid: 'msg-oral-appt-fill',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '4点',
+    });
+    const apptFillReply = await replyBodyFor('req-oral-appt-fill');
+    expect(apptFillReply).toContain('王姐');
+    expect(apptFillReply).toContain('16:00');
+    expect(apptFillReply).toContain('预约还没登记');
+
+    offline.emitInboundText({
+      reqId: 'req-oral-appt-confirm',
+      msgid: 'msg-oral-appt-confirm',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '对',
+    });
+    const apptConfirmReply = await replyBodyFor('req-oral-appt-confirm');
+    expect(apptConfirmReply).toContain('预约已登记');
+    expect(await world.store.listAppointments()).toHaveLength(1);
+  }, 15_000);
+
+  test('P2 Auto Role Grant & 4 Soft-Role Workspaces + 7 Bundled Skills + Readonly Context Injection E2E', async () => {
+    let nowMs = Date.UTC(2026, 10, 12, 6, 0, 0);
+    const now = () => new Date(nowMs);
+    const world = await createSeededMemoryWorld(now);
+
+    // Seed a confirmed store entry for 测试B店 so manager_ops review snapshot has real numbers
+    await world.store.insertEntries([
+      {
+        entryId: 'e2e-store-entry-1',
+        storeId: 's-b',
+        businessDay: '2026-11-12',
+        ownerPersonId: 'p-zhao',
+        ownerName: '小赵',
+        reporterPersonId: 'p-zhao',
+        customerName: '内部客户名绝不外泄',
+        amount: 158000,
+        amountType: 'consultant',
+        note: '补水护理',
+        status: 'confirmed',
+        disputed: false,
+        createdAt: '2026-11-12T03:00:00Z',
+      },
+    ]);
+
+    // Ensure m-lin starts with roles: [] and only ['report_self'] in M03 policy to verify auto-grant on first message
+    const basePolicy = buildPolicy(1);
+    const policyBeforeAutoGrant = await updateAccessPolicy(world.store, {
+      expectedVersion: 1,
+      next: {
+        ...basePolicy,
+        version: 2,
+        members: {
+          ...basePolicy.members,
+          'p-lin': {
+            role: 'employee',
+            storeIds: ['s-b'],
+            status: 'active',
+            capabilities: ['report_self'],
+          },
+        },
+      },
+      actor: 'e2e-admin',
+      reason: 'prepare-auto-grant-e2e',
+      at: now().toISOString(),
+    });
+    expect(policyBeforeAutoGrant.ok).toBe(true);
+    expect((await world.store.getPerson('p-lin'))?.roles).toEqual([]);
+
+    const offline = createOfflineWsClient();
+    const imManager = new IMConnectionManager();
+    const groupsMap: Record<string, RegisteredGroup> = {};
+    const wiring = createRuntimeWiringHarness(groupsMap);
+    const testUserSkillsDir = path.join(tmp, 'skills', 'admin-e2e-four-roles');
+
+    const runtime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'secret-p2-full',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+      },
+      imManager,
+      ...wiring,
+      userSkillsDir: testUserSkillsDir,
+      startMaintenance: false,
+      wecomConnection: { client: offline.client, leaseCheckIntervalMs: 50 },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        lease: { enabled: true, owner: 'node-p2-full', ttlMs: 5000, renewMs: 1000 },
+        modelClassify: async () => ({
+          intent: 'marketing',
+          object: null,
+          action: null,
+          slots: {},
+          confidence: 0.99,
+          uncertain: false,
+        }),
+      },
+    });
+    expect(runtime).not.toBeNull();
+    activeCleanups.push(async () => {
+      await runtime!.close();
+      await imManager.disconnectAll();
+    });
+
+    expect(runtime!.enabledRoles).toEqual([
+      'marketing',
+      'training',
+      'manager_ops',
+      'reception_ads',
+    ]);
+    expect(runtime!.roleSkillIds).toEqual(WECOM_ROLE_SKILL_IDS);
+
+    // Part A: Newly bound employee m-lin (roles=[], only report_self) is auto-granted on first message and can use soft role + progress_self
+    offline.emitInboundText({
+      reqId: 'req-autogrant-lin-1',
+      msgid: 'msg-autogrant-lin-1',
+      userid: 'm-lin',
+      corpid: CORP_ID,
+      content: '顾客嫌贵怎么接待',
+    });
+    const linReceptionWs = deriveWeComEmployeeWorkspace({
+      corpId: CORP_ID,
+      botId: BOT_ID,
+      memberId: 'm-lin',
+      storeId: 's-b',
+      targetRole: 'reception_ads',
+    });
+    await waitUntil(() =>
+      db
+        .getMessagesSince(linReceptionWs.jid, { timestamp: '', id: '' })
+        .some((m) => m.id === 'msg-autogrant-lin-1'),
+    );
+    expect((await world.store.getPerson('p-lin'))?.roles).toContain(
+      'marketing',
+    );
+
+    // Employee m-lin requesting manager_ops review is directly denied by fast path and never enters manager_ops workspace
+    offline.emitInboundText({
+      reqId: 'req-lin-mgr-denied',
+      msgid: 'msg-lin-mgr-denied',
+      userid: 'm-lin',
+      corpid: CORP_ID,
+      content: '请给我日报建议和经营诊断',
+    });
+    await waitUntil(() =>
+      offline.sent.some((f) => f.headers.req_id === 'req-lin-mgr-denied'),
+    );
+    const linDeniedReply = JSON.stringify(
+      offline.sent.find((f) => f.headers.req_id === 'req-lin-mgr-denied')?.body ??
+        '',
+    );
+    expect(linDeniedReply).toContain('店长经营复盘仅对本店店长或老板开放');
+
+    // Once revoked (status: 'revoked'), auto-grant NEVER resurrects m-lin
+    const currentPolicyAfterAuto = buildPolicy(3);
+    const revokedLin = await updateAccessPolicy(world.store, {
+      expectedVersion: 3,
+      next: {
+        ...currentPolicyAfterAuto,
+        version: 4,
+        members: {
+          ...currentPolicyAfterAuto.members,
+          'p-lin': {
+            role: 'employee',
+            storeIds: ['s-b'],
+            status: 'revoked',
+            capabilities: ['report_self'],
+          },
+        },
+      },
+      actor: 'e2e-admin',
+      reason: 'revoke-lin',
+      at: now().toISOString(),
+    });
+    expect(revokedLin.ok).toBe(true);
+    const linPerson = (await world.store.getPerson('p-lin'))!;
+    await world.store.savePerson({ ...linPerson, roles: [] });
+
+    offline.emitInboundText({
+      reqId: 'req-lin-after-revoke',
+      msgid: 'msg-lin-after-revoke',
+      userid: 'm-lin',
+      corpid: CORP_ID,
+      content: '帮我写一条朋友圈文案',
+    });
+    await waitUntil(() =>
+      offline.sent.some((f) => f.headers.req_id === 'req-lin-after-revoke'),
+    );
+    expect((await world.store.getPerson('p-lin'))?.roles).toEqual([]);
+    expect(
+      db
+        .getMessagesSince(
+          deriveWeComEmployeeWorkspace({
+            corpId: CORP_ID,
+            botId: BOT_ID,
+            memberId: 'm-lin',
+            targetRole: 'marketing',
+          }).jid,
+          { timestamp: '', id: '' },
+        )
+        .some((m) => m.id === 'msg-lin-after-revoke'),
+    ).toBe(false);
+
+    // Part B: Manager m-wang-yj routes across all 4 soft roles with isolated workspaces, 7 bundled skills, and readonlyContext injection
+    const roleTurnSpecs: ReadonlyArray<{
+      role: WeComSoftRole;
+      reqId: string;
+      msgId: string;
+      text: string;
+      expectedSkills: readonly string[];
+      expectedContextSubstrings?: readonly string[];
+    }> = [
+      {
+        role: 'marketing',
+        reqId: 'req-mgr-role-mk',
+        msgId: 'msg-mgr-role-mk',
+        text: '帮我写一条周末补水活动朋友圈文案',
+        expectedSkills: [
+          'beauty-local-content',
+          'vendor-content-strategy',
+          'vendor-copywriting',
+        ],
+      },
+      {
+        role: 'training',
+        reqId: 'req-mgr-role-tr',
+        msgId: 'msg-mgr-role-tr',
+        text: '家访五步法怎么带教新人？',
+        expectedSkills: ['beauty-training-coach'],
+        expectedContextSubstrings: [
+          '[系统受控只读参考资料（已通过 M03 权限校验，严禁声称已写库或修改账目）]',
+          '【受控培训参考】',
+          '家访五步法',
+          '[员工本轮提问]\n家访五步法怎么带教新人？',
+        ],
+      },
+      {
+        role: 'manager_ops',
+        reqId: 'req-mgr-role-ops',
+        msgId: 'msg-mgr-role-ops',
+        text: '请给我日报建议和经营诊断',
+        expectedSkills: ['beauty-manager-daily'],
+        expectedContextSubstrings: [
+          '[系统受控只读参考资料（已通过 M03 权限校验，严禁声称已写库或修改账目）]',
+          '【本店只读经营快照（供复盘参考，严禁声称可改账）】',
+          '业务日：2026-11-12',
+          '今日已确认业绩：1580元（1笔）',
+          '[员工本轮提问]\n请给我日报建议和经营诊断',
+        ],
+      },
+      {
+        role: 'reception_ads',
+        reqId: 'req-mgr-role-rc',
+        msgId: 'msg-mgr-role-rc',
+        text: '顾客嫌贵怎么接待？顺便看下美团团购诊断思路',
+        expectedSkills: ['beauty-reception', 'beauty-ads-review'],
+      },
+    ];
+
+    const derivedWorkspaces = new Map<
+      WeComSoftRole,
+      { jid: string; folder: string; role: WeComSoftRole }
+    >();
+
+    for (const spec of roleTurnSpecs) {
+      const ws = deriveWeComEmployeeWorkspace({
+        corpId: CORP_ID,
+        botId: BOT_ID,
+        memberId: 'm-wang-yj',
+        ...(spec.role !== 'marketing' ? { storeId: 's-b' } : {}),
+        targetRole: spec.role,
+      });
+      derivedWorkspaces.set(spec.role, ws);
+      expect(isWeComManagedWorkspaceJid(ws.jid)).toBe(true);
+      expect(isWeComManagedWorkspaceFolder(ws.folder)).toBe(true);
+
+      offline.emitInboundText({
+        reqId: spec.reqId,
+        msgid: spec.msgId,
+        userid: 'm-wang-yj',
+        corpid: CORP_ID,
+        content: spec.text,
+      });
+
+      await waitUntil(
+        () =>
+          db
+            .getMessagesSince(ws.jid, { timestamp: '', id: '' })
+            .some((m) => m.id === spec.msgId),
+        3000,
+        15,
+        async () =>
+          JSON.stringify({
+            role: spec.role,
+            wsJid: ws.jid,
+            sent: offline.sent.slice(-4),
+            policy: await world.store.getConfig('front-claw-access'),
+            warns: log.warn.mock.calls.slice(-3),
+          }),
+      );
+    }
+
+    // All 4 workspace JIDs and folders are distinct
+    const allRoleJids = [...derivedWorkspaces.values()].map((w) => w.jid);
+    const allRoleFolders = [...derivedWorkspaces.values()].map((w) => w.folder);
+    expect(new Set(allRoleJids).size).toBe(4);
+    expect(new Set(allRoleFolders).size).toBe(4);
+    expect(derivedWorkspaces.get('training')!.jid).toMatch(
+      /^web:wecom-front-claw:training:[a-f0-9]{16}$/,
+    );
+
+    // Issue #9 training-knowledge.ts parseTrainingSummary accepts the derived training workspaceJid
+    const sampleDoc = '# 培训教材\n\n## 家访五步法\n先了解现状。';
+    expect(
+      parseTrainingSummary(
+        sampleDoc,
+        createHash('sha256').update(sampleDoc).digest('hex'),
+        {
+          accountId: 'a-wang',
+          workspaceJid: derivedWorkspaces.get('training')!.jid,
+        },
+        'sample.md',
+      ).title,
+    ).toBe('培训教材');
+
+    for (const spec of roleTurnSpecs) {
+      const ws = derivedWorkspaces.get(spec.role)!;
+      const msgs = db.getMessagesSince(ws.jid, { timestamp: '', id: '' });
+      expect(msgs).toHaveLength(1);
+      const storedText = msgs[0]!.content;
+
+      if (spec.expectedContextSubstrings) {
+        for (const sub of spec.expectedContextSubstrings) {
+          expect(storedText).toContain(sub);
+        }
+        expect(storedText).not.toContain('内部客户名绝不外泄');
+        expect(storedText).not.toContain('postgres://');
+      } else {
+        expect(storedText).toBe(spec.text);
+      }
+
+      const profile = db.getAgentProfileForWorkspace(ws.folder, 'admin-e2e');
+      expect(profile).toBeDefined();
+      expect(profile!.name).toBe(WECOM_SAFE_ROLE_PROFILE_NAMES[spec.role]);
+      expect(profile!.is_default).toBe(false);
+      expect(profile!.runtime_policy.context.source).toBe('managed');
+      expect(profile!.runtime_policy.mcp.mode).toBe('disabled');
+      expect(profile!.runtime_policy.skills).toEqual({
+        mode: 'custom',
+        ids: [...spec.expectedSkills],
+        host: { mode: 'disabled', ids: [] },
+      });
+
+      const manifest = resolveEffectiveSkills({
+        layers: [{ source: 'managed', root: testUserSkillsDir }],
+        managedPolicy: profile!.runtime_policy.skills,
+        hostPolicy: profile!.runtime_policy.skills.host!,
+      });
+      expect(manifest.missingManagedSkillIds).toEqual([]);
+      expect(manifest.selected.map((s) => s.id).sort()).toEqual(
+        [...spec.expectedSkills].sort(),
+      );
+    }
   }, 15_000);
 });
 
