@@ -715,7 +715,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       auditTarget(named ?? actor.storeId, scope?.storeId);
       if (!scope || !await can(actor, capability, scope.storeId)) {
         auditDecision('denied');
-        if (named && otherStoreShortNames(named, actor.storeName).length) {
+        if (!scope && named && otherStoreShortNames(named, actor.storeName).length) {
           return cannot(`只能办本店（${actor.storeName}）的事，${otherStoresNamed(named, people, actor).join('、')}的报数和查询都不行（跨店不能代报，也不能查）`);
         }
         return !scope || (named && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
@@ -1180,7 +1180,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!await can(current, 'progress_self')) return ACCESS_DENIED;
         operationId = found.draftId; ledgerSettled = found.status === 'confirmed';
         tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
-        return readonly && found.status === 'pending' && pendingExpired(found.expiresAt, now()) ? DRAFT_EXPIRED_REREPORT : resultText(found);
+        return readonly && found.status === 'pending' && pendingExpired(found.expiresAt, now()) ? resultText({ ...found, status: 'void' }) : resultText(found);
       }
       // R18 / D160：确认指令保留「刚确认过」标记，其余消息清掉。
       if (!isConfirmCommand(text) && (await store.getConfig(d160Key(actor.personId, input.sessionId)))?.trim()) {
