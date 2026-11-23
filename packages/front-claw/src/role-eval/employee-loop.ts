@@ -1062,7 +1062,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const expected = expectedAsk && askRaw ? { key: newCustomerAskKey(actor.personId, input.sessionId!), value: askRaw,
         arrivedSequence: confirmationSequence(expectedAsk.platformIssuedAt ?? expectedAsk.issuedAt ?? '', input.arrivedAt, !!expectedAsk.replacedPending, (await input.pendingArrival!).sequence) } : undefined;
       const result = await writesFor(input).savePendingReport({ reporterPersonId: actor.personId, at, ...(draft ? { draft } : {}), ...(ask ? { ask } : {}), ...(expected ? { expectedAsk: expected } : {}) });
-      if (result.saved) await clearInterleaved(actor);
+      if (result.saved) {
+        if (ask) auditTarget(actor.storeId, actor.storeId);
+        await clearInterleaved(actor);
+      }
       const notices = result.drafts.flatMap(d => reportLabels(d).map(n => `上一笔「${n}」没有确认，已作废，需要的话请重新报。`));
       for (const raw of result.asks) for (const name of (JSON.parse(raw) as SavedNewCustomerAsk).names) notices.push(`上一条「${name}」没有记，需要的话请重新报。`);
       if (notices.length) abandonedPendingReminder = notices.join('\n');
@@ -1140,6 +1143,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!active()) return 'Front Claw：请求已取消或超时，未开始新写入。';
         const { compareAndSetPendingAsk } = writesFor(input);
         const consumed = await compareAndSetPendingAsk(timeAskKey, askedTimeRaw!, '', { arrivedSequence });
+        if (consumed && typeof timeAsk.storeId === 'string' && timeAsk.storeId) auditTarget(timeAsk.storeId, timeAsk.storeId);
         if (consumed && preflightReply === undefined && timeAsk.bindingVersion === input.bindingVersion
             && timeAsk.accountId === actor.accountId && timeAsk.storeId === actor.storeId) {
           clockReply = parseStandaloneAppointmentTime(text);
@@ -1850,7 +1854,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       }
       if (!gate.ok && gate.newCustomerNames) {
         // R18：回「是」时按原句与条目再过一次单闸（通行证不能跨消息保存）。
-        const askPayload = { names: gate.newCustomerNames, listed, businessDay: report.businessDay,
+        const askPayload = { storeId: actor.storeId, names: gate.newCustomerNames, listed, businessDay: report.businessDay,
           expiresAt: zonedDateTime(report.businessDay, cutoff, timeZone).toISOString(), text, gateEntries: gateEntriesFor(), source: parsedSource };
         const latestAsk = await actorFor(input.memberId);
         if (!latestAsk || !same(latestAsk) || !await enabled(latestAsk) || !active()) return DENIED;

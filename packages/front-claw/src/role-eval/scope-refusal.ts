@@ -99,10 +99,9 @@ export function labelledStoreTargets(text: string): string[] | null {
     const marked = !!label[1] || label[2]!.includes(':');
     if (!marked && /^(?:这边|这儿|最近|今天|今日|本月|的|业绩|排名|排行|经营|汇总|进度|情况|表现|有哪些|是什么|[?。!]|$)/.test(rest)) continue;
     const field = rest.split(/(?:的?(?:业绩|进度|经营|汇总|表现|情况|本月|今天|今日))|[?。!；;]/u, 1)[0]!.trim();
-    const names = field.split(/(?:、|,|和|与|或者|以及|及)(?=[^。?]*?(?:店|[A-Za-z0-9]))/u)
-      .map(name => name.trim().replace(/^(?:门店|分店)\s*:?\s*/, '').trim());
-    if (names.some(name => !/^[\p{Script=Han}\w.-]{1,120}$/u.test(name))) return null;
-    for (const name of names) targets.add(name);
+    // Conjunction characters are valid in directory names. Only an exact directory match may resolve this entire field.
+    if (!/^[\p{Script=Han}\w.-]{1,120}$/u.test(field)) return null;
+    targets.add(field);
   }
   return [...targets];
 }

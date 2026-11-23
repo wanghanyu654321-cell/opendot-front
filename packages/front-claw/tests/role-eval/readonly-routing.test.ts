@@ -277,6 +277,47 @@ it('默认宿主把每条消息的业务读写持久化，与顺序和投递元�
     outcome: 'written',
     writes: ['setConfig'],
   });
+  const consumedTime = await call(
+    'm-zhao',
+    '谢谢',
+    'audit-appointment-time-consume',
+  );
+  expect(
+    await w.base.getConfig(
+      'employee-loop:appointment-time-ask:p-zhao:audit-session',
+    ),
+  ).toBe('');
+  expect(consumedTime).toMatchObject({
+    writes: ['compareAndSetPendingAsk'],
+    targetStoreId: timeAsk.storeId,
+    outcome: 'written',
+  });
+  const reportReceipt = await call(
+    'm-zhao',
+    '张三：680（小赵）',
+    'audit-new-customer',
+  );
+  const reportKey = 'employee-loop:new-customer-ask:p-zhao:audit-session';
+  const reportAsk = JSON.parse((await w.base.getConfig(reportKey))!);
+  expect(reportAsk.storeId).toBe('s-b');
+  expect(reportReceipt).toMatchObject({
+    targetStoreId: reportAsk.storeId,
+    outcome: 'written',
+  });
+  await w.base.setConfig(
+    reportKey,
+    JSON.stringify({
+      ...reportAsk,
+      expiresAt: new Date(NOW.getTime() - 1000).toISOString(),
+    }),
+  );
+  const expired = await call('m-zhao', '谢谢', 'audit-new-customer-expire');
+  expect(await w.base.getConfig(reportKey)).toBe('');
+  expect(expired).toMatchObject({
+    targetStoreId: reportAsk.storeId,
+    writes: ['compareAndSetPendingAsk'],
+    outcome: 'written',
+  });
   await boot.close();
 });
 
@@ -650,3 +691,20 @@ it('模型遗漏槽位时按中文标签读取跨店授权目标，不读取本�
   });
   await verify(w, 'm-boss', '我想看门店：测试B店的业绩表现', 'summary');
 });
+
+it.each(['和平店', '中和店', '与邻店', '邻与里店', '及第店', '邻及里店'])(
+  '按完整中文目录名解析授权门店 %s',
+  async (name) => {
+    const w = await fixture();
+    for (const person of await w.base.listPeople()) {
+      if (person.storeId === 's-b')
+        await w.base.savePerson({ ...person, storeName: name });
+    }
+    await verify(w, 'm-boss', '我想看门店：' + name + '的业绩表现', 'summary');
+    w.reset();
+    expect(
+      await w.call('m-boss', '我想看门店：' + name + '和测试A店的业绩表现'),
+    ).toMatch(/查不到|暂不支持/);
+    expect(w.entryStores()).toEqual([]);
+  },
+);

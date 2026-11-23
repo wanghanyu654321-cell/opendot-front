@@ -1,3 +1,4 @@
+import { auditTarget } from './business-audit.js';
 import { confirmationSequence, sequenceBefore } from './pending-order.js';
 import type { Draft, EmployeeDraftContext, ReportDraftItem } from './performance-store.js';
 import type { ConsumerWrites } from './consumer-writes.js';
@@ -6,7 +7,7 @@ import { isYesNewCustomerReply } from './customer-name-policy.js';
 import { formatYuan } from './money.js';
 
 export type SavedNewCustomerAsk = {
-  names: string[]; listed: ReportDraftItem[]; businessDay: string; expiresAt?: string; issuedAt?: string; issuedSequence?: string; platformIssuedAt?: string; version?: string; replacedPending?: boolean;
+  storeId?: string; names: string[]; listed: ReportDraftItem[]; businessDay: string; expiresAt?: string; issuedAt?: string; issuedSequence?: string; platformIssuedAt?: string; version?: string; replacedPending?: boolean;
   text?: string; gateEntries?: GateEntry[]; source?: 'standard' | 'natural';
 };
 function parseAsk(raw: string): SavedNewCustomerAsk | null {
@@ -120,6 +121,7 @@ export async function advancePendingSlot(args: {
     const conditions = ask && !validAsk ? { expiredAt: now().toISOString() }
       : answeringAsk && isYesNewCustomerReply(text) ? { ...(guardArrival ? { arrivedSequence: arrival } : {}), unexpiredAt: now().toISOString() } : {};
     if (!await writes.compareAndSetPendingAsk(askKey, raw!, '', conditions)) return { drafts, expired, reminder, expiredReminder, pendingAsk: null, ask: null, blocked: true };
+    if (typeof ask?.storeId === 'string' && ask.storeId) auditTarget(ask.storeId, ask.storeId);
     if (ask && !validAsk) appendExpired(expiredNames(ask.names));
     else if (replacing && validAsk) reminder += (reminder ? '\n' : '') + askReminder(validAsk);
   }
