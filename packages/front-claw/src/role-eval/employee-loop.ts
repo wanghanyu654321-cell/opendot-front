@@ -1,3 +1,4 @@
+import { auditAuthorization, auditDecision, auditTarget } from './business-audit.js';
 import { capturePendingArrival, confirmationSequence, sequenceBefore, type PendingArrival } from './pending-order.js';
 import { pausePoint } from './pause-points.js';
 import { createHash } from 'node:crypto';
@@ -18,10 +19,10 @@ import {
 } from './appointments.js';
 import { monthKey } from './metrics.js';
 import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-handler.js';
-import { ACCESS_POLICY_KEY, authorize, authorizedStores, decideAccess, policyFrom, readPolicy, standing, type Capability } from './access-policy.js';
+import { ACCESS_POLICY_KEY, parseAccessPolicy, authorize, authorizedStores, decideAccess, policyFrom, readPolicy, standing, type Capability } from './access-policy.js';
 import { checkGateNow, commitGuard, policyVersionOf, type GateSpec, type GateTarget } from './commit-gate.js';
 import type { Fence } from './fencing.js';
-import { appointmentClause, clauseKind, compoundHead, compoundTail, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
+import { businessRead, appointmentClause, clauseKind, compoundHead, compoundTail, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
 import { consumerWrites } from './consumer-writes.js';
 import { CommitContentionRejected, FencedWriteRejected } from './performance-store.js';
 import { resolveStoreHours } from './store-hours.js';
@@ -710,8 +711,9 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const capability: Capability = summary ? 'store_summary' : 'unreported';
       const people = await store.listPeople();
       const named = (summary ?? missing)![1];
-      const scope = named ? storeByName(people, named) : storeById(people, actor.storeId);
-      if (!scope || !await can(actor, capability, scope.storeId)) return named ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
+      const scope = named ? (storeById(people, named) ?? storeByName(people, named)) : storeById(people, actor.storeId);
+      if (named) auditTarget(named, scope?.storeId);
+      if (!scope || !await can(actor, capability, scope.storeId)) return !scope || (named && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
       const reply = summary ? await storeSummary(store, scope, day) : await unreported(store, scope, day);
       return finalCheck(capability, [scope.storeId], reply);
     }
@@ -896,9 +898,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     return await draftAllowed(actor, draft) ? draft : ACCESS_DENIED;
   }
 
-  async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, memberId: string, tag: Tag): Promise<string> {
-    const object = c.object;
-    if (object === 'progress' || object === 'entry') {
+  async function selfProgress(actor: Person, memberId: string, tag: Tag): Promise<string> {
       if (!await can(actor, 'progress_self')) return ACCESS_DENIED;
       const result = await tools.myProgress(actor.accountId);
       const current = await actorFor(memberId);
@@ -906,7 +906,20 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       if (!await can(current, 'progress_self')) return ACCESS_DENIED;
       tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
       return result.reply;
+      }
+  async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, memberId: string, tag: Tag): Promise<string> {
+    const object = c.object;
+    if (c.slots.store !== undefined) {
+      if (!policyMode) return ACCESS_DENIED;
+      const people = await store.listPeople();
+      const scope = storeById(people, c.slots.store) ?? storeByName(people, c.slots.store);
+      if (!scope) return NOT_FOUND_OR_DENIED;
+      if (['performance', 'summary', 'completion', 'target'].includes(object ?? '')) {
+        return (await managementQuery(actor, '经营汇总 ' + scope.storeId, memberId, tag)) ?? NOT_FOUND_OR_DENIED;
+      }
+      if (scope.storeId !== actor.storeId || object === 'ranking') return NOT_FOUND_OR_DENIED;
     }
+    if (object === 'progress' || object === 'entry') return selfProgress(actor, memberId, tag);
     if (object === 'performance' || object === 'summary' || object === 'completion' || object === 'target') {
       if (!policyMode) return ACCESS_DENIED;
       const capability: Capability = 'store_summary';
@@ -1050,7 +1063,36 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       if (!actor) return DENIED;
       let text = input.text.trim();
       // M03 入口鉴权：策略缺失、损坏、无授权、停用或角色不符时，在任何业务读写前拒绝。
-      if (policyMode && !standing(await readPolicy(store), actor).allowed) return ACCESS_DENIED;
+      if (policyMode) {
+        const gate = standing(await readPolicy(store), actor);
+        auditAuthorization(actor, gate);
+        if (!gate.allowed) return ACCESS_DENIED;
+      }
+      const requested = businessRead(text);
+      if (requested?.kind === 'identity') {
+        const current = await actorFor(input.memberId);
+        const raw = await readPolicy(store);
+        const gate = standing(raw, current);
+        const policy = parseAccessPolicy(raw.policy);
+        if (!policyMode || !current || current.personId !== actor.personId || !gate.allowed || !policy || policy === 'missing') return ACCESS_DENIED;
+        const grant = policy.members[current.personId]!;
+        const scopes = grant.storeIds.filter(id => !!policy.stores[id] && (current.tier === 'owner' || id === current.storeId));
+        tag.access = { capability: null, storeIds: scopes };
+        return `Front Claw：当前业务身份为${{ employee: '员工', manager: '店长', owner: '老板' }[gate.role]}，获授权门店：${scopes.join('、') || '无'}。`;
+      }
+      if (requested?.kind === 'summary') {
+        if (!policyMode) return ACCESS_DENIED;
+        return (await managementQuery(actor, '经营汇总 ' + requested.store, input.memberId, tag)) ?? NOT_FOUND_OR_DENIED;
+      }
+      if (requested?.kind === 'self') {
+        auditTarget(actor.storeId, actor.storeId);
+        return selfProgress(actor, input.memberId, tag);
+      }
+      if (input.modelClassification && isReadOnlyQuery(input.modelClassification)) {
+        const chain = validateModelChain({ text, output: input.modelClassification });
+        if (!chain.ok) return askReply(chain.ask);
+        return dispatchClassifiedQuery(actor, chain.classification, input.memberId, tag);
+      }
       // D179 统一过期收尾：先生成本请求私有快照并关闭过期项，所有正常分支共用；
       // 回复只在循环出口追加。expireOnly 不消费有效追问，正常确认仍复用这一次 config 读取。
       let drafts = structuredClone(await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
@@ -1066,7 +1108,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const timeAsk = readAppointmentTimeAsk(askedTimeRaw);
       let clockReply: string | null = null;
       const arrivedSequence = (await input.pendingArrival!).sequence;
-      if (timeAsk && sequenceBefore(timeAsk.issuedSequence, arrivedSequence)) {
+      if (!requested && timeAsk && sequenceBefore(timeAsk.issuedSequence, arrivedSequence)) {
         if (!active()) return 'Front Claw：请求已取消或超时，未开始新写入。';
         const { compareAndSetPendingAsk } = writesFor(input);
         const consumed = await compareAndSetPendingAsk(timeAskKey, askedTimeRaw!, '', { arrivedSequence });
@@ -1820,6 +1862,8 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     let pendingReminder = '';
     try {
       text = await run();
+      if (text === ACCESS_DENIED || text === DENIED || text === NOT_FOUND_OR_DENIED || text === POLICY_CHANGED) auditDecision('denied');
+      else if (tag.access) auditDecision('read');
       // D182：追问未占用新挂起位时，回显原挂起项使用的确认口令。
       if (response.kind === 'ask' && !response.occupiesPending && pendingSnapshot) {
         const { actorId, drafts, ask } = pendingSnapshot;

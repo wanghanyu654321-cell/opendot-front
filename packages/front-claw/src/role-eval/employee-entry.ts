@@ -22,7 +22,7 @@ import {
   type ModelClassifier, type ModelClassification, type ModelRuntimeConfig,
 } from './model-classify.js';
 
-import { courtesyReply, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, NOT_TODAY_REPLY, otherStoreShortNames, pastDayReportPhrase, scopeRefusal } from './scope-refusal.js';
+import { businessRead, courtesyReply, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, NOT_TODAY_REPLY, otherStoreShortNames, pastDayReportPhrase, scopeRefusal } from './scope-refusal.js';
 import { stripNegatedMakeupPhrases } from './standard-line.js';
 import { textLevelImpurity } from './confirmable-draft-gate.js';
 
@@ -163,6 +163,11 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline }, { text: reply, kind });
         return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
       };
+      if (businessRead(input.text)) {
+        decision = { target: 'store', label: 'progress', intents: ['progress'] };
+        const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline });
+        return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
+      }
       const clockReply = parseStandaloneAppointmentTime(input.text);
       const clockActor = clockReply && options.accessPolicy === true ? await options.store.getPersonByMember(input.memberId) : null;
       const askedTime = clockActor && (await options.store.getConfig(appointmentTimeAskKey(clockActor, input)))?.trim();

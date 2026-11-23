@@ -170,17 +170,26 @@ describe('Issue #9 预约补时间', () => {
     expect(await base.listAppointments()).toHaveLength(1);
   });
 
-  it.each(['1', '2', '4点 680元', '我的进度', '谢谢'])('非时间答复 %s 清掉追问并按本轮消息处理', async text => {
+  it.each(['1', '2', '4点 680元', '谢谢'])('非时间答复 %s 清掉追问并按本轮消息处理', async text => {
     const { base, say } = await setup();
     await say(appointment);
     expect(await base.getConfig(timeAskKey)).toContain(appointment);
     const reply = await say(text);
-    if (text === '我的进度') expect(reply).toContain('今天 已做 900');
     if (text === '谢谢') expect(reply).toContain('不客气');
     expect(await base.getConfig(timeAskKey)).toBe('');
     await say('4点');
     expect(await base.listDrafts({ status: 'pending' })).toEqual([]);
     expect(await base.listAppointments()).toEqual([]);
+  });
+
+  it('查询本人进度保留预约追问，下一轮仍可补时间', async () => {
+    const { base, say } = await setup();
+    await say(appointment);
+    const pending = await base.getConfig(timeAskKey);
+    expect(pending).toContain(appointment);
+    expect(await say('我的进度')).toContain('今天 已做 900');
+    expect(await base.getConfig(timeAskKey)).toBe(pending);
+    expect(await say('下午4点')).toContain('16:00');
   });
 
   it('预约追问隔离会话，撤掉预约权限后不能补建草稿', async () => {

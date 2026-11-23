@@ -353,3 +353,20 @@ export function appointmentClause(text: string): string {
       && tail && !looksLikeAppointment(tail) && !/预约/.test(withoutAppointmentCoaching(flatOf(tail)))) return head;
   return text;
 }
+
+/** A complete read-only question. Discard only framing and explicit negative clauses. */
+export type BusinessRead = { kind: 'self' | 'identity' } | { kind: 'summary'; store?: string };
+export function businessRead(text: string): BusinessRead | undefined {
+  const request = text.normalize('NFKC').trim()
+    .replace(/^[A-Za-z]+-[A-Za-z]*\d+\s*:\s*/, '')
+    .replace(/^我(?:现在)?自称[^。！？!?\n]+[。！？!?]\s*/, '')
+    .replace(/^只读(?:查询|核对)\s*:?\s*/, '')
+    .replace(/[?？。;；，,]\s*不(?:报单|创建门店|改权限|扩权|预约|改账|发布)(?:[、，,]\s*不(?:报单|创建门店|改权限|扩权|预约|改账|发布))*[。.!！]?$/, '')
+    .replace(/[?？。;；]+$/, '').trim();
+  if (/^我(?:当前)?(?:实际)?(?:业务身份和)?(?:获|被)?授权门店(?:是什么|有哪些)$/.test(request)) return { kind: 'identity' };
+  if (isSelfProgressQuery(request) || /^我(?:本月|今天)?的?(?:业绩(?:进度)?|进度)(?:是多少|多少)?$/.test(request)) return { kind: 'self' };
+  const named = /^(?:虚构且未授权的门店|门店)?([\w][\w.-]*)本月(?:全店)?业绩(?:汇总)?(?:是多少|多少)?$/.exec(request);
+  const command = /^(?:经营汇总|门店汇总|本店汇总|本月汇总)\s+([^\s]+)$/.exec(request);
+  if (named || command) return { kind: 'summary', store: (named ?? command)![1]! };
+  return undefined;
+}
