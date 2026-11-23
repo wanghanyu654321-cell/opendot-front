@@ -85,9 +85,20 @@ export function isStorePerfQuery(text: string): boolean {
     || /^(?:本店|我们店)(?:今天|今日|本月)?(?:的)?(?:业绩|汇总)(?:是?(?:多少))?(?:吧|啊|呢)?$/.test(flat)
     || /^(?:经营汇总|门店汇总|本店汇总|本月汇总)(?:\s+\S+)?$/.test(flat);
 }
+export const otherProgressCommand = /^(\S{1,12}?)的(?:今天|本月)?进度$/;
+export const missingReportsCommand = /^(?:今天)?谁(?:还)?没报(?:\s+(\S+))?$/;
+export const storeRankingCommand = /^门店(?:排名|排行)$/;
+
+/** An explicit label in the source remains binding when the classifier omits the slot. */
+export function labelledStoreTargets(text: string): string[] {
+  const tokens = text.normalize('NFKC').matchAll(/(?:门店|分店)(?:编号|编码|ID)?\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_.-]*)/gi);
+  return [...new Set(Array.from(tokens, match => match[1]!))];
+}
+
 export function isManagedQueryPhrase(text: string): boolean {
   const flat = flatOf(text);
-  return /^(?:我的进度|今天进度|进度|经营汇总\S*|谁没报\S*|门店排名)$/.test(flat)
+  return missingReportsCommand.test(text.trim()) || storeRankingCommand.test(flat) || otherProgressCommand.test(flat)
+    || /^(?:我的进度|今天进度|进度|经营汇总\S*|谁没报\S*|门店排名)$/.test(flat)
     || /^(?:[\u4e00-\u9fa5]{1,8}的进度)$/.test(flat)
     || isSelfProgressQuery(text)
     || isStorePerfQuery(text);
@@ -355,7 +366,7 @@ export function appointmentClause(text: string): string {
 }
 
 /** A complete read-only question. Discard only framing and explicit negative clauses. */
-export type BusinessRead = { kind: 'self' | 'identity' } | { kind: 'summary'; store?: string };
+export type BusinessRead = { kind: 'self' | 'identity' | 'unsupported' } | { kind: 'summary'; store?: string } | { kind: 'managed'; command: string };
 export function businessRead(text: string): BusinessRead | undefined {
   const request = text.normalize('NFKC').trim()
     .replace(/^[A-Za-z]+-[A-Za-z]*\d+\s*:\s*/, '')
@@ -366,12 +377,15 @@ export function businessRead(text: string): BusinessRead | undefined {
   if (/^我(?:当前)?(?:实际)?(?:业务身份和)?(?:获|被)?授权门店(?:是什么|有哪些)$/.test(request)) return { kind: 'identity' };
   if (isSelfProgressQuery(request) || /^我(?:本月|今天)?的?(?:业绩(?:进度)?|进度)(?:是多少|多少)?$/.test(request)) return { kind: 'self' };
   const query = request.replace(/^(?:请|帮我|给我)?(?:查一下|查询|查看|核对|看看|查|看)\s*/, '');
-  const named = /^(?:(?:[\p{Script=Han}]{1,12}的)?门店\s*)?([\w.-]+|[\p{Script=Han}]{1,20}店)\s*的?\s*(?:本月|今日|今天)?(?:全店)?业绩(?:汇总)?(?:是多少|多少)?$/u.exec(query);
+  const named = /^(?:(?:[\p{Script=Han}]{1,12}的)?门店\s*)?([\w.-]+|[\p{Script=Han}]{1,20}店)\s*的?\s*(?:本月|今日|今天)?(?:全店)?(?:业绩(?:汇总)?|进度)(?:是多少|多少)?$/u.exec(query);
   const command = /^(?:经营汇总|门店汇总|本店汇总|本月汇总)(?:\s+([^\s]+))?$/.exec(request);
+  if (isStorePerfQuery(request) && !command?.[1]) return { kind: 'summary' };
   if (named) {
     const target = named[1]!;
     return /^(?:本店|全店)$/.test(target) ? { kind: 'summary' } : { kind: 'summary', store: target };
   }
+  if (otherProgressCommand.test(request) || missingReportsCommand.test(request) || storeRankingCommand.test(request)) return { kind: 'managed', command: request };
   if (command) return command[1] ? { kind: 'summary', store: command[1] } : { kind: 'summary' };
+  if (/^(?:[A-Za-z]+-[A-Za-z]*\d+[：:]\s*)?只读(?:查询|核对)/.test(text.trim())) return { kind: 'unsupported' };
   return undefined;
 }

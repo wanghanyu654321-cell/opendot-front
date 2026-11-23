@@ -242,12 +242,24 @@ it('默认宿主把每条消息的业务读写持久化，与顺序和投递元�
       );
   }
   expect(await call('m-zhao', '李姐 200', 'audit-draft')).toMatchObject({
+    targetStoreId: 's-b',
     writes: expect.arrayContaining(['saveDraft']),
     outcome: 'written',
   });
   expect(await call('m-zhao', '对', 'audit-confirm')).toMatchObject({
+    targetStoreId: 's-b',
     writes: expect.arrayContaining(['commitConfirmingDraft']),
     outcome: 'written',
+  });
+  expect(
+    await call('m-zhao', '明天下午三点张女士要来店', 'audit-booking'),
+  ).toMatchObject({
+    targetStoreId: 's-b',
+    writes: expect.arrayContaining(['saveDraft']),
+  });
+  expect(await call('m-zhao', '对', 'audit-booking-confirm')).toMatchObject({
+    targetStoreId: 's-b',
+    writes: expect.arrayContaining(['commitConfirmingAppointments']),
   });
   await boot.close();
 });
@@ -429,4 +441,139 @@ it('审计隔离同消息号不同会话，把迟到写入保留为结果未知'
     attemptedWrites: [],
     writes: [],
   });
+});
+
+it.each(['查我们店本月业绩', '查门店业绩'])(
+  '本店别称 %s 只读本店业绩',
+  async (text) => {
+    const w = await fixture();
+    await verify(w, 'm-wang-yj', text, 'summary');
+  },
+);
+
+it('模型分类缺少门店，仍以任意措辞中的显式门店标识为准', async () => {
+  const w = await worldM05({
+    router: {
+      modelClassify: async () => ({
+        intent: 'query',
+        object: 'summary',
+        action: 'query',
+        slots: {},
+        confidence: 1,
+        uncertain: false,
+      }),
+    },
+  });
+  w.reset();
+  expect(
+    await w.call('m-wang-yj', '我想看门店 batch9-nope-20301201 的业绩表现'),
+  ).toBe('Front Claw：查不到，或你没有权限查看。');
+  expect(w.entryStores()).toEqual([]);
+});
+
+it.each([
+  ['今天谁还没报', /没报|报过了/],
+  ['门店排行', /当前权限不允许/],
+  ['小赵的本月进度', /900/],
+] as const)('管理查询 %s 保留待补时间', async (text, reply) => {
+  const w = await fixture();
+  const member = 'm-wang-yj';
+  await w.call(member, '明天张女士要来店');
+  const key = 'employee-loop:appointment-time-ask:p-wang-yj:session-m-wang-yj';
+  const ask = await w.base.getConfig(key);
+  expect(ask).toBeTruthy();
+  w.reset();
+  expect(await w.call(member, text)).toMatch(reply);
+  expect(new Set(w.entryStores())).toEqual(
+    new Set(text === '门店排行' ? [] : ['s-b']),
+  );
+  expect(await w.base.getConfig(key)).toBe(ask);
+});
+
+it.each([
+  '明天下午三点不用给张女士预约',
+  '明天下午三点不要为张女士预约',
+  '明天下午三点张女士暂不安排预约',
+])('带受益人的否定 %s 不生成预约追问和草稿', async (text) => {
+  const w = await fixture();
+  await w.call('m-zhao', text);
+  expect(await w.base.listDrafts()).toEqual([]);
+  expect(await w.base.listAppointments()).toEqual([]);
+  expect(
+    await w.base.getConfig(
+      'employee-loop:appointment-time-ask:p-zhao:session-m-zhao',
+    ),
+  ).toBeNull();
+  expect(parseAppointmentRequest(text, NOW, 'Asia/Shanghai')).toBeNull();
+});
+
+it('读取本人业绩期间调店后不会回显前门店的金额', async () => {
+  const w = await fixture();
+  const person = (await w.base.getPersonByMember('m-zhao'))!;
+  const read = w.base.listEntries.bind(w.base);
+  let moved = false;
+  w.base.listEntries = async (filter) => {
+    const result = await read(filter);
+    if (!moved) {
+      moved = true;
+      await w.base.savePerson({
+        ...person,
+        storeId: 's-a',
+        storeName: '测试A店',
+      });
+      const members = membersM05();
+      members[person.personId]!.storeIds = ['s-a'];
+      const { updateAccessPolicy } =
+        await import('../../src/role-eval/access-policy.js');
+      expect(
+        (
+          await updateAccessPolicy(w.base, {
+            expectedVersion: 1,
+            next: policyM05(2, members),
+            actor: 'test-admin',
+            at: NOW.toISOString(),
+            reason: 'transfer',
+          })
+        ).ok,
+      ).toBe(true);
+    }
+    return result;
+  };
+  const reply = await w.call('m-zhao', '我的进度');
+  expect(moved).toBe(true);
+  expect(w.entryStores()).toContain('s-b');
+  expect(reply).not.toContain('900');
+});
+
+it('分类为查询的两个原文门店互有冲突时不读取任一门店', async () => {
+  const w = await worldM05({
+    router: {
+      modelClassify: async () => ({
+        intent: 'query',
+        object: 'summary',
+        action: 'query',
+        slots: { store: 's-b' },
+        confidence: 1,
+        uncertain: false,
+      }),
+    },
+  });
+  w.reset();
+  expect(
+    await w.call('m-wang-yj', '帮我看看门店 s-a 和门店 s-b 的经营情况'),
+  ).toMatch(/查不到|暂不支持/);
+  expect(w.entryStores()).toEqual([]);
+});
+it('未支持的显式只读请求保留有效预约和账本状态', async () => {
+  const w = await fixture();
+  await w.call('m-zhao', '明天张女士要来店');
+  const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+  const pending = await w.base.getConfig(key);
+  expect(pending).toBeTruthy();
+  w.reset();
+  expect(await w.call('m-zhao', '只读查询：看未来十年的库存预测')).toContain(
+    '暂不支持',
+  );
+  expect(w.entryStores()).toEqual([]);
+  expect(await w.base.getConfig(key)).toBe(pending);
 });

@@ -97,7 +97,18 @@ export function createBusinessAudit(base: PerformanceStore) {
           (name === 'setConfig' &&
             typeof args[0] === 'string' &&
             args[0].startsWith('employee-loop:'));
-        if (businessWrite) row.attemptedWrites.add(name);
+        if (businessWrite) {
+          row.attemptedWrites.add(name);
+          const entity = args[0];
+          if (
+            entity &&
+            typeof entity === 'object' &&
+            'storeId' in entity &&
+            typeof entity.storeId === 'string'
+          ) {
+            auditTarget(entity.storeId, entity.storeId);
+          }
+        }
         const result: unknown = Reflect.apply(fn, target, args);
         if (rowReads.has(name)) {
           row.readOperations.add(name);

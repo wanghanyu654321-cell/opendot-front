@@ -22,7 +22,7 @@ import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-h
 import { ACCESS_POLICY_KEY, parseAccessPolicy, authorize, authorizedStores, decideAccess, policyFrom, readPolicy, standing, type Capability } from './access-policy.js';
 import { checkGateNow, commitGuard, policyVersionOf, type GateSpec, type GateTarget } from './commit-gate.js';
 import type { Fence } from './fencing.js';
-import { businessRead, otherStoreShortNames, otherStoresNamed, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
+import { businessRead, labelledStoreTargets, otherProgressCommand, missingReportsCommand, storeRankingCommand, otherStoreShortNames, otherStoresNamed, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
 import { consumerWrites } from './consumer-writes.js';
 import { CommitContentionRejected, FencedWriteRejected } from './performance-store.js';
 import { resolveStoreHours } from './store-hours.js';
@@ -681,7 +681,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       tag.access = { capability, storeIds: [...storeIds] };
       return reply;
     };
-    const other = /^(\S{1,12}?)的(?:今天|本月)?进度$/.exec(text);
+    const other = otherProgressCommand.exec(text);
     if (other && !/^(?:我|本人)$/.test(other[1]!)) {
       // 先按策略算出可查门店，再只在这些门店里匹配名字；无权者不读目录、不读账本。
       const stores = await authorizedStores(store, actor, 'progress_other', platform);
@@ -706,7 +706,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       return finalCheck(capability, [scope.storeId], reply);
     }
     const summary = /^(?:经营汇总|门店汇总|本店汇总|本月汇总)(?:\s+(\S+))?$/.exec(text);
-    const missing = /^(?:今天)?谁(?:还)?没报(?:\s+(\S+))?$/.exec(text);
+    const missing = missingReportsCommand.exec(text);
     if (summary || missing) {
       const capability: Capability = summary ? 'store_summary' : 'unreported';
       const people = await store.listPeople();
@@ -723,7 +723,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const reply = summary ? await storeSummary(store, scope, day) : await unreported(store, scope, day);
       return finalCheck(capability, [scope.storeId], reply);
     }
-    if (/^门店(?:排名|排行)$/.test(text)) {
+    if (storeRankingCommand.test(text)) {
       const storeIds = await authorizedStores(store, actor, 'stores_ranking', platform);
       if (!storeIds.length) return ACCESS_DENIED;
       const people = await store.listPeople();
@@ -908,18 +908,21 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     if (!await can(actor, 'progress_self')) return ACCESS_DENIED;
     const result = await tools.myProgress(actor.accountId);
     const current = await actorFor(memberId);
-    if (!current || current.personId !== actor.personId) return DENIED;
-    if (!await can(current, 'progress_self')) return ACCESS_DENIED;
+    if (!current || current.personId !== actor.personId || current.accountId !== actor.accountId || current.storeId !== actor.storeId) return DENIED;
+    if (!await can(current, 'progress_self', actor.storeId)) return ACCESS_DENIED;
     tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
     return result.reply;
   }
-  async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, memberId: string, tag: Tag): Promise<string> {
+  async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, text: string, memberId: string, tag: Tag): Promise<string> {
     const object = c.object;
-    if (c.slots.store !== undefined) {
+    const explicit = labelledStoreTargets(text);
+    if (explicit.length > 1 || (explicit[0] && c.slots.store && explicit[0] !== c.slots.store)) return NOT_FOUND_OR_DENIED;
+    const named = explicit[0] ?? c.slots.store;
+    if (named !== undefined) {
       if (!policyMode) return ACCESS_DENIED;
       const people = await store.listPeople();
-      const scope = storeById(people, c.slots.store) ?? storeByName(people, c.slots.store);
-      auditTarget(c.slots.store, scope?.storeId);
+      const scope = storeById(people, named) ?? storeByName(people, named);
+      auditTarget(named, scope?.storeId);
       if (!scope) return NOT_FOUND_OR_DENIED;
       if (['performance', 'summary', 'completion', 'target'].includes(object ?? '')) {
         return (await managementQuery(actor, '经营汇总 ' + scope.storeId, memberId, tag)) ?? NOT_FOUND_OR_DENIED;
@@ -970,7 +973,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     if (!chain.ok) return { reply: chain.ask, kind: 'ask' };
     const c = chain.classification;
     if (isReadOnlyQuery(c)) {
-      const q = await dispatchClassifiedQuery(actor, c, input.memberId, tag);
+      const q = await dispatchClassifiedQuery(actor, c, text, input.memberId, tag);
       return { reply: q, ...(tag.access ? { access: tag.access } : {}) };
     }
     const amend = c.intent === 'amend' || c.action === 'amend';
@@ -1076,6 +1079,11 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!gate.allowed) return ACCESS_DENIED;
       }
       const requested = businessRead(text);
+      if (requested?.kind === 'unsupported') return 'Front Claw：暂不支持这项只读查询。';
+      if (requested?.kind === 'managed') {
+        if (!policyMode) return ACCESS_DENIED;
+        return (await managementQuery(actor, requested.command, input.memberId, tag)) ?? NOT_FOUND_OR_DENIED;
+      }
       if (requested?.kind === 'identity') {
         const current = await actorFor(input.memberId);
         const raw = await readPolicy(store);
@@ -1101,10 +1109,11 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         }
         return reply;
       }
-      if (input.modelClassification && isReadOnlyQuery(input.modelClassification)) {
+      if (input.modelClassification?.intent === 'query') {
+        if (!isReadOnlyQuery(input.modelClassification)) return 'Front Claw：暂不支持这项只读查询。';
         const chain = validateModelChain({ text, output: input.modelClassification });
         if (!chain.ok) return askReply(chain.ask);
-        return dispatchClassifiedQuery(actor, chain.classification, input.memberId, tag);
+        return dispatchClassifiedQuery(actor, chain.classification, text, input.memberId, tag);
       }
       // D179 统一过期收尾：先生成本请求私有快照并关闭过期项，所有正常分支共用；
       // 回复只在循环出口追加。expireOnly 不消费有效追问，正常确认仍复用这一次 config 读取。
