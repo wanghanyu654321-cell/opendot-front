@@ -2776,6 +2776,7 @@ async function deliverScopedChannelOutput(
           targetJid,
           text: input.wecomText,
           correlationId: scope.inputTurnId || scope.turnRunId,
+          workspaceJid: scope.logicalBaseChatJid,
           outbox: outboxBase,
         })
       : await deliverChannelOutboxItem({
@@ -15445,6 +15446,7 @@ async function processAgentConversation(
             chatId: nextAddress.externalChatId,
             rootId: nextAddress.rootMessageId,
             threadId: nextAddress.threadId,
+            logicalBaseChatJid: chatJid,
           },
           // Same warm-path correlation split as the main workspace admission.
           inputTurnId,
@@ -17038,6 +17040,7 @@ async function processAgentConversation(
               chatId: agentStreamingAddress.externalChatId,
               rootId: agentStreamingAddress.rootMessageId,
               threadId: agentStreamingAddress.threadId,
+            logicalBaseChatJid: chatJid,
             },
           )
         : undefined;

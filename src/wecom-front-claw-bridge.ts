@@ -37,28 +37,20 @@ export type WeComSoftRole =
  * Issue #2 / #3 共享企微前置拦截三态输出（与 docs/OPENDOT-FRONT-MASTER-PLAN.md 对齐）。
  * 放行态仅携带路由身份和脱敏文本，绝不暴露 Front Claw PG store 或数据库连接串。
  */
-export type WeComPrecheckOutcome =
-  | {
-      readonly kind: 'handled' | 'failed';
-      readonly replies: readonly string[];
-    }
-  | {
-      readonly kind: 'pass';
-      readonly corpId: string;
-      readonly accountId: string;
-      readonly storeId: string;
-      readonly displayName: string;
-      readonly targetRole?: WeComSoftRole;
-      readonly workspaceJid?: string;
-      readonly expiredReminder?: string;
-      readonly readonlyContext?: string;
-    };
+export type WeComPrecheckOutcome = import('./wecom.js').WeComPrecheckOutcome;
 
 export type WeComPrecheckPort = (
   event: WeComInboundTextEvent,
 ) => Promise<WeComPrecheckOutcome>;
 
 export interface WeComOutboundAuthRequest {
+  readonly principal?: {
+    readonly personId: string;
+    readonly tier: BridgePerson['tier'];
+    readonly bindingVersion: number;
+  };
+  readonly botId?: string;
+  readonly accountId?: string;
   readonly corpId?: string;
   readonly memberId: string;
   readonly storeId?: string;
@@ -498,6 +490,7 @@ type AccessDecision =
   | { allowed: false; reason: string; version?: number };
 
 interface FrontClawAccessPolicyModule {
+  standing: (raw: RawPolicy, person: BridgePerson) => AccessDecision;
   ACCESS_POLICY_KEY: string;
   ACCESS_POLICY_HIGH_WATER_KEY: string;
   CAPABILITIES: readonly string[];
@@ -738,6 +731,11 @@ interface FrontClawModules {
 }
 
 interface RoutedResult {
+  access?: {
+    capability: string | null;
+    storeIds: string[];
+    identity?: { personId: string; policyVersion: number };
+  };
   entry: 'unified';
   replies: string[];
   modelCalled: boolean;
@@ -2155,6 +2153,11 @@ export async function createWeComFrontClawBridge(
 
       return {
         kind: 'pass',
+        principal: Object.freeze({
+          personId: actor.personId,
+          tier: actor.tier,
+          bindingVersion: binding.version,
+        }),
         corpId: binding.corpId,
         accountId: actor.accountId,
         storeId: actor.storeId,
@@ -2168,12 +2171,39 @@ export async function createWeComFrontClawBridge(
       };
     }
 
+    const proof = result.access && structuredClone(result.access);
+    const authorizeReply = async () => {
+      const current = await refreshPerson();
+      if (!current || !(await fenceStillHolds(activeFence))) return false;
+      const policy = await readPolicy();
+      if (!proof || proof.capability === null) {
+        const access = mods.accessPolicy.standing(policy, current);
+        return (
+          access.allowed &&
+          (!proof?.identity ||
+            (current.personId === proof.identity.personId &&
+              access.version === proof.identity.policyVersion))
+        );
+      }
+      return (
+        proof.storeIds.length > 0 &&
+        proof.storeIds.every(
+          (store) =>
+            mods.accessPolicy.decideAccess(
+              policy,
+              current,
+              proof.capability!,
+              store,
+              platformCapabilities,
+            ).allowed,
+        )
+      );
+    };
     return {
       kind: 'handled',
+      ...(proof || result.target === 'store' ? { authorizeReply } : {}),
       replies:
-        result.replies.length > 0
-          ? result.replies
-          : [mods.entry.CLARIFY_REPLY],
+        result.replies.length > 0 ? result.replies : [mods.entry.CLARIFY_REPLY],
     };
   }
 
@@ -2323,6 +2353,11 @@ export async function createWeComFrontClawBridge(
         binding = activeMatches[0]!;
       }
 
+      if (
+        (req.botId !== undefined && binding.botId !== req.botId) ||
+        (req.accountId !== undefined && binding.accountId !== req.accountId)
+      )
+        return { allowed: false, reason: 'binding_mismatch' };
       if (!nonEmpty(binding.corpId)) {
         return { allowed: false, reason: 'missing_domain' };
       }
@@ -2382,16 +2417,27 @@ export async function createWeComFrontClawBridge(
         return { allowed: false, reason: 'policy_store_unavailable' };
       }
       const targetStoreId = req.storeId ?? current.storeId;
+      if (req.accountId !== undefined && targetStoreId !== current.storeId)
+        return { allowed: false, reason: 'store_out_of_scope' };
       if (
         targetStoreId !== current.storeId &&
         (targetRole === 'manager_ops' || current.tier !== 'owner')
       ) {
         return { allowed: false, reason: 'store_out_of_scope' };
       }
+      if (
+        req.principal &&
+        (req.principal.personId !== current.personId ||
+          req.principal.tier !== current.tier ||
+          req.principal.bindingVersion !== binding.version)
+      )
+        return { allowed: false, reason: 'person_mismatch' };
       const identity = { binding, person: current };
       const refreshPerson = (source?: GrantStores) =>
         refreshBoundPerson(identity, source, req);
-      await provisionDefaultGrant(identity, refreshPerson, activeFence);
+      // A reply for an admitted turn must not reinstate permissions that were removed meanwhile.
+      if (!req.principal)
+        await provisionDefaultGrant(identity, refreshPerson, activeFence);
       const actor = await refreshPerson();
       if (!actor) return { allowed: false, reason: 'person_mismatch' };
       const rawPolicy = await readPolicy();

@@ -665,6 +665,213 @@ afterEach(async () => {
 }, Math.max(30_000, PG_STOP_HOOK_TIMEOUT_MS));
 
 describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
+  test('separates employee marketing workspaces when the same member moves stores', () => {
+    const identity = { corpId: CORP_ID, botId: BOT_ID, memberId: 'm-zhao' };
+    expect(
+      deriveEmployeeWeComWorkspace({ ...identity, storeId: 's-a' }).jid,
+    ).not.toBe(
+      deriveEmployeeWeComWorkspace({ ...identity, storeId: 's-b' }).jid,
+    );
+  });
+
+  test.each(['transfer', 'revoke-read', 'narrow-stores'])(
+    'holds a completed business read until its authority is rechecked at SDK reply (%s)',
+    async (change) => {
+      const now = () => new Date('2026-11-12T06:00:00Z');
+      const world = await createSeededMemoryWorld(now);
+      if (change === 'narrow-stores') {
+        const person = (await world.store.getPerson('p-wang'))!;
+        await world.store.savePerson({...person, tier: 'owner'});
+        const policy = buildPolicy(2);
+        policy.members['p-wang'] = {role: 'owner', storeIds: ['s-b', 's-a'], status: 'active'};
+        policy.stores['s-a'] = [...CAPABILITIES];
+        expect((await updateAccessPolicy(world.store, { expectedVersion: 1, next: policy,
+          actor: 'test-admin', reason: 'authorize two stores', at: now().toISOString()})).ok).toBe(true);
+      }
+      const offline = createOfflineWsClient();
+      const imManager = new IMConnectionManager();
+      const connect = imManager.connectUserWeCom.bind(imManager);
+      let original = '';
+      vi.spyOn(imManager, 'connectUserWeCom').mockImplementation(
+        (user, config, onNewChat, opts) =>
+          connect(
+            user,
+            {
+              ...config,
+              precheck: async (event) => {
+                const result = await config.precheck!(event);
+                if (event.messageId === 'read-before-transfer') {
+                  if (result.kind !== 'handled')
+                    throw Error('expected a handled business read');
+                  original = result.replies.join('');
+                  const person = (await world.store.getPerson('p-wang'))!;
+                  if (change === 'transfer')
+                    await world.store.savePerson({ ...person, storeId: 's-a' });
+                  else {
+                    const policy = JSON.parse(
+                      (await world.store.getConfig('front-claw-access'))!,
+                    ) as AccessPolicy;
+                    const next = structuredClone(policy);
+                    next.version++;
+                    if (change === 'narrow-stores') next.members['p-wang']!.storeIds = ['s-b'];
+                    else next.members['p-wang']!.capabilities = ['progress_self', 'marketing'];
+                    expect(
+                      (
+                        await updateAccessPolicy(world.store, {
+                          expectedVersion: policy.version,
+                          next,
+                          actor: 'test-admin',
+                          reason: 'revoke business read',
+                          at: now().toISOString(),
+                        })
+                      ).ok,
+                    ).toBe(true);
+                  }
+                }
+                return result;
+              },
+            },
+            onNewChat,
+            opts,
+          ),
+      );
+      const runtime = await startWeComFrontClawRuntime({
+        env: {
+          FRONT_CLAW_WECOM_ENABLED: '1',
+          FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+          FRONT_CLAW_WECOM_BOT_SECRET: 'test-secret',
+          FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        },
+        imManager,
+        ...createRuntimeWiringHarness({}),
+        startMaintenance: false,
+        wecomConnection: { client: offline.client },
+        bridgeOptions: {
+          now,
+          open: world.open,
+          modelClassify: async () => ({
+            intent: 'query',
+            object: 'summary',
+            action: null,
+            slots: {},
+            confidence: 0.99,
+            uncertain: false,
+          }),
+          lease: {
+            enabled: true,
+            owner: 'test-read-fence',
+            ttlMs: 5000,
+            renewMs: 1000,
+          },
+        },
+      });
+      activeCleanups.push(async () => {
+        await runtime!.close();
+        await imManager.disconnectAll();
+      });
+      offline.emitInboundText({
+        reqId: 'read-before-transfer',
+        msgid: 'read-before-transfer',
+        corpid: CORP_ID,
+        userid: 'm-wang-yj',
+        content: change === 'narrow-stores' ? '门店排名' : '经营汇总',
+      });
+      await waitUntil(() => original.length > 0);
+      expect(original).toContain(change === 'narrow-stores' ? 's-a' : '测试B店');
+      offline.emitInboundText({
+        reqId: 'unbound-feedback',
+        msgid: 'unbound-feedback',
+        corpid: CORP_ID,
+        userid: 'm-unknown',
+        content: '查询',
+      });
+      await waitUntil(() =>
+        offline.sent.some(
+          (frame) => frame.headers.req_id === 'unbound-feedback',
+        ),
+      );
+      expect(
+        offline.sent
+          .filter((frame) => frame.headers.req_id === 'read-before-transfer')
+          .some(
+            (frame) =>
+              (frame.body as { stream?: { content?: string } }).stream
+                ?.content === original,
+          ),
+      ).toBe(false);
+    },
+  );
+
+  test('refuses a shared custom workspace even when its profile passes the tool guardrail', async () => {
+    const now = () => new Date('2026-11-12T06:00:00Z');
+    const world = await createSeededMemoryWorld(now);
+    const offline = createOfflineWsClient();
+    const imManager = new IMConnectionManager();
+    const workspace = 'web:shared-marketing-test';
+    const profile = {
+      profileId: 'safe-profile',
+      workspaceJid: workspace,
+      status: 'active',
+      executionMode: 'container',
+      contextSource: 'managed',
+      hostSkillsMode: 'disabled',
+      disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
+    };
+    expect(validateTargetAgentProfile(profile)).toEqual({ ok: true });
+    const runtime = await startWeComFrontClawRuntime({
+      env: {
+        FRONT_CLAW_WECOM_ENABLED: '1',
+        FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+        FRONT_CLAW_WECOM_BOT_SECRET: 'test-secret',
+        FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        FRONT_CLAW_WECOM_WORKSPACE_JID: workspace,
+      },
+      imManager,
+      ...createRuntimeWiringHarness({}),
+      startMaintenance: false,
+      wecomConnection: { client: offline.client },
+      bridgeOptions: {
+        now,
+        open: world.open,
+        resolveTargetProfile: () => profile,
+        lease: {
+          enabled: true,
+          owner: 'test-custom-workspace',
+          ttlMs: 5000,
+          renewMs: 1000,
+        },
+        modelClassify: async () => ({
+          intent: 'marketing',
+          object: null,
+          action: null,
+          slots: {},
+          confidence: 0.99,
+          uncertain: false,
+        }),
+      },
+    });
+    activeCleanups.push(async () => {
+      await runtime!.close();
+      await imManager.disconnectAll();
+    });
+    offline.emitInboundText({
+      reqId: 'custom-shared',
+      msgid: 'custom-shared',
+      corpid: CORP_ID,
+      userid: 'm-zhao',
+      content: '帮我写一条朋友圈文案',
+    });
+    await waitUntil(() =>
+      offline.sent.some((frame) => frame.headers.req_id === 'custom-shared'),
+    );
+    expect(JSON.stringify(offline.sent[0]!.body)).toContain(
+      BRIDGE_AGENT_GUARDRAIL_DENIED_REPLY,
+    );
+    expect(
+      db.getMessagesSince(workspace, { timestamp: '', id: '' }),
+    ).toHaveLength(0);
+  });
+
   test('Gate 2: accepts normal WeCom message without from.corpid via unique trusted binding and rejects ambiguous/unbound senders', async () => {
     let nowMs = Date.UTC(2026, 10, 12, 6, 0, 0);
     const now = () => new Date(nowMs);
@@ -994,6 +1201,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       corpId: CORP_ID,
       botId: BOT_ID,
       memberId: 'm-zhao',
+      storeId: 's-b',
     });
     expect(
       db.getMessagesSince(WECOM_MANAGED_WORKSPACE_JID, {
@@ -1316,7 +1524,17 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         corpId: CORP_ID,
         botId: BOT_ID,
         memberId: 'm-zhao',
+        storeId: 's-b',
       });
+      expect(db.getRegisteredGroup(zhaoWs.jid)).toBeUndefined();
+      healedOffline.emitInboundText({
+        reqId: 'legacy-fresh-scope',
+        msgid: 'legacy-fresh-scope',
+        corpid: CORP_ID,
+        userid: 'm-zhao',
+        content: '帮我写一条朋友圈文案',
+      });
+      await waitUntil(() => !!db.getRegisteredGroup(zhaoWs.jid));
       const healedZhaoWs = db.getRegisteredGroup(zhaoWs.jid);
       expect(healedZhaoWs).toMatchObject({
         folder: zhaoWs.folder,
@@ -1460,11 +1678,13 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       corpId: CORP_ID,
       botId: BOT_ID,
       memberId: 'm-zhao',
+      storeId: 's-b',
     });
     const linWs = deriveEmployeeWeComWorkspace({
       corpId: CORP_ID,
       botId: BOT_ID,
       memberId: 'm-lin',
+      storeId: 's-b',
     });
     expect(zhaoWs.jid).not.toBe(linWs.jid);
     expect(zhaoWs.folder).not.toBe(linWs.folder);
@@ -1941,6 +2161,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       corpId: CORP_ID,
       botId: BOT_ID,
       memberId: 'm-zhao',
+      storeId: 's-b',
     });
     const zhaoC2cJid = `wecom:c2c:${CORP_ID}:m-zhao`;
 
@@ -1973,7 +2194,22 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       offline.sent.filter((f) => f.cmd === WsCmd.SEND_MSG).length;
 
     // (a) Accepted -> Outbox delivered with real WeCom providerMessageId + idempotent replay
+    const admit = async (id: string) => {
+      offline.emitInboundText({
+        reqId: id,
+        msgid: id,
+        corpid: CORP_ID,
+        userid: 'm-zhao',
+        content: '帮我写一条周末补水活动朋友圈文案',
+      });
+      await waitUntil(() =>
+        db
+          .getMessagesSince(zhaoWs.jid, { timestamp: '', id: '' })
+          .some((row) => row.id === id),
+      );
+    };
     const okRes = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: '秋季护理文案草稿正文',
@@ -2000,6 +2236,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(countSendMsgs()).toBe(1);
 
     const okReplay = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: '秋季护理文案草稿正文',
@@ -2041,6 +2278,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     // (b) SEND_MSG ACK timeout (unknown) -> Outbox locked as uncertain and automatic replay blocked
     offline.setAckFor(() => null);
     const unknownRes = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: '超时未确认文案',
@@ -2068,6 +2306,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     // Restore healthy ACKs: retrying same key OR sibling ordinal on same turn must remain blocked (0 sends)
     offline.setAckFor(() => ({ errcode: 0 }));
     const replayBlocked = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: '超时未确认文案',
@@ -2089,6 +2328,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     });
     expect(replayBlocked.status).toBe('uncertain');
     const siblingBlocked = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: '同回合后续消息',
@@ -2112,6 +2352,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(countSendMsgs()).toBe(2);
 
     // (c) Multi-chunk partial rejected (chunk 1 accepted, chunk 2 rejected -> sentChunkCount=1) -> uncertain, no replay
+    await admit('msg-outbox-partial-rej');
     const turnPartialRej = ChannelTurnRuntime.start({
       provider: 'wecom',
       accountId: BOT_ID,
@@ -2130,6 +2371,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     );
     const twoChunkRejectText = 'A'.repeat(16001);
     const partialRejRes = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: twoChunkRejectText,
@@ -2157,6 +2399,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     );
     offline.setAckFor(() => ({ errcode: 0 }));
     const partialRejReplay = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: twoChunkRejectText,
@@ -2180,6 +2423,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(countSendMsgs()).toBe(4);
 
     // (d) Multi-chunk partial unknown (chunk 1 accepted, chunk 2 timeout) -> uncertain, no replay
+    await admit('msg-outbox-partial-unk');
     const turnPartialUnk = ChannelTurnRuntime.start({
       provider: 'wecom',
       accountId: BOT_ID,
@@ -2196,6 +2440,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     );
     const twoChunkUnkText = 'B'.repeat(16001);
     const partialUnkRes = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: twoChunkUnkText,
@@ -2220,6 +2465,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(partialUnkRes.error).toContain('sent_chunks=1');
     offline.setAckFor(() => ({ errcode: 0 }));
     const partialUnkReplay = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: twoChunkUnkText,
@@ -2243,6 +2489,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(countSendMsgs()).toBe(6);
 
     // (e) Chunk-1 rejected (sentChunkCount=0) -> DefinitiveChannelDeliveryError -> Outbox failed (not uncertain)
+    await admit('msg-outbox-chunk1-rej');
     const turnChunk1Rej = ChannelTurnRuntime.start({
       provider: 'wecom',
       accountId: BOT_ID,
@@ -2255,6 +2502,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     });
     offline.setAckFor(() => ({ errcode: 40003, errmsg: 'invalid_userid' }));
     const chunk1RejRes = await deliverWeComTextViaOutbox({
+      workspaceJid: zhaoWs.jid,
       imManager,
       targetJid: zhaoC2cJid,
       text: '首块拒收文案',
@@ -2421,6 +2669,12 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
             targetJid: chatJid,
             text: '撤权后严禁外发的营销回复',
             correlationId: 'msg-revoke-inflight-1',
+            workspaceJid: deriveEmployeeWeComWorkspace({
+              corpId: CORP_ID,
+              botId: BOT_ID,
+              memberId: 'm-zhao',
+              storeId: 's-b',
+            }).jid,
             outbox: {
               provider: 'wecom',
               accountId: BOT_ID,
@@ -2614,6 +2868,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       corpId: CORP_ID,
       botId: BOT_ID,
       memberId: 'm-zhao',
+      storeId: 's-b',
     });
     await waitUntil(() =>
       db
@@ -2884,6 +3139,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       corpId: CORP_ID,
       botId: BOT_ID,
       memberId: 'm-zhao',
+      storeId: 's-b',
       targetRole: 'marketing',
     });
     await waitUntil(() =>
@@ -3156,6 +3412,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
             corpId: CORP_ID,
             botId: BOT_ID,
             memberId: 'm-lin',
+            storeId: 's-b',
             targetRole: 'marketing',
           }).jid,
           { timestamp: '', id: '' },
@@ -3229,7 +3486,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         corpId: CORP_ID,
         botId: BOT_ID,
         memberId: 'm-wang-yj',
-        ...(spec.role !== 'marketing' ? { storeId: 's-b' } : {}),
+        storeId: 's-b',
         targetRole: spec.role,
       });
       derivedWorkspaces.set(spec.role, ws);
@@ -3323,6 +3580,97 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         [...spec.expectedSkills].sort(),
       );
     }
+
+    const managerJid = `wecom:c2c:${CORP_ID}:m-wang-yj`;
+    let ordinal = 0;
+    async function deliverOriginal(
+      role: WeComSoftRole,
+      actualWorkspace = derivedWorkspaces.get(role)!.jid,
+    ) {
+      const originalWorkspace = derivedWorkspaces.get(role)!.jid;
+      const stored = db.getMessagesSince(originalWorkspace, {
+        timestamp: '',
+        id: '',
+      })[0]!;
+      const turn = ChannelTurnRuntime.start({
+        provider: 'wecom',
+        accountId: BOT_ID,
+        sourceJid: stored.source_jid!,
+        chatId: `c2c:${CORP_ID}:m-wang-yj`,
+        externalMessageId: stored.id,
+      });
+      activeCleanups.push(() => {
+        turn.interrupt('test_cleanup');
+      });
+      ordinal++;
+      return deliverWeComTextViaOutbox({
+        imManager,
+        targetJid: managerJid,
+        text: 'synthetic reply',
+        correlationId: 'warm-runner-delivery-id',
+        workspaceJid: actualWorkspace,
+        outbox: {
+          provider: 'wecom',
+          accountId: BOT_ID,
+          sourceJid: managerJid,
+          chatId: `c2c:${CORP_ID}:m-wang-yj`,
+          turnRunId: turn.runId,
+          ordinal,
+          kind: 'text',
+          payload: { text: 'synthetic reply' },
+          idempotencyKey: `${turn.runId}:scope-check:${ordinal}`,
+          owner: 'test-scoped-delivery',
+        },
+      });
+    }
+    const originalPolicy = JSON.parse(
+      (await world.store.getConfig('front-claw-access'))!,
+    ) as AccessPolicy;
+    const narrowed = structuredClone(originalPolicy);
+    narrowed.version++;
+    narrowed.members['p-wang']!.capabilities = ['progress_self', 'marketing'];
+    expect(
+      (
+        await updateAccessPolicy(world.store, {
+          expectedVersion: originalPolicy.version,
+          next: narrowed,
+          actor: 'test-admin',
+          reason: 'withdraw review while reply is pending',
+          at: now().toISOString(),
+        })
+      ).ok,
+    ).toBe(true);
+    const sent = () =>
+      offline.sent.filter((frame) => frame.cmd === WsCmd.SEND_MSG).length;
+    const before = sent();
+    expect((await deliverOriginal('manager_ops')).status).toBe('failed');
+    expect(
+      (
+        await deliverOriginal(
+          'manager_ops',
+          derivedWorkspaces.get('marketing')!.jid,
+        )
+      ).status,
+    ).toBe('failed');
+    expect(
+      (
+        await imManager.sendMessageWithReceipt(
+          managerJid,
+          'forged scope',
+          Object.assign(
+            { correlationId: 'msg-mgr-role-mk' },
+            { targetRole: 'marketing', storeId: 's-b' },
+          ),
+        )
+      )?.state,
+    ).toBe('blocked');
+    expect(sent()).toBe(before);
+    expect((await deliverOriginal('marketing')).status).toBe('delivered');
+    expect(sent()).toBe(before + 1);
+    const manager = (await world.store.getPerson('p-wang'))!;
+    await world.store.savePerson({ ...manager, storeId: 's-a' });
+    expect((await deliverOriginal('marketing')).status).toBe('failed');
+    expect(sent()).toBe(before + 1);
   }, 15_000);
 });
 

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { WSClient, WsCmd, type WsFrame } from '@wecom/aibot-node-sdk';
 import {
@@ -31,6 +32,7 @@ export interface WeComInboundTextEvent {
 export type WeComPrecheckOutcome =
   | {
       readonly kind: 'handled' | 'failed';
+      readonly authorizeReply?: () => Promise<boolean>;
       readonly replies: readonly string[];
     }
   | {
@@ -39,6 +41,11 @@ export type WeComPrecheckOutcome =
       readonly accountId: string;
       readonly storeId: string;
       readonly displayName: string;
+      readonly principal?: Readonly<{
+        personId: string;
+        tier: 'employee' | 'manager' | 'owner';
+        bindingVersion: number;
+      }>;
       readonly targetRole?:
         | 'marketing'
         | 'training'
@@ -53,9 +60,29 @@ export type WeComPrecheckPort = (
   event: WeComInboundTextEvent,
 ) => Promise<WeComPrecheckOutcome>;
 
+type AdmittedWeComScope = {
+  readonly principal: NonNullable<
+    Extract<WeComPrecheckOutcome, { kind: 'pass' }>['principal']
+  >;
+  readonly accountId: string;
+  readonly storeId: string;
+  readonly targetRole: NonNullable<
+    Extract<WeComPrecheckOutcome, { kind: 'pass' }>['targetRole']
+  >;
+};
+
+export interface WeComInputRef {
+  readonly messageId: string;
+  readonly workspaceJid: string;
+}
+export const wecomInputContext = new AsyncLocalStorage<
+  Readonly<WeComInputRef>
+>();
+
 export type WeComOutboundAuthorizePort = (input: {
   readonly botId: string;
   readonly chatId: string;
+  readonly scope?: AdmittedWeComScope;
   readonly memberId: string;
   readonly corpId?: string;
   readonly correlationId?: string;
@@ -783,6 +810,13 @@ export function createWeComConnection(
   let stopping = false;
   let closed = true;
   let activeConnectOpts: WeComConnectOpts | null = null;
+  // Indexed by the admitted provider message and exact workspace, never by latest chat.
+  const admittedScopes = new Map<string, AdmittedWeComScope>();
+  const scopeKey = (
+    corp: string | undefined,
+    member: string,
+    ref: WeComInputRef,
+  ) => JSON.stringify([corp, botId, member, ref.messageId, ref.workspaceJid]);
   const admittedPassKeys = new Set<string>();
   const bootstrappedDynamicChatJids = new Set<string>();
   const MAX_ADMITTED_PASS_KEYS = 2048;
@@ -1005,7 +1039,12 @@ export function createWeComConnection(
         if (config.authorizeOutbound) {
           let decision: { readonly allowed: boolean; readonly reason?: string };
           try {
+            const inputRef = wecomInputContext.getStore();
+            const scope =
+              inputRef &&
+              admittedScopes.get(scopeKey(corpId, memberId, inputRef));
             decision = await config.authorizeOutbound({
+              ...(scope ? { scope } : {}),
               botId,
               chatId,
               memberId,
@@ -1265,6 +1304,8 @@ export function createWeComConnection(
         },
         scope,
         async () => {
+          if (outcome.authorizeReply && !(await outcome.authorizeReply()))
+            throw Error('reply_access_changed');
           if (
             stopping ||
             closed ||
@@ -1380,7 +1421,13 @@ export function createWeComConnection(
         !bootstrappedDynamicChatJids.has(jid)
       ) {
         rememberBoundedKey(bootstrappedDynamicChatJids, jid);
-        opts.onNewChat(jid, chatName);
+        wecomInputContext.run(
+          {
+            messageId: inboundEvent.messageId,
+            workspaceJid: candidateWorkspaceJid!,
+          },
+          () => opts.onNewChat(jid, chatName),
+        );
         resolved = tryResolveRoute();
       }
       if (!resolved) {
@@ -1448,6 +1495,31 @@ export function createWeComConnection(
       false,
       { sourceJid: jid },
     );
+    const ref = Object.freeze({
+      messageId: inboundEvent.messageId,
+      workspaceJid: targetJid,
+    });
+    if (
+      outcome.principal &&
+      outcome.targetRole &&
+      outcome.storeId &&
+      candidateWorkspaceJid === targetJid
+    ) {
+      const key = scopeKey(outcome.corpId, inboundEvent.memberId, ref);
+      admittedScopes.set(
+        key,
+        Object.freeze({
+          principal: Object.freeze({ ...outcome.principal }),
+          accountId: outcome.accountId,
+          storeId: outcome.storeId,
+          targetRole: outcome.targetRole,
+        }),
+      );
+      if (admittedScopes.size > MAX_ADMITTED_PASS_KEYS) {
+        const oldest = admittedScopes.keys().next().value;
+        if (oldest !== undefined) admittedScopes.delete(oldest);
+      }
+    }
     broadcastNewMessage(
       targetJid,
       {
@@ -1463,20 +1535,22 @@ export function createWeComConnection(
       agentId ?? undefined,
     );
     notifyNewImMessage();
-    opts.onMessage?.(jid, effectivePassContent, senderName);
-    if (agentId) {
-      opts.onAgentMessage?.(jid, agentId);
-    }
+    await wecomInputContext.run(ref, async () => {
+      opts.onMessage?.(jid, effectivePassContent, senderName);
+      if (agentId) {
+        opts.onAgentMessage?.(jid, agentId);
+      }
 
-    if (outcome.expiredReminder?.trim()) {
-      const reminderOutcome = await sendProactiveTextWithReceipt(
-        jid,
-        inboundEvent.memberId,
-        outcome.expiredReminder.trim(),
-        { corpId: outcome.corpId },
-      );
-      emitDeliveryOutcome(jid, reminderOutcome);
-    }
+      if (outcome.expiredReminder?.trim()) {
+        const reminderOutcome = await sendProactiveTextWithReceipt(
+          jid,
+          inboundEvent.memberId,
+          outcome.expiredReminder.trim(),
+          { corpId: outcome.corpId },
+        );
+        emitDeliveryOutcome(jid, reminderOutcome);
+      }
+    });
   }
 
   return {
