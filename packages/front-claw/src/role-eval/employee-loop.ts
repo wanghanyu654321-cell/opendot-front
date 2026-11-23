@@ -22,7 +22,7 @@ import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-h
 import { ACCESS_POLICY_KEY, parseAccessPolicy, authorize, authorizedStores, decideAccess, policyFrom, readPolicy, standing, type Capability } from './access-policy.js';
 import { checkGateNow, commitGuard, policyVersionOf, type GateSpec, type GateTarget } from './commit-gate.js';
 import type { Fence } from './fencing.js';
-import { businessRead, appointmentClause, clauseKind, compoundHead, compoundTail, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
+import { businessRead, otherStoreShortNames, otherStoresNamed, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
 import { consumerWrites } from './consumer-writes.js';
 import { CommitContentionRejected, FencedWriteRejected } from './performance-store.js';
 import { resolveStoreHours } from './store-hours.js';
@@ -36,7 +36,7 @@ import { askForTextImpurity, bracketImpurity, evaluateConfirmableReportDraft, te
 import { collectConfirmedLedgerNames, collectKnownCustomerNames } from './store-customer-roster.js';
 import { isYesNewCustomerReply, newCustomerAskKey, newCustomerAskReply, notCustomerNameAskReply } from './customer-name-policy.js';
 import { customerNameConflicts } from './customer-conflict.js';
-import { advancePendingSlot, pendingConfirmationReminder, pendingExpired, reportLabels, type SavedNewCustomerAsk, type PendingReportAdmission } from './pending-slot.js';
+import { advancePendingSlot, expiredPendingView, pendingConfirmationReminder, pendingExpired, reportLabels, type SavedNewCustomerAsk, type PendingReportAdmission } from './pending-slot.js';
 import { validateModelChain, isReadOnlyQuery, type ModelClassification } from './model-classify.js';
 import { modelReportCandidate } from './model-report-candidate.js';
 import { oralProjectReportLine } from './intent-router.js';
@@ -713,7 +713,13 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const named = (summary ?? missing)![1];
       const scope = named ? (storeById(people, named) ?? storeByName(people, named)) : storeById(people, actor.storeId);
       auditTarget(named ?? actor.storeId, scope?.storeId);
-      if (!scope || !await can(actor, capability, scope.storeId)) return !scope || (named && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
+      if (!scope || !await can(actor, capability, scope.storeId)) {
+        auditDecision('denied');
+        if (named && otherStoreShortNames(named, actor.storeName).length) {
+          return cannot(`只能办本店（${actor.storeName}）的事，${otherStoresNamed(named, people, actor).join('、')}的报数和查询都不行（跨店不能代报，也不能查）`);
+        }
+        return !scope || (named && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
+      }
       const reply = summary ? await storeSummary(store, scope, day) : await unreported(store, scope, day);
       return finalCheck(capability, [scope.storeId], reply);
     }
@@ -1087,7 +1093,13 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       }
       if (requested?.kind === 'self') {
         auditTarget(actor.storeId, actor.storeId);
-        return selfProgress(actor, input.memberId, tag);
+        const reply = await selfProgress(actor, input.memberId, tag);
+        if (tag.access) {
+          const drafts = (await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId })).filter(d => owned(d, actor, input));
+          const ask = await readAsk(newCustomerAskKey(actor.personId, input.sessionId ?? ''));
+          expiredPendingReminder = expiredPendingView(drafts, ask, now()).expiredReminder;
+        }
+        return reply;
       }
       if (input.modelClassification && isReadOnlyQuery(input.modelClassification)) {
         const chain = validateModelChain({ text, output: input.modelClassification });
@@ -1098,10 +1110,14 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       // 回复只在循环出口追加。expireOnly 不消费有效追问，正常确认仍复用这一次 config 读取。
       let drafts = structuredClone(await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
         .filter(d => owned(d, actor, input));
-      const expiredSlot = await advance(actor, drafts, undefined, true);
+      const readonly = isManagedQueryPhrase(text) || /^(?:入账结果(?:\s+\S+)?|我的预约|预约结果|我登记的预约|查.{0,8}预约|预约列表|(?:今天|明天|本店)的?预约)$/.test(text);
+      const expiredSlot = readonly
+        ? expiredPendingView(drafts, await readAsk(newCustomerAskKey(actor.personId, input.sessionId ?? '')), now())
+        : await advance(actor, drafts, undefined, true);
+      if (readonly) expiredPendingReminder = expiredSlot.expiredReminder;
       if (expiredSlot.blocked) return 'Front Claw：请求已取消或草稿版本已变化，请查原操作结果。';
       drafts = expiredSlot.drafts;
-      if (expiredSlot.expired.length > 0 && active()) await clearInterleaved(actor);
+      if (!readonly && expiredSlot.expired.length > 0 && active()) await clearInterleaved(actor);
       pendingSnapshot = structuredClone({ actorId: actor.personId, drafts, ask: expiredSlot.pendingAsk });
       const replay = drafts.find(d => meta(d)?.messageId === input.messageId || meta(d)?.actionMessageId === input.messageId);
       const timeAskKey = appointmentTimeAskKey(actor, input);
@@ -1109,7 +1125,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const timeAsk = readAppointmentTimeAsk(askedTimeRaw);
       let clockReply: string | null = null;
       const arrivedSequence = (await input.pendingArrival!).sequence;
-      if (!requested && timeAsk && sequenceBefore(timeAsk.issuedSequence, arrivedSequence)) {
+      if (!readonly && timeAsk && sequenceBefore(timeAsk.issuedSequence, arrivedSequence)) {
         if (!active()) return 'Front Claw：请求已取消或超时，未开始新写入。';
         const { compareAndSetPendingAsk } = writesFor(input);
         const consumed = await compareAndSetPendingAsk(timeAskKey, askedTimeRaw!, '', { arrivedSequence });
@@ -1164,7 +1180,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!await can(current, 'progress_self')) return ACCESS_DENIED;
         operationId = found.draftId; ledgerSettled = found.status === 'confirmed';
         tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
-        return resultText(found);
+        return readonly && found.status === 'pending' && pendingExpired(found.expiresAt, now()) ? DRAFT_EXPIRED_REREPORT : resultText(found);
       }
       // R18 / D160：确认指令保留「刚确认过」标记，其余消息清掉。
       if (!isConfirmCommand(text) && (await store.getConfig(d160Key(actor.personId, input.sessionId)))?.trim()) {

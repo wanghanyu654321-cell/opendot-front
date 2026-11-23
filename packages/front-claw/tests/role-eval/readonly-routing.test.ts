@@ -360,3 +360,73 @@ it('门店标识中的数字不计入金额，独立真实金额保持验证', (
     guardUtteranceAmounts('门店 ' + absent + '，李姐 -680元'),
   ).toMatchObject({ ok: false, issue: 'negative' });
 });
+
+it('审计隔离同消息号不同会话，把迟到写入保留为结果未知', async () => {
+  const { createBusinessAudit } =
+    await import('../../src/role-eval/business-audit.js');
+  const { MemoryPerformanceStore } =
+    await import('../../src/role-eval/performance-store.js');
+  let release!: () => void;
+  const delay = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  class DelayedStore extends MemoryPerformanceStore {
+    override async setConfig(key: string, value: string) {
+      await delay;
+      return super.setConfig(key, value);
+    }
+  }
+  const base = new DelayedStore();
+  const audit = createBusinessAudit(base);
+  const message = {
+    memberId: 'fixture',
+    sessionId: 'first',
+    bindingVersion: 1,
+    messageId: 'one',
+    text: 'private request text',
+  };
+  let late!: Promise<void>;
+  await audit.run(message, async () => {
+    late = audit.store.setConfig(
+      'employee-loop:appointment-time-ask:fixture',
+      'private business value',
+    );
+    return {
+      entry: 'unified',
+      replies: [],
+      modelCalled: false,
+      state: 'timeout',
+    };
+  });
+  const key = (session: string) =>
+    'business-audit:v1:' +
+    createHash('sha256')
+      .update(JSON.stringify(['fixture', session, 1, 'one']))
+      .digest('hex');
+  const first = await base.getConfig(key('first'));
+  expect(JSON.parse(first!)).toMatchObject({
+    attemptedWrites: ['setConfig'],
+    writes: [],
+    outcome: 'unknown',
+  });
+  release();
+  await late;
+  expect(
+    await base.getConfig('employee-loop:appointment-time-ask:fixture'),
+  ).toBe('private business value');
+  expect(await base.getConfig(key('first'))).toBe(first);
+  await audit.run({ ...message, sessionId: 'second' }, async () => {
+    await audit.store.getDraft('absent-draft');
+    return {
+      entry: 'unified',
+      replies: [],
+      modelCalled: false,
+      state: 'completed',
+    };
+  });
+  expect(JSON.parse((await base.getConfig(key('second')))!)).toMatchObject({
+    readOperations: ['getDraft'],
+    attemptedWrites: [],
+    writes: [],
+  });
+});

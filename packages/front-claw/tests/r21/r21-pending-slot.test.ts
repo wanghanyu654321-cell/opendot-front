@@ -72,6 +72,8 @@ describe('R21 D179 任何下一条消息都在正常回复后消费过期项一�
   for (const kind of ['草稿', '追问'] as const) for (const [label, text, normal] of messages) it(`${kind} × ${label}`, async () => {
     const { w, expire } = await setup(label === '营销授权');
     await w.call('m-zhao', start(kind)); await expire();
+    const drafts = await w.base.listDrafts();
+    const ask = await w.base.getConfig(key);
     const reply = await w.call('m-zhao', text!);
     expect(reply.endsWith(notice(kind))).toBe(true);
     expect(reply.split(notice(kind))).toHaveLength(2);
@@ -79,6 +81,11 @@ describe('R21 D179 任何下一条消息都在正常回复后消费过期项一�
     if (normal) expect(reply.slice(0, -notice(kind).length)).toContain(normal);
     expect(reply).not.toContain('还在等你回');
     if (label === '入账结果') expect(reply).not.toMatch(/回复「对」|回复.*取消/);
+    if (['查进度', '入账结果', '我的预约'].includes(label!)) {
+      expect(await w.base.listDrafts()).toEqual(drafts);
+      expect(await w.base.getConfig(key)).toBe(ask);
+      expect(await w.call('m-zhao', '取消')).toContain(notice(kind));
+    }
     expect((await w.base.listDrafts({ status: 'pending' })).map(d => d.payload.type)).toEqual(label === '新报单' ? ['report'] : []);
     expect((await w.base.getConfig(key)) || '').toBe('');
     expect(await w.call('m-zhao', '辛苦了')).not.toContain('已过期');
