@@ -240,3 +240,26 @@ it('真实PG重启：预约草稿跨进程保留，重启前后无幽灵预约�
   expect(await appts(url)).toBe(1); expect(await reminders(url)).toBe(1);
   await reopened.close();
 });
+
+it('真实PG：默认宿主写入逐消息审计，关闭再开仍可查询', async () => {
+  const { createHash } = await import('node:crypto');
+  const { bootFrontClaw } = await import('../../src/role-eval/front-claw-boot.js');
+  const url = await freshDatabase();
+  const setup = await open(url);
+  const w = await worldM05({ store: setup.store });
+  await setup.close();
+  const boot = await bootFrontClaw({ env: { [FRONT_CLAW_DATABASE_URL]: url },
+    employeeLoop: true, accessPolicy: true, model: { complete: w.model }, send: w.send, now: () => NOW });
+  const id = 'synthetic-audit-reopen';
+  try {
+    const r = await boot.handler.handleMessage({ memberId: 'm-wang-yj', text: 's-b本月全店业绩汇总是多少？',
+      sessionId: 'session-audit', bindingVersion: 1, messageId: id });
+    expect(r.replies.join('')).toContain('本月 1000');
+  } finally { await boot.close(); }
+  const reader = await open(url);
+  try {
+    const raw = await reader.store.getConfig('business-audit:v1:' + createHash('sha256').update(JSON.stringify(['m-wang-yj', 'session-audit', 1, id])).digest('hex'));
+    expect(JSON.parse(raw!)).toMatchObject({ actor: { personId: 'p-wang-yj', role: 'manager' },
+      policyVersion: 1, targetStoreId: 's-b', readStoreIds: ['s-b'], writes: [], outcome: 'read' });
+  } finally { await reader.close(); }
+});

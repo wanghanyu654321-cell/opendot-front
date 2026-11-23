@@ -712,7 +712,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const people = await store.listPeople();
       const named = (summary ?? missing)![1];
       const scope = named ? (storeById(people, named) ?? storeByName(people, named)) : storeById(people, actor.storeId);
-      if (named) auditTarget(named, scope?.storeId);
+      auditTarget(named ?? actor.storeId, scope?.storeId);
       if (!scope || !await can(actor, capability, scope.storeId)) return !scope || (named && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
       const reply = summary ? await storeSummary(store, scope, day) : await unreported(store, scope, day);
       return finalCheck(capability, [scope.storeId], reply);
@@ -899,20 +899,21 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   }
 
   async function selfProgress(actor: Person, memberId: string, tag: Tag): Promise<string> {
-      if (!await can(actor, 'progress_self')) return ACCESS_DENIED;
-      const result = await tools.myProgress(actor.accountId);
-      const current = await actorFor(memberId);
-      if (!current || current.personId !== actor.personId) return DENIED;
-      if (!await can(current, 'progress_self')) return ACCESS_DENIED;
-      tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
-      return result.reply;
-      }
+    if (!await can(actor, 'progress_self')) return ACCESS_DENIED;
+    const result = await tools.myProgress(actor.accountId);
+    const current = await actorFor(memberId);
+    if (!current || current.personId !== actor.personId) return DENIED;
+    if (!await can(current, 'progress_self')) return ACCESS_DENIED;
+    tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
+    return result.reply;
+  }
   async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, memberId: string, tag: Tag): Promise<string> {
     const object = c.object;
     if (c.slots.store !== undefined) {
       if (!policyMode) return ACCESS_DENIED;
       const people = await store.listPeople();
       const scope = storeById(people, c.slots.store) ?? storeByName(people, c.slots.store);
+      auditTarget(c.slots.store, scope?.storeId);
       if (!scope) return NOT_FOUND_OR_DENIED;
       if (['performance', 'summary', 'completion', 'target'].includes(object ?? '')) {
         return (await managementQuery(actor, '经营汇总 ' + scope.storeId, memberId, tag)) ?? NOT_FOUND_OR_DENIED;
@@ -1077,12 +1078,12 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!policyMode || !current || current.personId !== actor.personId || !gate.allowed || !policy || policy === 'missing') return ACCESS_DENIED;
         const grant = policy.members[current.personId]!;
         const scopes = grant.storeIds.filter(id => !!policy.stores[id] && (current.tier === 'owner' || id === current.storeId));
-        tag.access = { capability: null, storeIds: scopes };
+        tag.access = { capability: null, storeIds: scopes, identity: { personId: current.personId, policyVersion: gate.version } };
         return `Front Claw：当前业务身份为${{ employee: '员工', manager: '店长', owner: '老板' }[gate.role]}，获授权门店：${scopes.join('、') || '无'}。`;
       }
       if (requested?.kind === 'summary') {
         if (!policyMode) return ACCESS_DENIED;
-        return (await managementQuery(actor, '经营汇总 ' + requested.store, input.memberId, tag)) ?? NOT_FOUND_OR_DENIED;
+        return (await managementQuery(actor, requested.store ? '经营汇总 ' + requested.store : '经营汇总', input.memberId, tag)) ?? NOT_FOUND_OR_DENIED;
       }
       if (requested?.kind === 'self') {
         auditTarget(actor.storeId, actor.storeId);
@@ -1892,6 +1893,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       text = `Front Claw：账本暂不可用，结果未知；请查「入账结果 ${operationId ?? input.messageId ?? ''}」，不要另报一笔。`;
       }
     }
+    if (outcome === 'unavailable') auditDecision('unknown');
     if (isConfirmCommand(input.text.trim()) && text === DRAFT_EXPIRED_REREPORT) expiredPendingReminder = '';
     if (abandonedPendingReminder) text = `${abandonedPendingReminder}\n${text}`;
     if (pendingReminder) text += `\n${pendingReminder}`;

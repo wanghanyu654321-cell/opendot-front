@@ -365,8 +365,13 @@ export function businessRead(text: string): BusinessRead | undefined {
     .replace(/[?？。;；]+$/, '').trim();
   if (/^我(?:当前)?(?:实际)?(?:业务身份和)?(?:获|被)?授权门店(?:是什么|有哪些)$/.test(request)) return { kind: 'identity' };
   if (isSelfProgressQuery(request) || /^我(?:本月|今天)?的?(?:业绩(?:进度)?|进度)(?:是多少|多少)?$/.test(request)) return { kind: 'self' };
-  const named = /^(?:虚构且未授权的门店|门店)?([\w][\w.-]*)本月(?:全店)?业绩(?:汇总)?(?:是多少|多少)?$/.exec(request);
-  const command = /^(?:经营汇总|门店汇总|本店汇总|本月汇总)\s+([^\s]+)$/.exec(request);
-  if (named || command) return { kind: 'summary', store: (named ?? command)![1]! };
+  const query = request.replace(/^(?:请|帮我|给我)?(?:查一下|查询|查看|核对|看看|查|看)\s*/, '');
+  const named = /^(?:(?:[\p{Script=Han}]{1,12}的)?门店\s*)?([\w.-]+|[\p{Script=Han}]{1,20}店)\s*的?\s*(?:本月|今日|今天)?(?:全店)?业绩(?:汇总)?(?:是多少|多少)?$/u.exec(query);
+  const command = /^(?:经营汇总|门店汇总|本店汇总|本月汇总)(?:\s+([^\s]+))?$/.exec(request);
+  if (named) {
+    const target = named[1]!;
+    return /^(?:本店|全店)$/.test(target) ? { kind: 'summary' } : { kind: 'summary', store: target };
+  }
+  if (command) return command[1] ? { kind: 'summary', store: command[1] } : { kind: 'summary' };
   return undefined;
 }

@@ -13,11 +13,13 @@ interface MessageAudit {
   targetDigest: string | null;
   readStoreIds: Set<string>;
   readOperations: Set<string>;
+  attemptedWrites: Set<string>;
   writes: Set<string>;
   outcome: Outcome;
 }
 const active = new AsyncLocalStorage<MessageAudit>();
-const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+const digest = (value: string) =>
+  createHash('sha256').update(value).digest('hex');
 
 export function auditAuthorization(actor: Person, gate: AccessDecision) {
   const row = active.getStore();
@@ -39,10 +41,35 @@ export function auditDecision(outcome: Outcome) {
   if (row) row.outcome = outcome;
 }
 
-const filteredReads = new Set(['listEntries', 'listDrafts', 'listAppointments']);
-const scopedReads = new Set(['getTarget', 'listTargets', 'getStoreTarget', 'listStoreTargets', 'listAliases']);
-const writes = new Set(['saveDraft', 'replacePendingReport', 'transitionPendingDraft', 'compareAndSetPendingAsk',
-  'commitConfirmingDraft', 'commitConfirmingAppointments', 'commitConfirmingTarget', 'commitConfirmingStoreTarget', 'commitConfirmingCorrection']);
+const filteredReads = new Set([
+  'listEntries',
+  'listDrafts',
+  'listAppointments',
+]);
+const scopedReads = new Set([
+  'getTarget',
+  'listTargets',
+  'getStoreTarget',
+  'listStoreTargets',
+  'listAliases',
+]);
+const rowReads = new Set([
+  'getDraft',
+  'getEntry',
+  'getOpenDraft',
+  'listRevisions',
+]);
+const writes = new Set([
+  'saveDraft',
+  'replacePendingReport',
+  'transitionPendingDraft',
+  'compareAndSetPendingAsk',
+  'commitConfirmingDraft',
+  'commitConfirmingAppointments',
+  'commitConfirmingTarget',
+  'commitConfirmingStoreTarget',
+  'commitConfirmingCorrection',
+]);
 
 function changed(result: unknown): boolean {
   if (result === null || result === false) return false;
@@ -64,17 +91,37 @@ export function createBusinessAudit(base: PerformanceStore) {
       const name = String(key);
       return (...args: unknown[]) => {
         const row = active.getStore();
+        if (!row) return Reflect.apply(fn, target, args);
+        const businessWrite =
+          writes.has(name) ||
+          (name === 'setConfig' &&
+            typeof args[0] === 'string' &&
+            args[0].startsWith('employee-loop:'));
+        if (businessWrite) row.attemptedWrites.add(name);
         const result: unknown = Reflect.apply(fn, target, args);
-        if (!row) return result;
+        if (rowReads.has(name)) {
+          row.readOperations.add(name);
+          return Promise.resolve(result).then((value) => {
+            const records = Array.isArray(value) ? value : [value];
+            for (const record of records) {
+              if (record && typeof record.storeId === 'string')
+                row.readStoreIds.add(record.storeId);
+            }
+            return value;
+          });
+        }
         if (filteredReads.has(name) || scopedReads.has(name)) {
           row.readOperations.add(name);
           const filter = args[0];
-          const scope = scopedReads.has(name) ? filter
-            : filter && typeof filter === 'object' && 'storeId' in filter ? filter.storeId : null;
+          const scope = scopedReads.has(name)
+            ? filter
+            : filter && typeof filter === 'object' && 'storeId' in filter
+              ? filter.storeId
+              : null;
           if (typeof scope === 'string') row.readStoreIds.add(scope);
         }
-        if (writes.has(name) || (name === 'setConfig' && typeof args[0] === 'string' && args[0].startsWith('employee-loop:'))) {
-          return Promise.resolve(result).then(value => {
+        if (businessWrite) {
+          return Promise.resolve(result).then((value) => {
             if (changed(value)) row.writes.add(name);
             return value;
           });
@@ -83,26 +130,69 @@ export function createBusinessAudit(base: PerformanceStore) {
       };
     },
   });
-  async function run<T extends HandleResult>(input: EmployeeMessage, work: () => Promise<T>): Promise<T> {
+  async function run<T extends HandleResult>(
+    input: EmployeeMessage,
+    work: () => Promise<T>,
+  ): Promise<T> {
     if (!input.messageId) return work();
-    const row: MessageAudit = { actor: null, policyVersion: null, targetStoreId: null, targetDigest: null,
-      readStoreIds: new Set(), readOperations: new Set(), writes: new Set(), outcome: 'reply' };
+    const row: MessageAudit = {
+      actor: null,
+      policyVersion: null,
+      targetStoreId: null,
+      targetDigest: null,
+      readStoreIds: new Set(),
+      readOperations: new Set(),
+      attemptedWrites: new Set(),
+      writes: new Set(),
+      outcome: 'reply',
+    };
+    const occurredAt = new Date().toISOString();
+    const key =
+      'business-audit:v1:' +
+      digest(
+        JSON.stringify([
+          input.memberId,
+          input.sessionId ?? null,
+          input.bindingVersion ?? null,
+          input.messageId,
+        ]),
+      );
+    const requestFingerprint = digest(
+      JSON.stringify([
+        input.memberId,
+        input.sessionId ?? null,
+        input.bindingVersion ?? null,
+        input.text,
+      ]),
+    );
     let duplicate = false;
     try {
       const result = await active.run(row, work);
       duplicate = 'duplicate' in result && result.duplicate === true;
-      if ('state' in result && result.state !== 'completed') row.outcome = 'unknown';
-      else if (row.writes.size) row.outcome = 'written';
+      if ('state' in result && result.state !== 'completed')
+        row.outcome = 'unknown';
+      else if (row.outcome !== 'unknown' && row.writes.size)
+        row.outcome = 'written';
       return result;
     } catch (error) {
       row.outcome = 'unknown';
       throw error;
     } finally {
       if (!duplicate) {
-        const key = 'business-audit:v1:' + digest(input.messageId);
-        const record = JSON.stringify({ ...row, readStoreIds: [...row.readStoreIds], readOperations: [...row.readOperations], writes: [...row.writes] });
-        try { await base.insertConfigIfAbsent(key, record); }
-        catch { console.warn('front_claw_business_audit_unavailable', key); }
+        const record = JSON.stringify({
+          ...row,
+          occurredAt,
+          requestFingerprint,
+          attemptedWrites: [...row.attemptedWrites],
+          readStoreIds: [...row.readStoreIds],
+          readOperations: [...row.readOperations],
+          writes: [...row.writes],
+        });
+        try {
+          await base.insertConfigIfAbsent(key, record);
+        } catch {
+          console.warn('front_claw_business_audit_unavailable', key);
+        }
       }
     }
   }
