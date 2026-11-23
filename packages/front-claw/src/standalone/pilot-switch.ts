@@ -106,17 +106,14 @@ function validateRequest(input: PilotSwitchRequest): void {
   )
     throw Error('pilot_invalid_request');
 }
-const union = (
-  existing: readonly Capability[],
-  additions: readonly Capability[],
-): Capability[] => [...new Set([...existing, ...additions])];
 const sorted = (capabilities: readonly Capability[]) =>
   [...capabilities].sort();
 
-/** A pilot-only command: shared policy ceilings may expand only while exactly one account/store exists. */
+/** Formal changes touch one directory entry and one member grant. */
 export function planPilotSwitch(
   supplied: PilotSwitchSnapshot,
   request: PilotSwitchRequest,
+  baseline = false,
 ): PilotSwitchPlan {
   const snapshot = structuredClone(supplied),
     input = structuredClone(request);
@@ -131,14 +128,21 @@ export function planPilotSwitch(
   if (policy.version !== input.expectedVersion)
     throw Error('pilot_version_conflict');
   if (
-    snapshot.people.length !== 1 ||
-    snapshot.bindings.length !== 1 ||
-    Object.keys(policy.members).length !== 1 ||
-    Object.keys(policy.stores).length !== 1
+    baseline &&
+    (snapshot.people.length !== 1 ||
+      snapshot.bindings.length !== 1 ||
+      Object.keys(policy.members).length !== 1 ||
+      Object.keys(policy.stores).length !== 1)
   )
     throw Error('pilot_scope_not_single');
-  const person = snapshot.people[0]!;
+  const matches = snapshot.people.filter(
+    (row) =>
+      row.personId === input.personId || row.accountId === input.accountId,
+  );
+  const person = matches[0];
   if (
+    matches.length !== 1 ||
+    !person ||
     person.personId !== input.personId ||
     person.accountId !== input.accountId ||
     person.storeId !== input.storeId ||
@@ -149,7 +153,12 @@ export function planPilotSwitch(
   if (!person.active) throw Error('pilot_identity_inactive');
   let binding: WecomBotBinding;
   try {
-    binding = snapshotBinding(snapshot.bindings[0]);
+    const matches = snapshot.bindings.filter(
+      (row) =>
+        row.accountId === person.accountId || row.memberId === person.memberId,
+    );
+    if (matches.length !== 1) throw Error('pilot_binding_invalid');
+    binding = snapshotBinding(matches[0]);
   } catch {
     throw Error('pilot_binding_invalid');
   }
@@ -186,24 +195,38 @@ export function planPilotSwitch(
     loop.enabled !== true ||
     loop.storeId !== person.storeId ||
     !Array.isArray(loop.memberIds) ||
-    loop.memberIds.length !== 1 ||
-    loop.memberIds[0] !== person.memberId
+    (baseline && loop.memberIds.length !== 1) ||
+    !loop.memberIds.includes(person.memberId)
   )
     throw Error('pilot_entry_invalid');
   const capabilities = [...PILOT_CAPABILITIES[input.tier]];
+  if (
+    !baseline &&
+    capabilities.some(
+      (cap) =>
+        !policy.enterprise.includes(cap) ||
+        !policy.stores[person.storeId]!.includes(cap) ||
+        !policy.roles[input.tier].includes(cap),
+    )
+  )
+    throw Error('pilot_ceiling_insufficient');
   const nextPerson: Person = {
     ...person,
     tier: input.tier,
-    roles: [...new Set([...person.roles, 'marketing' as const])],
   };
   const next: AccessPolicy = {
     ...policy,
-    enterprise: union(policy.enterprise, capabilities),
-    stores: {
-      ...policy.stores,
-      [person.storeId]: union(policy.stores[person.storeId]!, capabilities),
-    },
-    roles: { ...policy.roles, [input.tier]: capabilities },
+    ...(baseline
+      ? {
+          enterprise: capabilities,
+          stores: { [person.storeId]: capabilities },
+          roles: {
+            employee: [...PILOT_CAPABILITIES.employee],
+            manager: [...PILOT_CAPABILITIES.manager],
+            owner: [...PILOT_CAPABILITIES.owner],
+          },
+        }
+      : {}),
     members: {
       ...policy.members,
       [person.personId]: {
@@ -260,6 +283,15 @@ export async function runPilotSwitch(
   request: PilotSwitchRequest,
   apply = false,
 ): Promise<PilotSwitchPlan> {
+  return executePilotSwitch(client, request, apply, false);
+}
+
+async function executePilotSwitch(
+  client: SqlClient,
+  request: PilotSwitchRequest,
+  apply: boolean,
+  baseline: boolean,
+): Promise<PilotSwitchPlan> {
   const input = structuredClone(request);
   validateRequest(input);
   return client.transaction(async (query) => {
@@ -267,6 +299,13 @@ export async function runPilotSwitch(
       await query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
     await query("SET LOCAL lock_timeout = '3s'");
     await query("SET LOCAL statement_timeout = '10s'");
+    if (baseline) {
+      const { rows } = await query<{ name: string }>(
+        'SELECT current_database() AS name',
+      );
+      if (!/^synthetic_pilot_switch_[a-z0-9_]+$/.test(rows[0]?.name ?? ''))
+        throw Error('pilot_isolated_database_required');
+    }
     const config: Record<string, string | null> = {};
     for (const key of [
       ACCESS_POLICY_HIGH_WATER_KEY,
@@ -300,6 +339,7 @@ export async function runPilotSwitch(
         loopRaw: config[EMPLOYEE_LOOP_CONFIG] ?? null,
       },
       input,
+      baseline,
     );
     if (apply && plan.changed) {
       const updated = await updateAccessPolicy(store, {
@@ -323,7 +363,12 @@ export async function runPilotSwitchCli(
   const [mode, personId, accountId, storeId, tier, version] = args;
   if (
     args.length !== 6 ||
-    !['preview', 'apply'].includes(mode ?? '') ||
+    ![
+      'preview',
+      'apply',
+      'preview-synthetic-baseline',
+      'apply-synthetic-baseline',
+    ].includes(mode ?? '') ||
     !/^\d+$/.test(version ?? '')
   )
     throw Error('pilot_invalid_request');
@@ -334,18 +379,37 @@ export async function runPilotSwitchCli(
     tier,
     expectedVersion: Number(version),
     actor: 'pilot-admin',
-    reason: `single-account single-store pilot switch to ${tier}`,
+    reason: `${mode} pilot tier ${tier}`,
     at: new Date().toISOString(),
   } as PilotSwitchRequest;
   validateRequest(input);
-  const resolved = resolveBusinessDatabaseUrl(env);
-  if (!resolved.url) throw Error('pilot_database_required');
-  const pool = createDatabasePool(
-    applyDatabaseHost(resolved.url, env.FRONT_CLAW_DATABASE_HOST),
-    1,
-  );
+  const baseline = mode!.endsWith('-synthetic-baseline');
+  let databaseUrl: string;
+  if (baseline) {
+    if (env.AUDIT_PG_ALLOW !== 'isolated-synthetic' || !env.AUDIT_PG_URL)
+      throw Error('pilot_isolated_database_required');
+    const target = new URL(env.AUDIT_PG_URL);
+    if (
+      !['postgres:', 'postgresql:'].includes(target.protocol) ||
+      !['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname) ||
+      target.search ||
+      !/^\/synthetic_pilot_switch_[a-z0-9_]+$/.test(target.pathname)
+    )
+      throw Error('pilot_isolated_database_required');
+    databaseUrl = target.href;
+  } else {
+    const resolved = resolveBusinessDatabaseUrl(env);
+    if (!resolved.url) throw Error('pilot_database_required');
+    databaseUrl = applyDatabaseHost(resolved.url, env.FRONT_CLAW_DATABASE_HOST);
+  }
+  const pool = createDatabasePool(databaseUrl, 1);
   try {
-    const plan = await runPilotSwitch(sqlClient(pool), input, mode === 'apply');
+    const plan = await executePilotSwitch(
+      sqlClient(pool),
+      input,
+      mode!.startsWith('apply'),
+      baseline,
+    );
     return {
       mode,
       changed: plan.changed,

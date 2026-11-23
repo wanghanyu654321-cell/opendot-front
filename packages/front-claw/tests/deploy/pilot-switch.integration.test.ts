@@ -1,20 +1,31 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from 'vitest';
 import type pg from 'pg';
+import { randomUUID } from 'node:crypto';
+import { dropIdleDatabase } from './isolated-database.js';
 import {
   createDatabasePool,
   sqlClient,
 } from '../../src/standalone/database.js';
 import {
   runPilotSwitch,
+  runPilotSwitchCli,
   type PilotSwitchRequest,
 } from '../../src/standalone/pilot-switch.js';
 import { seedIdentity } from '../../src/standalone/seed.js';
 import { migrateUp } from '../../src/role-eval/schema-migrations.js';
 import { createPostgresPerformanceStore } from '../../src/role-eval/performance-postgres.js';
 import { createPostgresBindingStore } from '../../src/role-eval/directory-store.js';
-import { decideAccess, readPolicy } from '../../src/role-eval/access-policy.js';
+import {
+  CAPABILITIES,
+  decideAccess,
+  readPolicy,
+} from '../../src/role-eval/access-policy.js';
 
 let pool: pg.Pool;
+let control: pg.Pool;
+let created = false;
+let testUrl: string;
+const database = 'synthetic_pilot_switch_' + randomUUID().replaceAll('-', '');
 const input: PilotSwitchRequest = {
   personId: 'pilot-person',
   accountId: 'pilot-account',
@@ -48,12 +59,23 @@ beforeAll(async () => {
   expect(process.env.AUDIT_PG_ALLOW).toBe('isolated-synthetic');
   const url = new URL(process.env.AUDIT_PG_URL!);
   expect(['127.0.0.1', 'localhost', '[::1]']).toContain(url.hostname);
-  expect(url.pathname).toMatch(/^\/synthetic_pilot_switch_[a-zA-Z0-9_]+$/);
-  pool = createDatabasePool(url.href, 4);
+  expect(['postgres:', 'postgresql:']).toContain(url.protocol);
+  expect(url.search).toBe('');
+  control = createDatabasePool(url.href, 1);
+  await control.query(`CREATE DATABASE "${database}"`);
+  created = true;
+  url.pathname = '/' + database;
+  testUrl = url.href;
+  pool = createDatabasePool(testUrl, 4);
   await migrateUp(sqlClient(pool), { apply: true });
 });
 afterAll(async () => {
-  await pool?.end();
+  try {
+    await pool?.end();
+    if (created) await dropIdleDatabase(control, database);
+  } finally {
+    await control?.end();
+  }
 });
 beforeEach(async () => {
   await pool.query(
@@ -80,11 +102,11 @@ beforeEach(async () => {
       at: input.at,
     },
     {
-      enterprise: [...employee],
+      enterprise: [...CAPABILITIES],
       roles: {
         employee: [...employee],
-        manager: ['report_self', 'progress_self'],
-        owner: ['progress_self'],
+        manager: [...CAPABILITIES],
+        owner: [...CAPABILITIES],
       },
     },
   );
@@ -229,7 +251,7 @@ it('lets exactly one same-version concurrent switch commit and refuses the stale
   expect(policy.members['pilot-person'].role).toBe(current.tier);
 });
 
-it('refuses another account without altering any row', async () => {
+it('preserves another account during a formal change and refuses to reset its shared policy', async () => {
   await createPostgresPerformanceStore(sqlClient(pool)).savePerson({
     ...person,
     personId: 'other-person',
@@ -237,8 +259,56 @@ it('refuses another account without altering any row', async () => {
     memberId: 'other-member',
   });
   const before = await snapshot();
-  await expect(runPilotSwitch(sqlClient(pool), input, true)).rejects.toThrow(
-    'pilot_scope_not_single',
-  );
+  await expect(resetBaseline()).rejects.toThrow('pilot_scope_not_single');
   expect(await snapshot()).toEqual(before);
+  await runPilotSwitch(sqlClient(pool), input, true);
+  expect(
+    await createPostgresPerformanceStore(sqlClient(pool)).getPerson(
+      'other-person',
+    ),
+  ).toMatchObject({ tier: 'employee', accountId: 'other-account' });
+});
+
+function resetBaseline(tier = 'manager', version = '2') {
+  return runPilotSwitchCli(
+    [
+      'apply-synthetic-baseline',
+      input.personId,
+      input.accountId,
+      input.storeId,
+      tier,
+      version,
+    ],
+    { AUDIT_PG_ALLOW: 'isolated-synthetic', AUDIT_PG_URL: testUrl },
+  );
+}
+
+it('rebuilds the single synthetic baseline without retaining older enterprise or store capabilities', async () => {
+  await resetBaseline();
+  await resetBaseline('employee', '3');
+  const raw = await readPolicy(createPostgresPerformanceStore(sqlClient(pool)));
+  const policy = JSON.parse(raw.policy!);
+  expect(policy.enterprise.sort()).toEqual([...employee].sort());
+  expect(policy.stores[input.storeId].sort()).toEqual([...employee].sort());
+  expect(policy.version).toBe(4);
+});
+
+it.each([
+  'postgresql://127.0.0.1/postgres',
+  'postgresql://db.example/synthetic_pilot_switch_test',
+  'postgresql://localhost/synthetic_pilot_switch_test?host=db.example',
+])('rejects unsuitable reset target before opening it', async (url) => {
+  await expect(
+    runPilotSwitchCli(
+      [
+        'apply-synthetic-baseline',
+        input.personId,
+        input.accountId,
+        input.storeId,
+        'employee',
+        '2',
+      ],
+      { AUDIT_PG_ALLOW: 'isolated-synthetic', AUDIT_PG_URL: url },
+    ),
+  ).rejects.toThrow('pilot_isolated_database_required');
 });

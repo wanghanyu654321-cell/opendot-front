@@ -54,12 +54,12 @@ export function switchFixture(): {
         highWater: '2',
         policy: JSON.stringify({
           version: 2,
-          enterprise: employee,
-          stores: { 'store-b': employee },
+          enterprise: [...CAPABILITIES],
+          stores: { 'store-b': [...CAPABILITIES] },
           roles: {
             employee,
-            manager: ['report_self', 'progress_self'],
-            owner: ['progress_self'],
+            manager: [...CAPABILITIES],
+            owner: [...CAPABILITIES],
           },
           members: {
             'pilot-person': {
@@ -119,9 +119,32 @@ describe('single-account single-store pilot tier plan', () => {
     expect(plan.effective).toContain('target_set');
     expect(plan.effective).toContain('correct_store');
     expect(plan.effective).not.toContain('stores_ranking');
-    expect(plan.policy.roles.owner).toEqual(['progress_self']);
+    expect(plan.policy.roles.owner).toEqual([...CAPABILITIES]);
     plan.person.roles.push('training');
     expect(snapshot).toEqual(original);
+  });
+
+  it('keeps unrelated member grants and every shared ceiling intact', () => {
+    const { snapshot, input } = switchFixture();
+    const policy = JSON.parse(snapshot.rawPolicy.policy!);
+    policy.members.other = { ...policy.members['pilot-person'] };
+    policy.stores.other = ['progress_self'];
+    snapshot.rawPolicy.policy = JSON.stringify(policy);
+    const { policy: after } = planPilotSwitch(snapshot, input);
+    expect(after.members.other).toEqual(policy.members.other);
+    expect(after.enterprise).toEqual(policy.enterprise);
+    expect(after.roles).toEqual(policy.roles);
+    expect(after.stores).toEqual(policy.stores);
+  });
+
+  it('refuses a required capability missing from a shared ceiling', () => {
+    const { snapshot, input } = switchFixture();
+    const policy = JSON.parse(snapshot.rawPolicy.policy!);
+    policy.roles.manager = ['marketing'];
+    snapshot.rawPolicy.policy = JSON.stringify(policy);
+    expect(() => planPilotSwitch(snapshot, input)).toThrow(
+      'pilot_ceiling_insufficient',
+    );
   });
 
   it('downgrades a manager to employee and removes every manager-only ability', () => {
@@ -183,8 +206,6 @@ describe('single-account single-store pilot tier plan', () => {
     'wrong-binding',
     'extra-binding',
     'extra-person',
-    'extra-store',
-    'extra-grant',
     'revoked',
     'empty-capabilities',
     'missing-high-water',
