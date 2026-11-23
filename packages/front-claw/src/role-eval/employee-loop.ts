@@ -22,7 +22,7 @@ import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-h
 import { ACCESS_POLICY_KEY, parseAccessPolicy, authorize, authorizedStores, decideAccess, policyFrom, readPolicy, standing, type Capability } from './access-policy.js';
 import { checkGateNow, commitGuard, policyVersionOf, type GateSpec, type GateTarget } from './commit-gate.js';
 import type { Fence } from './fencing.js';
-import { businessRead, labelledStoreTargets, otherProgressCommand, missingReportsCommand, storeRankingCommand, otherStoreShortNames, otherStoresNamed, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
+import { businessRead, existingReadCommand, labelledStoreTargets, otherProgressCommand, missingReportsCommand, storeRankingCommand, otherStoreShortNames, otherStoresNamed, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
 import { consumerWrites } from './consumer-writes.js';
 import { CommitContentionRejected, FencedWriteRejected } from './performance-store.js';
 import { resolveStoreHours } from './store-hours.js';
@@ -637,6 +637,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         const current = readAppointmentTimeAsk(await store.getConfig(key));
         if (current && !sequenceBefore(current.issuedSequence, sequence)) return 'superseded';
         if (input.signal?.aborted || performance.now() >= (input.deadline ?? Infinity)) return 'cancelled';
+        auditTarget(ask.storeId, ask.storeId);
         await writesFor(input).putOperationRecord(key, JSON.stringify(ask));
         return 'saved';
       })();
@@ -916,7 +917,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, text: string, memberId: string, tag: Tag): Promise<string> {
     const object = c.object;
     const explicit = labelledStoreTargets(text);
-    if (explicit.length > 1 || (explicit[0] && c.slots.store && explicit[0] !== c.slots.store)) return NOT_FOUND_OR_DENIED;
+    if (!explicit || explicit.length > 1 || (explicit[0] && c.slots.store && explicit[0] !== c.slots.store)) return NOT_FOUND_OR_DENIED;
     const named = explicit[0] ?? c.slots.store;
     if (named !== undefined) {
       if (!policyMode) return ACCESS_DENIED;
@@ -1079,6 +1080,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!gate.allowed) return ACCESS_DENIED;
       }
       const requested = businessRead(text);
+      if (requested?.kind === 'existing') text = requested.command;
       if (requested?.kind === 'unsupported') return 'Front Claw：暂不支持这项只读查询。';
       if (requested?.kind === 'managed') {
         if (!policyMode) return ACCESS_DENIED;
@@ -1119,7 +1121,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       // 回复只在循环出口追加。expireOnly 不消费有效追问，正常确认仍复用这一次 config 读取。
       let drafts = structuredClone(await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
         .filter(d => owned(d, actor, input));
-      const readonly = isManagedQueryPhrase(text) || /^(?:入账结果(?:\s+\S+)?|我的预约|预约结果|我登记的预约|查.{0,8}预约|预约列表|(?:今天|明天|本店)的?预约)$/.test(text);
+      const readonly = isManagedQueryPhrase(text) || existingReadCommand(text);
       const expiredSlot = readonly
         ? expiredPendingView(drafts, await readAsk(newCustomerAskKey(actor.personId, input.sessionId ?? '')), now())
         : await advance(actor, drafts, undefined, true);

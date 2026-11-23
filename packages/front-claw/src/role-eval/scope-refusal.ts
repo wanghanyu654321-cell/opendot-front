@@ -90,9 +90,21 @@ export const missingReportsCommand = /^(?:今天)?谁(?:还)?没报(?:\s+(\S+))?
 export const storeRankingCommand = /^门店(?:排名|排行)$/;
 
 /** An explicit label in the source remains binding when the classifier omits the slot. */
-export function labelledStoreTargets(text: string): string[] {
-  const tokens = text.normalize('NFKC').matchAll(/(?:门店|分店)(?:编号|编码|ID)?\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_.-]*)/gi);
-  return [...new Set(Array.from(tokens, match => match[1]!))];
+export function labelledStoreTargets(text: string): string[] | null {
+  const normalized = text.normalize('NFKC');
+  const targets = new Set<string>();
+  const labels = normalized.matchAll(/(?:门店|分店)(编号|编码|ID)?(\s*:\s*|\s*)/gi);
+  for (const label of labels) {
+    const rest = normalized.slice(label.index! + label[0].length);
+    const marked = !!label[1] || label[2]!.includes(':');
+    if (!marked && /^(?:这边|这儿|最近|今天|今日|本月|的|业绩|排名|排行|经营|汇总|进度|情况|表现|有哪些|是什么|[?。!]|$)/.test(rest)) continue;
+    const field = rest.split(/(?:的?(?:业绩|进度|经营|汇总|表现|情况|本月|今天|今日))|[?。!；;]/u, 1)[0]!.trim();
+    const names = field.split(/(?:、|,|和|与|或者|以及|及)(?=[^。?]*?(?:店|[A-Za-z0-9]))/u)
+      .map(name => name.trim().replace(/^(?:门店|分店)\s*:?\s*/, '').trim());
+    if (names.some(name => !/^[\p{Script=Han}\w.-]{1,120}$/u.test(name))) return null;
+    for (const name of names) targets.add(name);
+  }
+  return [...targets];
 }
 
 export function isManagedQueryPhrase(text: string): boolean {
@@ -366,7 +378,7 @@ export function appointmentClause(text: string): string {
 }
 
 /** A complete read-only question. Discard only framing and explicit negative clauses. */
-export type BusinessRead = { kind: 'self' | 'identity' | 'unsupported' } | { kind: 'summary'; store?: string } | { kind: 'managed'; command: string };
+export type BusinessRead = { kind: 'self' | 'identity' | 'unsupported' } | { kind: 'summary'; store?: string } | { kind: 'managed' | 'existing'; command: string };
 export function businessRead(text: string): BusinessRead | undefined {
   const request = text.normalize('NFKC').trim()
     .replace(/^[A-Za-z]+-[A-Za-z]*\d+\s*:\s*/, '')
@@ -386,6 +398,18 @@ export function businessRead(text: string): BusinessRead | undefined {
   }
   if (otherProgressCommand.test(request) || missingReportsCommand.test(request) || storeRankingCommand.test(request)) return { kind: 'managed', command: request };
   if (command) return command[1] ? { kind: 'summary', store: command[1] } : { kind: 'summary' };
+  if (/^(?:(?:我(?:想|要))?(?:看|查|核对)|门店|分店)/.test(request) && /业绩|经营情况/.test(request)
+      && !/报单|报数|记账|改账|预约|设目标|撤回|确认入账/.test(request)) {
+    const targets = labelledStoreTargets(request);
+    if (!targets || targets.length > 1) return { kind: 'unsupported' };
+    if (targets[0]) return { kind: 'summary', store: targets[0] };
+  }
+  if (existingReadCommand(request)) return { kind: 'existing', command: request };
   if (/^(?:[A-Za-z]+-[A-Za-z]*\d+[：:]\s*)?只读(?:查询|核对)/.test(text.trim())) return { kind: 'unsupported' };
   return undefined;
+}
+
+/** Read commands whose handlers need the current draft or appointment view. */
+export function existingReadCommand(text: string): boolean {
+  return /^(?:入账结果(?:\s+\S+)?|我的预约|预约结果|我登记的预约|查.{0,8}预约|预约列表|(?:今天|明天|本店)的?预约)$/.test(text);
 }

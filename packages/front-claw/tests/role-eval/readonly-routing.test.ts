@@ -261,6 +261,22 @@ it('默认宿主把每条消息的业务读写持久化，与顺序和投递元�
     targetStoreId: 's-b',
     writes: expect.arrayContaining(['commitConfirmingAppointments']),
   });
+  const timeReceipt = await call(
+    'm-zhao',
+    '明天张女士要来店',
+    'audit-appointment-time',
+  );
+  const timeAsk = JSON.parse(
+    (await w.base.getConfig(
+      'employee-loop:appointment-time-ask:p-zhao:audit-session',
+    ))!,
+  );
+  expect(timeAsk.storeId).toBe('s-b');
+  expect(timeReceipt).toMatchObject({
+    targetStoreId: timeAsk.storeId,
+    outcome: 'written',
+    writes: ['setConfig'],
+  });
   await boot.close();
 });
 
@@ -576,4 +592,61 @@ it('未支持的显式只读请求保留有效预约和账本状态', async () =
   );
   expect(w.entryStores()).toEqual([]);
   expect(await w.base.getConfig(key)).toBe(pending);
+});
+
+it.each([
+  '我想看门店：虹桥店的业绩表现',
+  '我想看门店:虹桥店的业绩表现',
+  '我想看门店：虹桥店和测试B店的业绩表现',
+  '我想看门店：？',
+])('模型缺槽时带中文或不完整目标标签 %s 不回退本店', async (text) => {
+  const w = await worldM05({
+    router: {
+      modelClassify: async () => ({
+        intent: 'query',
+        object: 'summary',
+        action: 'query',
+        slots: {},
+        confidence: 1,
+        uncertain: false,
+      }),
+    },
+  });
+  w.reset();
+  expect(await w.call('m-wang-yj', text)).toMatch(/查不到|暂不支持/);
+  expect(w.entryStores()).toEqual([]);
+});
+
+it.each(['我的预约', '入账结果'])(
+  '显式只读前缀复用已有查询 %s',
+  async (command) => {
+    const w = await fixture();
+    const member = 'm-zhao';
+    await w.call(member, '明天张女士要来店');
+    const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+    const before = await w.base.getConfig(key);
+    expect(before).toBeTruthy();
+    const native = await w.call(member, command);
+    expect(await w.call(member, '只读查询：' + command)).toBe(native);
+    expect(await w.base.getConfig(key)).toBe(before);
+  },
+);
+
+it('模型遗漏槽位时按中文标签读取跨店授权目标，不读取本人档案店', async () => {
+  const members = membersM05();
+  members['p-boss']!.storeIds = ['s-a', 's-b'];
+  const w = await worldM05({
+    policy: policyM05(1, members),
+    router: {
+      modelClassify: async () => ({
+        intent: 'query',
+        object: 'summary',
+        action: 'query',
+        slots: {},
+        confidence: 1,
+        uncertain: false,
+      }),
+    },
+  });
+  await verify(w, 'm-boss', '我想看门店：测试B店的业绩表现', 'summary');
 });
