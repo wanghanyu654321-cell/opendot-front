@@ -727,6 +727,7 @@ it('显式二店预约查询不回退本店且保留追问', async () => {
   w.reset();
   expect(await w.call('m-zhao', '查二店预约')).toBe('Front Claw：查不到，或你没有权限查看。');
   expect(w.spy.reads.filter(r => r.method === 'listAppointments')).toEqual([]);
+  expect(w.spy.reads.filter(r => r.method === 'listDrafts')).toEqual([]);
   expect(await w.base.getConfig(key)).toBe(before);
   expect(await w.call('m-zhao', '查预约')).toContain('没有登记的预约');
 });
