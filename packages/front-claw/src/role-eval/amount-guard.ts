@@ -127,7 +127,11 @@ function hasHedgeResidue(text: string): boolean {
  */
 export function guardUtteranceAmounts(raw: string, context?: AmountContext): AmountGuardResult {
   if (typeof raw !== 'string') return { ok: false, issue: 'bad', text: '' };
-  const text = raw.normalize('NFKC');
+  // A labelled ASCII store identifier is not a money token. Preserve separators and validate every other span.
+  const text = raw.normalize('NFKC').replace(
+    /(门店\s*)([A-Za-z0-9][A-Za-z0-9._-]{0,119})(?=\s|[，,。;；]|的?(?:本月|今天|业绩|汇总)|$)/g,
+    (match, label: string, id: string) => /[A-Za-z]/.test(id) && /[-_]/.test(id) ? label + ' '.repeat(id.length) : match,
+  );
   const ctx = inferContext(text, context);
   // D125：标准行整段按同一份语法收口，不跨行把下一行称呼当约数后缀。
   if (ctx === 'standard-line' || isStandardAmountLine(text)) {

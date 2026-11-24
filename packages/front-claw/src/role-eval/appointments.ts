@@ -130,15 +130,28 @@ const COMMON_SURNAME = /[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高�
 /** R8（D127）：只认标准预约格式——明确「预约/约了/帮我约」等说法，可带时间。
  * 「今天+客人」类问句没有预约动词则不当预约，交给模型分类。 */
 /** 明确的预约动词。仅「今天+客人」没有钟点、没有这类动词时不当预约（D127）。 */
+const NEGATED_BOOKING = /(?:不(?:要|用|想|需要)?|别)(?:再)?(?:(?:帮|给|为|替)[\p{Script=Han}]{1,8}?)?(?:安排|登记)?(?:预约|约(?:一下|个|了)?)/u;
+const APPOINTMENT_CREATE_VERB = /帮我约|帮.{0,4}约|给我约|替.{0,4}约|安排预约/;
+const APPOINTMENT_READ_QUERY =
+  /^(?:请)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查一下|看一下|看下|查|看|列一下|列出).{0,20}预约|预约.{0,6}(?:有哪些|有什么|是哪些|有几[个条笔])|(?:有哪些|有什么|是哪些).{0,6}预约|已(?:经)?(?:登记|有|约)的?预约|预约(?:记录|列表|结果|明细)/;
 const APPOINTMENT_CUE = /预约|约了|约一下|约个|帮我约|帮.{0,4}约|给我约|登记预约/;
 const APPOINTMENT_COACHING = /预约\s*(?:(?:客户|顾客|客人)\s*)?(?:(?:接待|沟通|流程|登记|咨询)\s*)?(?:话术|带教|演练|课件)/g;
 export const withoutAppointmentCoaching = (text: string): string => text.replace(APPOINTMENT_COACHING, '');
 
+function positiveAppointmentText(text: string): string {
+  if (!NEGATED_BOOKING.test(text)) return text;
+  return text.split(/[，,。;；、！？!?]/).filter(clause => !NEGATED_BOOKING.test(clause)).join('，');
+}
+export function onlyNegatedAppointment(text: string): boolean {
+  return NEGATED_BOOKING.test(text) && !positiveAppointmentText(text).trim();
+}
+
 export function looksLikeAppointment(text: string): boolean {
-  const raw = typeof text === 'string' ? withoutAppointmentCoaching(text).trim() : '';
+  const raw = typeof text === 'string' ? positiveAppointmentText(withoutAppointmentCoaching(text)).trim() : '';
   const flat = raw.replace(/\s+/g, '');
   if (!flat || flat.length > 200 || MARKETING_HINT.test(flat)) return false;
   if (parseAppointmentUtterance(raw)) return true;
+  if (APPOINTMENT_READ_QUERY.test(flat) && !APPOINTMENT_CREATE_VERB.test(flat)) return false;
   const named = [...flat.matchAll(NAMED)].some(m => !NOT_SURNAME.test(m[1]!)) && /来|约|到/.test(flat);
   if (!GUEST.test(flat) && !named && !APPOINTMENT_CUE.test(flat)) return false;
   // 有钟点（三点 / 15:00）的来店说法仍是预约（M05 既有路径）。
@@ -234,7 +247,7 @@ function resolveTime(flat: string, standalone = false): string | null | undefine
 export function parseAppointmentRequest(text: string, now: Date, timeZone: string, timeFollowup?: {
   clock: string; originalText: string; requestedAt: Date;
 }): AppointmentParse | null {
-  const raw = typeof text === 'string' ? text.trim() : '';
+  const raw = typeof text === 'string' && text.length <= 200 ? positiveAppointmentText(text).trim() : '';
   if (!raw || raw.length > 200) return null;
   const legacy = parseAppointmentUtterance(raw);
   const flat = raw.replace(/\s+/g, '');

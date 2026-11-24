@@ -1,3 +1,4 @@
+import { createBusinessAudit } from './business-audit.js';
 import { capturePendingArrival } from './pending-order.js';
 import { statSync } from 'node:fs';
 import { hostname } from 'node:os';
@@ -82,7 +83,8 @@ export async function bootFrontClaw(options: {
     const migrated = sqlitePath
       ? await applyDirectoryMigration({ store: opened.store, bindings: opened.bindings }, readSqliteDirectory(sqlitePath))
       : { bindings: 0, aliases: 0 };
-    const handler = createWecomBotHandler({
+    const audit = employeeLoop && accessPolicy ? createBusinessAudit(opened.store) : undefined;
+    const rawHandler = createWecomBotHandler({
       mode: 'isolated-synthetic',
       employeeLoop,
       ...(accessPolicy ? { accessPolicy: true } : {}),
@@ -91,13 +93,15 @@ export async function bootFrontClaw(options: {
       ...(options.platformCapabilities ? { platformCapabilities: options.platformCapabilities } : {}),
       ...(options.legacyEntry !== undefined ? { legacyEntry: options.legacyEntry } : {}),
       env,
-      store: opened.store,
+      store: audit?.store ?? opened.store,
       now: options.now ?? (() => new Date()),
       resolve: memberId => opened.store.getPersonByMember(memberId),
       send: options.send,
       model: options.model,
       ...(options.onLegacyWarn ? { onLegacyWarn: options.onLegacyWarn } : {}),
     });
+    const handler = audit ? { ...rawHandler, handleMessage: (input: Parameters<typeof rawHandler.handleMessage>[0]) =>
+      audit.run(input, () => rawHandler.handleMessage(input)) } : rawHandler;
     let timer: ReturnType<typeof setInterval> | undefined;
     let closing: Promise<void> | undefined;
     let dispatchTimer: ReturnType<typeof setInterval> | undefined;

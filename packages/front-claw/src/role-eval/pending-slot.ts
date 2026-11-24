@@ -1,3 +1,4 @@
+import { auditTarget } from './business-audit.js';
 import { confirmationSequence, sequenceBefore } from './pending-order.js';
 import type { Draft, EmployeeDraftContext, ReportDraftItem } from './performance-store.js';
 import type { ConsumerWrites } from './consumer-writes.js';
@@ -6,7 +7,7 @@ import { isYesNewCustomerReply } from './customer-name-policy.js';
 import { formatYuan } from './money.js';
 
 export type SavedNewCustomerAsk = {
-  names: string[]; listed: ReportDraftItem[]; businessDay: string; expiresAt?: string; issuedAt?: string; issuedSequence?: string; platformIssuedAt?: string; version?: string; replacedPending?: boolean;
+  storeId?: string; names: string[]; listed: ReportDraftItem[]; businessDay: string; expiresAt?: string; issuedAt?: string; issuedSequence?: string; platformIssuedAt?: string; version?: string; replacedPending?: boolean;
   text?: string; gateEntries?: GateEntry[]; source?: 'standard' | 'natural';
 };
 function parseAsk(raw: string): SavedNewCustomerAsk | null {
@@ -38,6 +39,15 @@ function expiredDraftReminder(draft: Draft): string {
   }
   return OTHER_EXPIRED;
 }
+/** Report expired items without closing drafts or consuming the stored ask. */
+export function expiredPendingView(drafts: Draft[], raw: string | null | undefined, at: Date) {
+  const ask = raw ? parseAsk(raw) : null;
+  const expired = drafts.filter(d => d.status === 'pending' && pendingExpired(d.expiresAt, at));
+  const expiredAsk = !!ask && pendingExpired(ask.expiresAt, at);
+  const expiredReminder = [...expired.map(expiredDraftReminder), expiredAsk ? expiredNames(ask.names) : ''].filter(Boolean).join('\n');
+  return { drafts, expired, expiredReminder, expiredAsk, pendingAsk: expiredAsk ? null : ask, blocked: false };
+}
+
 export function pendingConfirmationReminder(drafts: readonly Draft[], ask: SavedNewCustomerAsk | null, at: Date): string {
   const labels = drafts.filter(d => d.status === 'pending' && !pendingExpired(d.expiresAt, at)).flatMap(reportLabels);
   if (ask && !pendingExpired(ask.expiresAt, at)) labels.push(...ask.names.map(name => { const item = ask.listed.find(i => i.customer === name); return item && Number.isFinite(item.amount) ? `${name} ${formatYuan(item.amount)}元` : name; }));
@@ -111,6 +121,7 @@ export async function advancePendingSlot(args: {
     const conditions = ask && !validAsk ? { expiredAt: now().toISOString() }
       : answeringAsk && isYesNewCustomerReply(text) ? { ...(guardArrival ? { arrivedSequence: arrival } : {}), unexpiredAt: now().toISOString() } : {};
     if (!await writes.compareAndSetPendingAsk(askKey, raw!, '', conditions)) return { drafts, expired, reminder, expiredReminder, pendingAsk: null, ask: null, blocked: true };
+    if (typeof ask?.storeId === 'string' && ask.storeId) auditTarget(ask.storeId, ask.storeId);
     if (ask && !validAsk) appendExpired(expiredNames(ask.names));
     else if (replacing && validAsk) reminder += (reminder ? '\n' : '') + askReminder(validAsk);
   }

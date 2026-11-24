@@ -115,15 +115,21 @@ describe('R20 D176（由 R21 D179 更新）：下一条消息消费过期提醒'
       const ask = await w.base.getConfig(key);
       at = Date.parse(drafts[0]?.expiresAt ?? JSON.parse(ask!).expiresAt);
       const reply = await w.call(member, item.text);
-      // D179 覆盖 R20 的非报单不提醒、不清断言；有效挂起项矩阵仍按 D175。
       expect(reply.endsWith('\n' + expiredReminder(kind))).toBe(true);
       expect(reply.split(expiredReminder(kind))).toHaveLength(2);
-      expect((await w.base.listDrafts()).every(d => d.status !== 'pending')).toBe(true);
-      expect((await w.base.getConfig(key)) || '').toBe('');
+      const readonly = ['查进度', '入账结果', '我的预约'].includes(item.label);
+      if (readonly) {
+        expect(await w.base.listDrafts()).toEqual(drafts);
+        expect(await w.base.getConfig(key)).toBe(ask);
+      } else {
+        expect((await w.base.listDrafts()).every(d => d.status !== 'pending')).toBe(true);
+        expect((await w.base.getConfig(key)) || '').toBe('');
+      }
       if (item.label === '入账结果') expect(reply).not.toMatch(/回复「对」|回复.*取消/);
-      // D179：提醒已消费；随后新报单不得再次提醒。
       const replacement = await w.call(member, next('草稿', employee));
-      expect(replacement).not.toContain('已过期');
+      expect(replacement.includes(expiredReminder(kind))).toBe(readonly);
+      if (drafts[0]) expect((await w.base.getDraft(drafts[0].draftId))?.status).toBe('void');
+      expect((await w.base.getConfig(key)) || '').toBe('');
       // 取消新项后迟到答复不能恢复旧项。
       await w.call(member, '取消');
       await w.call(member, kind === '草稿' ? '对' : '是');

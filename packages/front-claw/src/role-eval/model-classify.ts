@@ -110,8 +110,8 @@ export function parseModelClassification(output: unknown): ModelClassification |
     slots.period = rawSlots.period;
   }
   if (rawSlots.store !== undefined) {
-    if (typeof rawSlots.store !== 'string' || rawSlots.store.length > 32) return null;
-    slots.store = rawSlots.store;
+    if (typeof rawSlots.store !== 'string' || !rawSlots.store.trim() || rawSlots.store.length > 120) return null;
+    slots.store = rawSlots.store.trim();
   }
   return {
     intent: o.intent as ModelIntent,
