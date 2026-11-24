@@ -605,8 +605,6 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     const mine = /^(?:我的预约|预约结果|我登记的预约|查.{0,8}预约)$/.test(text);
     const storeList = /^(?:预约列表|(?:今天|明天|本店)(?:的)?预约)$/.test(text);
     if (!mine && !storeList) return undefined;
-    // An explicit target must never silently become the actor's own appointments.
-    if (/^查/.test(text) && !/^(?:查预约|查我的预约|查本人预约|查我登记的预约)$/.test(text)) return NOT_FOUND_OR_DENIED;
     if (!policyMode) return 'Front Claw：预约登记当前未开放，没有读取或写入。';
     const today = businessDate(now(), cutoff, timeZone);
     const wantStore = storeList && await can(actor, 'appointment_receive', actor.storeId);
@@ -1111,7 +1109,11 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       }
       const requested = businessRead(text);
       if (onlyNegatedAppointment(text)) return 'Front Claw：没有登记预约。';
-      if (requested?.kind === 'existing') text = requested.command;
+      if (requested?.kind === 'existing') {
+        text = requested.command;
+        // Reject unsupported explicit appointment scope before reading pending state.
+        if (/^查.*预约$/.test(text) && !/^(?:查预约|查我的预约|查本人预约|查我登记的预约)$/.test(text)) return NOT_FOUND_OR_DENIED;
+      }
       if (requested?.kind === 'unsupported') return 'Front Claw：暂不支持这项只读查询。';
       if (requested?.kind === 'managed') {
         if (!policyMode) return ACCESS_DENIED;
