@@ -755,7 +755,12 @@ it.each([false, true])('身份审计采用第二次授权 gate（denied=%s）', 
   if (denied) {
     expect(result.replies).toEqual([ACCESS_DENIED]);
     expect(audit.outcome).toBe('denied');
-  } else expect(result.access?.identity?.policyVersion).toBe(audit.policyVersion);
+  } else {
+    expect(result.replies).toEqual(['Front Claw：当前业务身份为员工，获授权门店：s-b。']);
+    expect(audit.actor).toEqual({ personId: 'p-zhao', role: 'employee' });
+    expect(audit.outcome).toBe('read');
+    expect(audit.readStoreIds).toEqual([]);
+  }
 });
 
 
