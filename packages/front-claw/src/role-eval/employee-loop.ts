@@ -23,7 +23,7 @@ import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-h
 import { ACCESS_POLICY_KEY, parseAccessPolicy, authorize, authorizedStores, decideAccess, policyFrom, readPolicy, standing, type Capability } from './access-policy.js';
 import { checkGateNow, commitGuard, policyVersionOf, type GateSpec, type GateTarget } from './commit-gate.js';
 import type { Fence } from './fencing.js';
-import { businessRead, existingReadCommand, labelledStoreTargets, otherProgressCommand, missingReportsCommand, storeRankingCommand, otherStoreShortNames, otherStoresNamed, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
+import { businessRead, existingReadCommand, labelledStoreTargets, otherProgressCommand, missingReportsCommand, storeRankingCommand, otherStoreShortNames, otherStoresNamed, parseAppointmentReadQuery, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
 import { consumerWrites } from './consumer-writes.js';
 import { CommitContentionRejected, FencedWriteRejected } from './performance-store.js';
 import { resolveStoreHours } from './store-hours.js';
@@ -590,14 +590,18 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   async function appointmentQuery(actor: Person, text: string, memberId: string, tag: Tag): Promise<string | undefined> {
     const confirmCommand = /^确认预约(?:\s*\S+)?$/.test(text);
     if (confirmCommand) return 'Front Claw：现在预约登记即成立，店长只收提醒，不需要确认或回复。这条没有写入。';
-    const mine = /^(?:我的预约|预约结果|我登记的预约|查.{0,8}预约)$/.test(text);
-    const storeList = /^(?:预约列表|(?:今天|明天|本店)(?:的)?预约)$/.test(text);
-    if (!mine && !storeList) return undefined;
+    const readSpec = parseAppointmentReadQuery(text);
+    if (!readSpec) return undefined;
+    if (readSpec.scope === 'other' && readSpec.target !== actor.storeId && readSpec.target !== actor.storeName) {
+      return NOT_FOUND_OR_DENIED;
+    }
+    const storeList = readSpec.scope === 'store' || readSpec.scope === 'other';
     if (!policyMode) return 'Front Claw：预约登记当前未开放，没有读取或写入。';
     const today = businessDate(now(), cutoff, timeZone);
     const wantStore = storeList && await can(actor, 'appointment_receive', actor.storeId);
     if (!wantStore && !await can(actor, 'appointment_submit', actor.storeId)) return ACCESS_DENIED;
-    const day = /^明天/.test(text) ? addDay(today, 1) : /^今天/.test(text) ? today : null;
+    auditTarget(actor.storeId, actor.storeId);
+    const day = readSpec.day === 'tomorrow' ? addDay(today, 1) : readSpec.day === 'today' ? today : null;
     const all = await store.listAppointments(wantStore ? { storeId: actor.storeId, status: 'registered' } : { storeId: actor.storeId, employeePersonId: actor.personId, status: 'registered' });
     const rows = all.filter(row => day ? row.whenText.startsWith(day) : row.whenText.slice(0, 10) >= today).sort((a, b) => a.whenText.localeCompare(b.whenText));
     const notices = await store.listNotifications();
@@ -713,7 +717,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const capability: Capability = summary ? 'store_summary' : 'unreported';
       const people = await store.listPeople();
       const named = (summary ?? missing)![1];
-      const scope = named ? (storeById(people, named) ?? storeByName(people, named)) : storeById(people, actor.storeId);
+      const scope = named ? resolveStoreTarget(people, actor, named) : storeById(people, actor.storeId);
       auditTarget(named ?? actor.storeId, scope?.storeId);
       if (!scope || !await can(actor, capability, scope.storeId)) {
         auditDecision('denied');
@@ -733,6 +737,16 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       return finalCheck('stores_ranking', storeIds, await ranking(store, scopes, day));
     }
     return undefined;
+  }
+  function resolveStoreTarget(people: readonly Person[], actor: Person, named: string): { storeId: string; storeName: string } | null {
+    const direct = storeById(people, named) ?? storeByName(people, named);
+    if (direct) return direct;
+    const short = named.normalize('NFKC').trim();
+    if (!/^(?:测试)?(?:[一二三四五六七八九十]|[2-9a-z])店$/i.test(short)) return null;
+    if (otherStoreShortNames(short, actor.storeName).length > 0) return null;
+    const suffix = short.toLowerCase().replace(/^测试/, '');
+    const conflict = people.some(p => p.storeId !== actor.storeId && p.storeName.normalize('NFKC').replace(/\s+/g, '').toLowerCase().includes(suffix));
+    return conflict ? null : storeById(people, actor.storeId);
   }
   /** M04：按策略算出可用门店，再只在这些门店里按名字匹配在职完整人员；无权者不读目录。 */
   async function findInStores(actor: Person, capability: Capability, name: string): Promise<Person | string> {
@@ -923,7 +937,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     if (named !== undefined) {
       if (!policyMode) return ACCESS_DENIED;
       const people = await store.listPeople();
-      const scope = storeById(people, named) ?? storeByName(people, named);
+      const scope = resolveStoreTarget(people, actor, named);
       auditTarget(named, scope?.storeId);
       if (!scope) return NOT_FOUND_OR_DENIED;
       if (['performance', 'summary', 'completion', 'target'].includes(object ?? '')) {
@@ -960,7 +974,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       return reply;
     }
     if (object === 'appointment') {
-      const got = await appointmentQuery(actor, '我的预约', memberId, tag);
+      if (otherStoreShortNames(text, actor.storeName).length > 0) return NOT_FOUND_OR_DENIED;
+      if (c.slots.employee && c.slots.employee !== actor.displayName && !/^(?:我|本人)$/.test(c.slots.employee)) return NOT_FOUND_OR_DENIED;
+      const cmd = /明天|明日/.test(text) ? '查我明天的预约' : (/今天|今日/.test(text) && !/今天及以后/.test(text) ? '查我今天的预约' : '我的预约');
+      const got = await appointmentQuery(actor, cmd, memberId, tag);
       return got ?? ACCESS_DENIED;
     }
     return ACCESS_DENIED;
@@ -1088,7 +1105,11 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       if (requested?.kind === 'existing') {
         text = requested.command;
         // Reject unsupported explicit appointment scope before reading pending state.
-        if (/^查.*预约$/.test(text) && !/^查(?:看|询)?(?:一下)?(?:预约|我的预约|本人预约|我登记的预约)$/.test(text)) return NOT_FOUND_OR_DENIED;
+        const apptRead = parseAppointmentReadQuery(text);
+        if (apptRead?.scope === 'other' && apptRead.target !== actor.storeId && apptRead.target !== actor.storeName) {
+          auditTarget(apptRead.target ?? text);
+          return NOT_FOUND_OR_DENIED;
+        }
       }
       if (requested?.kind === 'unsupported') return 'Front Claw：暂不支持这项只读查询。';
       if (requested?.kind === 'managed') {
