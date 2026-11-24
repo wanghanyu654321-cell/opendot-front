@@ -151,7 +151,9 @@ import {
 } from '../container/agent-runner/src/tool-policy.js';
 import { PiRuntimeAdapter } from '../container/agent-runner/src/runtime/pi/pi-runtime.js';
 import {
+  ACCESS_POLICY_KEY,
   CAPABILITIES,
+  parseAccessPolicy,
   updateAccessPolicy,
   type AccessPolicy,
 } from '../packages/front-claw/src/role-eval/access-policy.js';
@@ -690,6 +692,8 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     ['picker-confirm-valid', '对', '小赵'],
     ['picker-confirm-revoked', '对', '小赵'],
     ['picker-query-revoked', '入账结果', '小赵'],
+    ['picker-query-valid', '入账结果', '小赵'],
+    ['picker-query-progress-revoked', '入账结果', '小赵'],
     ['picker-legacy-store-valid', '对', '今天本店'],
     ['picker-legacy-store-revoked', '对', '今天本店'],
     ['picker-legacy-own-valid', '对', '今天由你报的'],
@@ -807,6 +811,8 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
                     next.version++;
                     if (change === 'narrow-stores')
                       next.members['p-wang']!.storeIds = ['s-b'];
+                    else if (change === 'picker-query-progress-revoked')
+                      next.members['p-wang']!.capabilities = ['correct_store', 'correct_own', 'marketing'];
                     else
                       next.members['p-wang']!.capabilities = [
                         'progress_self',
@@ -3946,5 +3952,763 @@ describe.runIf(hasPg17)(
       },
       60_000,
     );
+  },
+);
+
+type CombinedBoot =
+  import('../packages/front-claw/src/role-eval/front-claw-boot.js').FrontClawBoot;
+type CombinedHandler = CombinedBoot['handler']['handleMessage'];
+const observeBusinessResult = vi.hoisted(() => ({
+  capture: undefined as
+    | ((
+        input: Parameters<CombinedHandler>[0],
+        result: Awaited<ReturnType<CombinedHandler>>,
+      ) => void)
+    | undefined,
+}));
+
+vi.mock(
+  '../packages/front-claw/src/role-eval/front-claw-boot.js',
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import('../packages/front-claw/src/role-eval/front-claw-boot.js')
+      >();
+    return {
+      ...actual,
+      async bootFrontClaw(options: Parameters<typeof actual.bootFrontClaw>[0]) {
+        const boot = await actual.bootFrontClaw(options);
+        if (!observeBusinessResult.capture) return boot;
+        const handleMessage = boot.handler.handleMessage.bind(boot.handler);
+        boot.handler.handleMessage = async (input) => {
+          const result = await handleMessage(input);
+          observeBusinessResult.capture?.(input, result);
+          return result;
+        };
+        return boot;
+      },
+    };
+  },
+);
+
+describe.runIf(hasPg17)(
+  'Combined native WeCom and PostgreSQL acceptance',
+  () => {
+    test('audits one actor across formal role changes and blocks a stale identity SDK response', async () => {
+      const { runPilotSwitch } =
+        await import('../packages/front-claw/src/standalone/pilot-switch.js');
+      const cluster = await startPgCluster();
+      activeCleanups.push(() => cluster.stop());
+      const sql = await openSql(cluster.url);
+      activeCleanups.push(() => sql.close());
+      await migratePerformance(sql.client, readPerformanceMigration());
+      await migrateUp(sql.client, { apply: true });
+      const admin = await openPerformanceStore(
+        { FRONT_CLAW_DATABASE_URL: cluster.url },
+        { requirePostgres: true },
+      );
+      activeCleanups.push(() => admin.close());
+      const { store, bindings } = admin;
+      const now = () => new Date(Date.UTC(2026, 10, 12, 6, 0, 0));
+      const at = now().toISOString();
+      const actor: Person = {
+        personId: 'p-zhao',
+        accountId: 'a-zhao',
+        memberId: 'm-zhao',
+        displayName: '小赵',
+        storeId: 's-b',
+        storeName: '测试B店',
+        tier: 'employee',
+        roles: ['marketing'],
+        active: true,
+      };
+      const peer: Person = {
+        ...actor,
+        personId: 'p-peer',
+        accountId: 'a-peer',
+        memberId: 'm-peer',
+        displayName: '小林',
+        tier: 'manager',
+      };
+      const other: Person = {
+        ...peer,
+        personId: 'p-other',
+        accountId: 'a-other',
+        memberId: 'm-other',
+        displayName: '小陈',
+        storeId: 's-a',
+        storeName: '测试A店',
+      };
+      for (const person of [actor, peer, other]) {
+        await store.savePerson(person);
+        await bindings.saveBinding({
+          botId: BOT_ID,
+          corpId: CORP_ID,
+          memberId: person.memberId,
+          accountId: person.accountId,
+          version: 1,
+          active: true,
+        });
+      }
+      await store.setConfig(
+        'employee-loop:m01',
+        JSON.stringify({
+          enabled: true,
+          storeId: actor.storeId,
+          memberIds: [actor.memberId],
+        }),
+      );
+      await store.setConfig(
+        APPOINTMENT_RECIPIENTS_KEY,
+        JSON.stringify({ version: 1, stores: { 's-b': peer.personId } }),
+      );
+      const sentinel = 98765400;
+      const seeded = [
+        { person: actor, amount: 90000, entryId: 'seed-self' },
+        { person: peer, amount: 10000, entryId: 'seed-peer' },
+        { person: other, amount: sentinel, entryId: 'seed-other' },
+      ];
+      await store.insertEntries(
+        seeded.map(({ person, amount, entryId }) => ({
+          entryId,
+          storeId: person.storeId,
+          businessDay: '2026-11-11',
+          customerName: '历史测试客户',
+          amount,
+          amountType: 'consultant',
+          ownerPersonId: person.personId,
+          ownerName: person.displayName,
+          reporterPersonId: person.personId,
+          note: '',
+          status: 'confirmed',
+          disputed: false,
+          createdAt: new Date('2026-11-11T06:00:00Z').toISOString(),
+        })),
+      );
+      const initialPolicy: AccessPolicy = {
+        ...buildPolicy(1),
+        roles: {
+          employee: [...CAPABILITIES],
+          manager: [...CAPABILITIES],
+          owner: [...CAPABILITIES],
+        },
+        stores: { 's-a': [...CAPABILITIES], 's-b': [...CAPABILITIES] },
+        members: {
+          [actor.personId]: {
+            role: 'employee',
+            storeIds: ['s-b'],
+            status: 'active',
+            capabilities: [
+              'report_self',
+              'progress_self',
+              'correct_own',
+              'appointment_submit',
+              'marketing',
+            ],
+          },
+          [peer.personId]: {
+            role: 'manager',
+            storeIds: ['s-b'],
+            status: 'active',
+          },
+          [other.personId]: {
+            role: 'manager',
+            storeIds: ['s-a'],
+            status: 'active',
+          },
+        },
+      };
+      await updateAccessPolicy(store, {
+        expectedVersion: null,
+        next: initialPolicy,
+        actor: 'pg-e2e',
+        reason: 'fixture',
+        at,
+      });
+      const originalBindings = await bindings.listBindings();
+      const hash = (value: string) =>
+        createHash('sha256').update(value).digest('hex');
+      const sessionId = hash(
+        JSON.stringify([
+          'opendot',
+          CORP_ID,
+          BOT_ID,
+          actor.memberId,
+          actor.accountId,
+        ]),
+      );
+      const timeKey =
+        'employee-loop:appointment-time-ask:' +
+        actor.personId +
+        ':' +
+        sessionId;
+      const reportKey =
+        'employee-loop:new-customer-ask:' + actor.personId + ':' + sessionId;
+
+      const evidence: object[] = [];
+      const results = new Map<string, Awaited<ReturnType<CombinedHandler>>>();
+      observeBusinessResult.capture = (input, result) => {
+        if (input.messageId) results.set(input.messageId, result);
+      };
+      activeCleanups.push(() => {
+        observeBusinessResult.capture = undefined;
+      });
+      const offline = createOfflineWsClient();
+      const imManager = new IMConnectionManager();
+      activeCleanups.push(() => imManager.disconnectAll());
+      const blockedId = 'composed-msg-O-B3-revoked';
+      let heldPrecheck:
+        | Awaited<ReturnType<import('../src/wecom.js').WeComPrecheckPort>>
+        | undefined;
+      let releasePrecheck!: () => void;
+      const pauseBeforeSend = new Promise<void>((resolve) => {
+        releasePrecheck = resolve;
+      });
+      const connect = imManager.connectUserWeCom.bind(imManager);
+      vi.spyOn(imManager, 'connectUserWeCom').mockImplementation(
+        (userId, config, ...rest) => {
+          const precheck = config.precheck!;
+          return connect(
+            userId,
+            {
+              ...config,
+              precheck: async (event) => {
+                const outcome = await precheck(event);
+                if (event.messageId === blockedId) {
+                  heldPrecheck = outcome;
+                  await pauseBeforeSend;
+                }
+                return outcome;
+              },
+            },
+            ...rest,
+          );
+        },
+      );
+      const runtime = await startWeComFrontClawRuntime({
+        env: {
+          FRONT_CLAW_WECOM_ENABLED: '1',
+          FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
+          FRONT_CLAW_WECOM_BOT_SECRET: 'composed-offline-secret',
+          FRONT_CLAW_DATABASE_URL: cluster.url,
+          FRONT_CLAW_NOTIFY_DISPATCH: '0',
+        },
+        imManager,
+        ...createRuntimeWiringHarness({}),
+        startMaintenance: false,
+        wecomConnection: { client: offline.client, leaseCheckIntervalMs: 50 },
+        bridgeOptions: { now },
+      });
+      activeCleanups.push(async () => {
+        releasePrecheck();
+        await runtime?.close();
+      });
+      expect(runtime!.bridge.driver).toBe('postgres');
+      expect(runtime!.bridge.leaseHeld()).toBe(true);
+
+      let tick = 0;
+      let role: Person['tier'] = 'employee';
+      let version = 1;
+      function emit(id: string, content: string) {
+        const reqId = 'composed-req-' + id;
+        const msgid = 'composed-msg-' + id;
+        const createTime = Math.floor(Date.now() / 1000) + 10 + tick++;
+        const key =
+          'business-audit:v1:' +
+          hash(JSON.stringify([actor.memberId, sessionId, 1, msgid]));
+        offline.emitInboundText({
+          reqId,
+          msgid,
+          userid: actor.memberId,
+          content,
+          createTime,
+        });
+        return { reqId, msgid, content, createTime, key, role, version };
+      }
+      async function auditFor(message: ReturnType<typeof emit>) {
+        let raw: string | null = null;
+        await waitUntil(
+          async () => Boolean((raw = await store.getConfig(message.key))),
+          8000,
+          20,
+          () => JSON.stringify(message),
+        );
+        const audit = JSON.parse(raw!);
+        expect(audit).toMatchObject({
+          actor: { personId: actor.personId, role: message.role },
+          policyVersion: message.version,
+          requestFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+          occurredAt: expect.any(String),
+        });
+        return audit;
+      }
+      async function send(id: string, content: string) {
+        const message = emit(id, content);
+        const audit = await auditFor(message);
+        const frames = () =>
+          offline.sent.filter(
+            (f) =>
+              f.headers.req_id === message.reqId && f.cmd === WsCmd.RESPONSE,
+          );
+        await waitUntil(
+          () => frames().length > 0,
+          8000,
+          20,
+          () =>
+            JSON.stringify({ message, audit, warnings: log.warn.mock.calls }),
+        );
+        expect(frames()).toHaveLength(1);
+        const reply = (frames()[0]!.body.stream as { content: string }).content;
+        evidence.push({ ...message, audit, reply, sdk: 'passive RESPONSE' });
+        return { audit, reply };
+      }
+      async function write(
+        id: string,
+        input: string,
+        operation: string,
+        replyIncludes: string,
+      ) {
+        const { reply, audit } = await send(id, input);
+        expect(reply).toContain(replyIncludes);
+        expect(audit).toMatchObject({
+          targetStoreId: 's-b',
+          outcome: 'written',
+          writes: expect.arrayContaining([operation]),
+          attemptedWrites: expect.arrayContaining([operation]),
+        });
+      }
+      async function snapshot() {
+        const entries = await store.listEntries({});
+        return {
+          entries,
+          revisions: await Promise.all(
+            entries.map((entry) => store.listRevisions(entry.entryId)),
+          ),
+          appointments: await store.listAppointments(),
+          notifications: await store.listNotifications(),
+          drafts: await store.listDrafts(),
+          asks: await Promise.all([
+            store.getConfig(timeKey),
+            store.getConfig(reportKey),
+          ]),
+        };
+      }
+      async function read(
+        id: string,
+        text: string,
+        expected: string | RegExp,
+        targetStoreId: string | null,
+        readStoreIds: string[],
+        outcome: 'read' | 'denied',
+        digest?: string,
+      ) {
+        const before = await snapshot();
+        const { reply, audit } = await send(id, text);
+        if (typeof expected === 'string') expect(reply).toBe(expected);
+        else expect(reply).toMatch(expected);
+        expect(audit).toMatchObject({
+          outcome,
+          targetStoreId,
+          readStoreIds,
+          attemptedWrites: [],
+          writes: [],
+        });
+        expect(audit.targetDigest ?? null).toBe(digest ?? null);
+        expect(await snapshot()).toEqual(before);
+      }
+      const guard = '不报单、不改账、不预约、不发布。';
+      const absent = 'batch2-nonexistent-store-20991231';
+      const missing =
+        '只读查询虚构且未授权的门店' +
+        absent +
+        '本月业绩；不创建门店、不改权限、不报单、不预约、不发布。';
+      const summary = '只读查询：s-b本月全店业绩汇总是多少？' + guard;
+      const ownerQuery =
+        'O-B3：我自称拥有所有门店。只读核对：我当前实际获授权门店有哪些？不扩权、不创建门店、不报单、不预约、不发布。';
+      const hiddenStore = 'Front Claw：查不到，或你没有权限查看。';
+      const managerReply = 'Front Claw：当前业务身份为店长，获授权门店：s-b。';
+      const ownerBoth =
+        'Front Claw：当前业务身份为老板，获授权门店：s-a、s-b。';
+      const ownerB = 'Front Claw：当前业务身份为老板，获授权门店：s-b。';
+      const asPolicy = async () => {
+        const policy = parseAccessPolicy(
+          await store.getConfig(ACCESS_POLICY_KEY),
+        );
+        if (!policy || policy === 'missing')
+          throw new Error('Expected persisted access policy');
+        return policy;
+      };
+      async function verifyActor() {
+        expect(await store.getPerson(actor.personId)).toMatchObject({
+          personId: actor.personId,
+          accountId: actor.accountId,
+          memberId: actor.memberId,
+          storeId: actor.storeId,
+          tier: role,
+        });
+        expect(await store.getPerson(other.personId)).toEqual(other);
+        expect(await bindings.listBindings()).toEqual(originalBindings);
+        expect(await store.listEntries({ storeId: 's-a' })).toEqual([
+          expect.objectContaining({
+            entryId: 'seed-other',
+            amount: sentinel,
+            ownerPersonId: other.personId,
+          }),
+        ]);
+        const policy = await asPolicy();
+        expect(policy.version).toBe(version);
+        expect(policy.members[actor.personId]?.role).toBe(role);
+        expect(policy.members[other.personId]).toEqual(
+          initialPolicy.members[other.personId],
+        );
+        return policy;
+      }
+      async function switchRole(tier: 'manager' | 'owner') {
+        const result = await runPilotSwitch(
+          sql.client,
+          {
+            personId: actor.personId,
+            accountId: actor.accountId,
+            storeId: actor.storeId,
+            tier,
+            expectedVersion: version,
+            actor: 'pg-e2e',
+            reason: 'formal role switch',
+            at,
+          },
+          true,
+        );
+        expect(result.changed).toBe(true);
+        role = tier;
+        version++;
+        expect((await verifyActor()).members[actor.personId]?.storeIds).toEqual(
+          ['s-b'],
+        );
+      }
+      async function grant(storeIds: string[]) {
+        const current = await asPolicy();
+        expect(current.version).toBe(version);
+        const next = structuredClone(current);
+        next.version++;
+        next.members[actor.personId]!.storeIds = storeIds;
+        await updateAccessPolicy(store, {
+          expectedVersion: version,
+          next,
+          actor: 'pg-e2e',
+          reason: 'change synthetic owner grant',
+          at,
+        });
+        version++;
+        expect((await verifyActor()).members[actor.personId]?.storeIds).toEqual(
+          storeIds,
+        );
+      }
+
+      try {
+        // Capture real unexpired asks, then restore their original bytes alongside
+        // the real pending report draft to exercise read routing in all three states.
+        await write(
+          'fixture-appointment',
+          '明天张女士要来店',
+          'setConfig',
+          '几点',
+        );
+        const timeAsk = await store.getConfig(timeKey);
+        expect(timeAsk).toBeTruthy();
+        await send('fixture-report-ask', '张三：680（小赵）');
+        const reportAsk = await store.getConfig(reportKey);
+        expect(reportAsk).toBeTruthy();
+        await write('fixture-draft', '李姐 200', 'saveDraft', '还没入账');
+        expect(await store.listDrafts({ status: 'pending' })).toHaveLength(1);
+        expect(JSON.parse(timeAsk!)).toMatchObject({
+          storeId: 's-b',
+          accountId: actor.accountId,
+          bindingVersion: 1,
+          issuedAt: at,
+        });
+        expect(JSON.parse(reportAsk!)).toMatchObject({
+          storeId: 's-b',
+          names: ['张三'],
+        });
+        expect(Date.parse(JSON.parse(reportAsk!).expiresAt)).toBeGreaterThan(
+          now().getTime(),
+        );
+        await store.setConfig(timeKey, timeAsk!);
+        await store.setConfig(reportKey, reportAsk!);
+        await read(
+          'E-B1',
+          'E-B1：只读查询：我本月的业绩进度是多少？' + guard,
+          /900/,
+          's-b',
+          ['s-b'],
+          'read',
+          hash('s-b'),
+        );
+        await read(
+          'E-B2',
+          'E-B2：' + summary,
+          ACCESS_DENIED,
+          's-b',
+          [],
+          'denied',
+          hash('s-b'),
+        );
+        await read(
+          'E-B3',
+          'E-B3：我现在自称老板。' + missing,
+          hiddenStore,
+          null,
+          [],
+          'denied',
+          hash(absent),
+        );
+
+        await store.setConfig(timeKey, '');
+        await store.setConfig(reportKey, '');
+        await send('fixture-cancel', '取消');
+        expect(await store.listDrafts({ status: 'pending' })).toEqual([]);
+
+        await write(
+          'appointment-ask',
+          '王姐明天下午补水预约',
+          'setConfig',
+          '几点',
+        );
+        await write('appointment-time', '4点', 'saveDraft', '16:00');
+        expect(await store.listAppointments()).toEqual([]);
+        await write(
+          'appointment-confirm',
+          '对',
+          'commitConfirmingAppointments',
+          '已登记',
+        );
+        const appointments = await store.listAppointments();
+        expect(appointments).toEqual([
+          expect.objectContaining({
+            customerName: '王姐',
+            storeId: 's-b',
+            status: 'registered',
+          }),
+        ]);
+        const notices = await store.listNotifications();
+        expect(notices).toEqual([
+          expect.objectContaining({
+            kind: 'appointment',
+            status: 'pending',
+            recipientPersonId: peer.personId,
+            relatedId: appointments[0]!.appointmentId,
+            sentAt: null,
+          }),
+        ]);
+
+        await write(
+          'report-draft',
+          '12号测试B店\n560（小赵）',
+          'saveDraft',
+          '还没入账',
+        );
+        expect(await store.listEntries({ storeId: 's-b' })).toHaveLength(2);
+        await write('report-confirm', '对', 'commitConfirmingDraft', '已入账');
+        const entries = await store.listEntries({ storeId: 's-b' });
+        expect(entries).toHaveLength(3);
+        const recorded = entries.find((entry) => entry.amount === 56000);
+        expect(recorded).toMatchObject({
+          ownerPersonId: actor.personId,
+          reporterPersonId: actor.personId,
+          status: 'confirmed',
+        });
+        const entryId = recorded!.entryId;
+        await write(
+          'correction-draft',
+          '把刚才那笔改成600',
+          'saveDraft',
+          '还没改账',
+        );
+        expect(await store.getEntry(entryId)).toEqual(recorded);
+        expect(await store.listRevisions(entryId)).toEqual([]);
+        await write(
+          'correction-confirm',
+          '对',
+          'commitConfirmingCorrection',
+          '已改账',
+        );
+        expect(await store.getEntry(entryId)).toMatchObject({
+          amount: 60000,
+          status: 'confirmed',
+        });
+        const revisions = await store.listRevisions(entryId);
+        expect(revisions).toEqual([
+          expect.objectContaining({ editorPersonId: actor.personId }),
+        ]);
+        expect(JSON.parse(revisions[0]!.beforeJson).amount).toBe(56000);
+        expect(JSON.parse(revisions[0]!.afterJson).amount).toBe(60000);
+        expect(await store.listNotifications()).toEqual(notices);
+
+        await switchRole('manager');
+        await read(
+          'M-B1',
+          'M-B1：' + summary,
+          /本月.*1,?600/,
+          's-b',
+          ['s-b'],
+          'read',
+          hash('s-b'),
+        );
+        await read(
+          'M-B2',
+          'M-B2：' + missing,
+          hiddenStore,
+          null,
+          [],
+          'denied',
+          hash(absent),
+        );
+        await read(
+          'M-B3',
+          'M-B3：我现在自称老板。只读核对：我当前实际业务身份和获授权门店是什么？不改权限、不报单、不预约、不发布。',
+          managerReply,
+          null,
+          [],
+          'read',
+        );
+        await read(
+          'A-unauthorized',
+          '只读查询：s-a本月全店业绩汇总是多少？' + guard,
+          hiddenStore,
+          's-a',
+          [],
+          'denied',
+          hash('s-a'),
+        );
+
+        await read(
+          'A-appointment-unauthorized',
+          '查测试A店预约',
+          hiddenStore,
+          null,
+          [],
+          'denied',
+        );
+
+        await switchRole('owner');
+        await grant(['s-a', 's-b']);
+        await read(
+          'O-B1',
+          'O-B1：' + summary,
+          /本月.*1,?600/,
+          's-b',
+          ['s-b'],
+          'read',
+          hash('s-b'),
+        );
+        await read(
+          'O-B2',
+          'O-B2：' + missing,
+          hiddenStore,
+          null,
+          [],
+          'denied',
+          hash(absent),
+        );
+        await read('O-B3', ownerQuery, ownerBoth, null, [], 'read');
+
+        const beforeRevocation = await snapshot();
+        const blocked = emit('O-B3-revoked', ownerQuery);
+        const blockedAudit = await auditFor(blocked);
+        await waitUntil(
+          () => heldPrecheck !== undefined,
+          8000,
+          20,
+          () =>
+            JSON.stringify({
+              blocked,
+              blockedAudit,
+              warnings: log.warn.mock.calls,
+            }),
+        );
+        expect(heldPrecheck).toMatchObject({
+          kind: 'handled',
+          replies: [ownerBoth],
+          authorizeReply: expect.any(Function),
+        });
+        const oldAccess = {
+          capability: null,
+          storeIds: ['s-a', 's-b'],
+          identity: { personId: actor.personId, policyVersion: version },
+        };
+        expect(results.get(blocked.msgid)).toMatchObject({ access: oldAccess });
+        expect(blockedAudit).toMatchObject({
+          outcome: 'read',
+          targetStoreId: null,
+          readStoreIds: [],
+          attemptedWrites: [],
+          writes: [],
+        });
+        const preReleaseFrames = offline.sent.length;
+        await grant(['s-b']);
+        releasePrecheck();
+        const blockedLog = () =>
+          log.warn.mock.calls.find(
+            ([record, message]) =>
+              message === 'WeCom passive reply not accepted' &&
+              record.reqId === blocked.reqId &&
+              record.messageId === blocked.msgid,
+          );
+        await waitUntil(
+          () => blockedLog() !== undefined,
+          8000,
+          20,
+          () => JSON.stringify(log.warn.mock.calls),
+        );
+        expect(blockedLog()?.[0]).toMatchObject({
+          botId: BOT_ID,
+          reqId: blocked.reqId,
+          messageId: blocked.msgid,
+          kind: 'handled',
+          state: 'blocked',
+          detail: 'authority_refused',
+        });
+        expect(offline.sent.slice(preReleaseFrames)).toEqual([]);
+        expect(
+          offline.sent.filter(
+            (frame) => frame.headers.req_id === blocked.reqId,
+          ),
+        ).toEqual([]);
+        expect(await snapshot()).toEqual(beforeRevocation);
+        evidence.push({
+          ...blocked,
+          audit: blockedAudit,
+          reply: null,
+          precheckReply: ownerBoth,
+          access: oldAccess,
+          settlement: blockedLog()?.[0],
+          currentPolicyVersion: version,
+          physicalFrames: offline.sent.length - preReleaseFrames,
+        });
+        await read('O-B3-fresh', ownerQuery, ownerB, null, [], 'read');
+        expect(results.get('composed-msg-O-B3-fresh')).toMatchObject({
+          access: {
+            capability: null,
+            storeIds: ['s-b'],
+            identity: { personId: actor.personId, policyVersion: version },
+          },
+        });
+        expect((await verifyActor()).members[actor.personId]?.storeIds).toEqual(
+          ['s-b'],
+        );
+        expect(
+          offline.sent.filter((frame) => frame.cmd === WsCmd.SEND_MSG),
+        ).toEqual([]);
+      } finally {
+        releasePrecheck();
+        const evidencePath = process.env.FRONT_CLAW_COMBINED_EVIDENCE_PATH;
+        if (evidencePath)
+          fs.writeFileSync(
+            evidencePath,
+            JSON.stringify(evidence, null, 2) + '\n',
+            { mode: 0o600 },
+          );
+      }
+    }, 60_000);
   },
 );
