@@ -4588,6 +4588,7 @@ describe.runIf(hasPg17)(
           null,
           [],
           'denied',
+          hash('测试A店'),
         );
 
         await switchRole('owner');
