@@ -301,7 +301,7 @@ async function executePilotSwitch(
     await query("SET LOCAL statement_timeout = '10s'");
     if (baseline) {
       const { rows } = await query<{ name: string; owned: boolean }>(
-        'SELECT datname AS name, datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned FROM pg_database WHERE datname = current_database()',
+        'SELECT datname AS name, datdba = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user) AS owned FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()',
       );
       if (
         !rows[0]?.owned ||

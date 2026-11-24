@@ -690,6 +690,13 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     ['picker-confirm-valid', '对', '小赵'],
     ['picker-confirm-revoked', '对', '小赵'],
     ['picker-query-revoked', '入账结果', '小赵'],
+    ['picker-legacy-store-valid', '对', '今天本店'],
+    ['picker-legacy-store-revoked', '对', '今天本店'],
+    ['picker-legacy-own-valid', '对', '今天由你报的'],
+    ['picker-missing-valid', '改 9', '没有第9笔'],
+    ['picker-missing-revoked', '改 9', '没有第9笔'],
+    ['picker-stale-valid', '改 1', '在你指定前已被改动'],
+    ['picker-stale-revoked', '改 1', '在你指定前已被改动'],
   ])(
     'holds a completed business read until its authority is rechecked at SDK reply (%s)',
     async (change, query, expected) => {
@@ -697,16 +704,26 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       const world = await createSeededMemoryWorld(now);
       const targetRead = change.includes('target');
       const picker = change.startsWith('picker-');
+      const legacyPicker = change.startsWith('picker-legacy-');
+      const ownPicker = change === 'picker-legacy-own-valid';
       const allowed = change.endsWith('-valid');
+      if (ownPicker) {
+        const next = buildPolicy(2);
+        next.members['p-wang']!.capabilities = ['correct_own', 'progress_self'];
+        expect((await updateAccessPolicy(world.store, {
+          expectedVersion: 1, next, actor: 'test-admin',
+          reason: 'create own-only picker', at: now().toISOString(),
+        })).ok).toBe(true);
+      }
       if (picker) {
         await world.store.insertEntries(
           [68000, 56000].map((amount, i) => ({
             entryId: 'pick-' + i,
             storeId: 's-b',
             businessDay: '2026-11-12',
-            ownerPersonId: 'p-zhao',
-            ownerName: '小赵',
-            reporterPersonId: 'p-zhao',
+            ownerPersonId: legacyPicker ? 'p-wang' : 'p-zhao',
+            ownerName: legacyPicker ? '苏晓禾' : '小赵',
+            reporterPersonId: legacyPicker ? 'p-wang' : 'p-zhao',
             customerName: '许姐',
             amount,
             amountType: 'consultant',
@@ -794,6 +811,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
                       next.members['p-wang']!.capabilities = [
                         'progress_self',
                         'marketing',
+                        ...(legacyPicker ? ['correct_own' as const] : []),
                       ];
                     expect(
                       (
@@ -821,6 +839,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
           FRONT_CLAW_WECOM_BOT_ID: BOT_ID,
           FRONT_CLAW_WECOM_BOT_SECRET: 'test-secret',
           FRONT_CLAW_NOTIFY_DISPATCH: '0',
+          ...(ownPicker ? { FRONT_CLAW_WECOM_AUTO_ROLE_GRANT: '0' } : {}),
         },
         imManager,
         ...createRuntimeWiringHarness({}),
@@ -860,6 +879,28 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         await waitUntil(() =>
           offline.sent.some((frame) => frame.headers.req_id === 'open-picker'),
         );
+        if (change.startsWith('picker-stale-')) {
+          await world.store.reviseEntry('pick-0', { amount: 71000 }, {
+            editorPersonId: 'p-wang',
+            reason: 'changed after listing',
+            createdAt: now().toISOString(),
+            revisionId: 'picker-revision',
+          });
+        }
+        if (legacyPicker) {
+          const draft = await world.store.getOpenDraft('p-wang');
+          if (draft?.payload.type !== 'correction' || !draft.payload.awaitingPick)
+            throw Error('expected a correction picker');
+          const payload = draft.payload;
+          const { newAmount, listed, reason } = payload.awaitingPick!;
+          expect(listed.map((row) => row.visibility)).toEqual(['own', 'own']);
+          payload.scope = 'own';
+          payload.awaitingPick = { newAmount, listed, reason };
+          payload.employeeContext.itemsDigest = createHash('sha256')
+            .update(JSON.stringify(['correction', 'amend', 'own', [], payload.awaitingPick]))
+            .digest('hex');
+          await world.store.saveDraft(draft);
+        }
       }
       offline.emitInboundText({
         reqId: 'read-before-transfer',

@@ -313,7 +313,7 @@ it.each([
   ).rejects.toThrow('pilot_isolated_database_required');
 });
 
-it('refuses synthetic reset by a fully privileged role that does not own the child database', async () => {
+it.each([false, true])('refuses synthetic reset by a role that does not own the child database (shadow catalog: %s)', async (shadowCatalog) => {
   const owner = 'reset_owner_' + randomUUID().replaceAll('-', '');
   const { rows } = await control.query<{ role: string }>(
     'SELECT current_user AS role',
@@ -321,6 +321,13 @@ it('refuses synthetic reset by a fully privileged role that does not own the chi
   const original = rows[0]!.role.replaceAll('"', '""');
   await control.query(`CREATE ROLE "${owner}" NOLOGIN`);
   try {
+    if (shadowCatalog) {
+      await pool.query('CREATE SCHEMA synthetic_catalog_test');
+      await pool.query(
+        'CREATE TABLE synthetic_catalog_test.pg_database AS SELECT datname, datdba FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()',
+      );
+      await control.query(`ALTER DATABASE "${database}" SET search_path TO synthetic_catalog_test, pg_catalog, public`);
+    }
     await control.query(`ALTER DATABASE "${database}" OWNER TO "${owner}"`);
     const before = await snapshot();
     await expect(resetBaseline()).rejects.toThrow(
@@ -329,6 +336,11 @@ it('refuses synthetic reset by a fully privileged role that does not own the chi
     expect(await snapshot()).toEqual(before);
   } finally {
     await control.query(`ALTER DATABASE "${database}" OWNER TO "${original}"`);
+    if (shadowCatalog) {
+      await control.query(`ALTER DATABASE "${database}" RESET search_path`);
+      await pool.query('DROP TABLE IF EXISTS synthetic_catalog_test.pg_database');
+      await pool.query('DROP SCHEMA IF EXISTS synthetic_catalog_test');
+    }
     await control.query(`DROP ROLE "${owner}"`);
   }
 });
