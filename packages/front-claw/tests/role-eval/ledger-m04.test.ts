@@ -359,7 +359,7 @@ describe('M04 内存实现（MemoryPerformanceStore）与 PG 实现同语义', (
   });
 });
 
-it.each(['progress_self', 'correct_store', null] as const)('缓存入账候选结果重验两个独立权限 revoked=%s', async revoked => {
+it.each(['progress_self', 'correct_store', 'swap', null] as const)('缓存入账候选结果重验两个独立权限 revoked=%s', async revoked => {
   const w = await worldM04({store: new MemoryPerformanceStore()});
   const reporter = peopleM04.find(p => p.memberId === 'm-wang-yj')!;
   await w.base.insertEntries(['composite-a','composite-b'].map(id => ({...entry(id,'s-b',reporter,68000),customerName:'许姐'})));
@@ -369,7 +369,16 @@ it.each(['progress_self', 'correct_store', null] as const)('缓存入账候选�
   const first = await say('入账结果','composite-query');
   expect(first.replies.join('')).toContain('改 1');
 
-  if (revoked) {
+  if (revoked === 'swap') {
+    const read = w.base.getConfig.bind(w.base);
+    let reads = 0;
+    w.base.getConfig = async key => {
+      if (key !== 'front-claw-access') return read(key);
+      const members = membersM04();
+      members[reporter.personId]!.capabilities = ++reads === 1 ? ['correct_store'] : ['progress_self'];
+      return JSON.stringify(policyM04(reads === 1 ? 1 : 2, members));
+    };
+  } else if (revoked) {
     const members = membersM04();
     members[reporter.personId]!.capabilities = ['report_self','report_proxy','progress_self','correct_store','correct_own'].filter(c => c !== revoked) as NonNullable<typeof members[typeof reporter.personId]['capabilities']>;
     await bump(w.base,1,policyM04(2,members));
