@@ -222,7 +222,7 @@ export interface CorrectionPayload {
   type: 'correction'; employeeContext: EmployeeDraftContext;
   action: 'amend' | 'withdraw'; scope: 'own' | 'store'; changes: CorrectionChange[];
   /** R4：0 或多项匹配时列出今天已报，等员工回「改 N」。此时 changes 为空，不能用「对」提交。 */
-  awaitingPick?: { newAmount: number; listed: CorrectionPickItem[]; reason: string };
+  awaitingPick?: { sourceScope?: 'own' | 'store'; newAmount: number; listed: CorrectionPickItem[]; reason: string };
   outcome?: 'conflict';
 }
 export type DraftPayload = ReportPayload | AppointmentPayload | TargetPayload | CorrectionPayload;

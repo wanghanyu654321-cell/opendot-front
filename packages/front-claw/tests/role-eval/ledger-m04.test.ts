@@ -4,8 +4,8 @@ import { CLARIFY_REPLY } from '../../src/role-eval/employee-entry.js';
 import { updateAccessPolicy } from '../../src/role-eval/access-policy.js';
 import { createWecomBotHandler } from '../../src/role-eval/wecom-bot-unified-handler.js';
 import { MemoryPerformanceStore, type PerformanceStore } from '../../src/role-eval/performance-store.js';
-import { NOW } from './access-fixture-m03.js';
-import { membersM04, policyM04, worldM04 } from './ledger-fixture-m04.js';
+import { NOW, entry } from './access-fixture-m03.js';
+import { membersM04, peopleM04, policyM04, worldM04 } from './ledger-fixture-m04.js';
 
 const NOT_FOUND = 'Front Claw：查不到，或你没有权限查看。';
 const CONFLICT = 'Front Claw：对象在你确认前已被改动（可能别人刚改过或刚入账），这次没有写入，请重新发起。';
@@ -26,6 +26,35 @@ async function unchanged(w: W, memberId: string, text: string, expected: string 
   expect(w.send).not.toHaveBeenCalled();
   return reply;
 }
+
+it.each([
+  ['correction', '改 9', false, /没有第9笔/],
+  ['correction', '改 9', true, ACCESS_DENIED],
+  ['correction', '改 1', false, /在你指定前已被改动/],
+  ['correction', '改 1', true, ACCESS_DENIED],
+  ['report', '改 1', false, /在你指定前已被改动/],
+  ['report', '改 1', true, ACCESS_DENIED],
+] as const)('checks authority before disclosing selection state (%s, %s, revoked=%s)', async (kind, selection, revoked, expected) => {
+  const w = await worldM04({ store: new MemoryPerformanceStore() });
+  const member = 'm-wang-yj';
+  const reporter = peopleM04.find(person => person.memberId === member)!;
+  const ids = kind === 'correction' ? ['selection-a', 'selection-b'] : ['selection-a'];
+  await w.base.insertEntries(ids.map(id => ({ ...entry(id, 's-b', reporter, 68000), customerName: '许姐' })));
+  const command = kind === 'correction' ? '把许姐那笔改成860' : '许姐 860';
+  expect(await w.call(member, command)).toContain('改 1');
+  expect((await pending(w))[0]?.kind).toBe(kind);
+  if (selection === '改 1') {
+    await w.base.reviseEntry('selection-a', { amount: 71000 }, {
+      editorPersonId: reporter.personId, reason: 'changed after listing', createdAt: at, revisionId: 'selection-revision',
+    });
+  }
+  if (revoked) {
+    const members = membersM04();
+    members[reporter.personId]!.capabilities = ['report_self', 'progress_self'];
+    await bump(w.base, 1, policyM04(2, members));
+  }
+  await unchanged(w, member, selection, expected);
+});
 
 describe('M04 PM 例句：无标题清单直接待确认；「把刚才那笔改成600」「撤回刚才的报数」进更正流程', () => {
   it('同店代报「张姐 680（小王）」→ 待确认 → 对 → 记给小王；改成600 → 对 → 一条修订+改账通知意图；撤回 → 对 → 作废且汇总不再计入', async () => {

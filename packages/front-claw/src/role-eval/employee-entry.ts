@@ -338,6 +338,7 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
     return {
       entry: 'unified',
       replies: terminal.pass ? [] : [terminal.reply],
+      ...(terminal.access ? { access: structuredClone(terminal.access) } : {}),
       modelCalled,
       ...(terminal.ledgerSettled ? { ledgerSettled: true } : {}),
       requestId,
