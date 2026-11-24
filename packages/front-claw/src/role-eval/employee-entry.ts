@@ -123,8 +123,9 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       if (!current.allowed || actor.personId !== access.identity.personId || current.version !== access.identity.policyVersion) return false;
     }
     const storeIds = access.storeIds.length ? access.storeIds : [actor.storeId];
+    const policyVersion = access.additionalCapability ? standing(await readPolicy(options.store), actor).version ?? -1 : undefined;
     for (const capability of [access.capability, ...(access.additionalCapability ? [access.additionalCapability] : [])]) {
-      if (!(await checkGateNow(options.store, { actor, capability, storeIds, policyMode: true, platform: options.platformCapabilities, nowMs: () => options.now().getTime() })).ok) return false;
+      if (!(await checkGateNow(options.store, { actor, capability, storeIds, policyVersion, policyMode: true, platform: options.platformCapabilities, nowMs: () => options.now().getTime() })).ok) return false;
     }
     return true;
   }
