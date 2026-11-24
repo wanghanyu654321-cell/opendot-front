@@ -773,3 +773,27 @@ it.each(['明天下午三点不要帮我约张女士','明天下午三点别给�
   expect(await w.base.getConfig(key)).toBe(before);
   expect(await w.base.listDrafts()).toEqual([]);
 });
+
+it.each(['查我的预约','查一下我的预约','查看我的预约','查询我的预约','查看一下本人预约','查询一下我登记的预约'])('本人预约查询前缀 %s 保留兼容性和追问', async command => {
+  const w = await fixture();
+  expect(await w.call('m-zhao', '明天下午三点帮我预约张女士')).toContain('张女士');
+  await w.call('m-zhao', '对');
+  expect(await w.base.listAppointments()).toHaveLength(1);
+  await w.call('m-zhao', '明天李女士要来店');
+  const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+  const before = await w.base.getConfig(key);
+  expect(before).toBeTruthy();
+  expect(await w.call('m-zhao', command)).toContain('张女士');
+  expect(await w.base.getConfig(key)).toBe(before);
+});
+it.each(['查二店预约','查一下二店预约','查看二店预约','查询二店预约','查看一下二店预约','查询一下测试A店预约'])('外店预约查询前缀 %s 在任何业务读取前拒绝', async command => {
+  const w = await fixture();
+  await w.call('m-zhao', '明天李女士要来店');
+  const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+  const before = await w.base.getConfig(key);
+  expect(before).toBeTruthy();
+  w.reset();
+  expect(await w.call('m-zhao', command)).toBe('Front Claw：查不到，或你没有权限查看。');
+  expect(w.spy.reads.filter(r => ['listDrafts','listAppointments'].includes(r.method))).toEqual([]);
+  expect(await w.base.getConfig(key)).toBe(before);
+});
