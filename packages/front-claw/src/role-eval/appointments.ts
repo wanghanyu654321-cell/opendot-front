@@ -130,7 +130,7 @@ const COMMON_SURNAME = /[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高�
 /** R8（D127）：只认标准预约格式——明确「预约/约了/帮我约」等说法，可带时间。
  * 「今天+客人」类问句没有预约动词则不当预约，交给模型分类。 */
 /** 明确的预约动词。仅「今天+客人」没有钟点、没有这类动词时不当预约（D127）。 */
-const NEGATED_BOOKING = /(?:不(?:要|用|想|需要)?|别)(?:再)?(?:(?:帮|给|为|替)[\p{Script=Han}]{1,8}?)?(?:安排|登记)?(?:预约|约一下|约个)/u;
+const NEGATED_BOOKING = /(?:不(?:要|用|想|需要)?|别)(?:再)?(?:(?:帮|给|为|替)[\p{Script=Han}]{1,8}?)?(?:安排|登记)?(?:预约|约(?:一下|个|了)?)/u;
 const APPOINTMENT_CUE = /预约|约了|约一下|约个|帮我约|帮.{0,4}约|给我约|登记预约/;
 const APPOINTMENT_COACHING = /预约\s*(?:(?:客户|顾客|客人)\s*)?(?:(?:接待|沟通|流程|登记|咨询)\s*)?(?:话术|带教|演练|课件)/g;
 export const withoutAppointmentCoaching = (text: string): string => text.replace(APPOINTMENT_COACHING, '');
@@ -138,6 +138,9 @@ export const withoutAppointmentCoaching = (text: string): string => text.replace
 function positiveAppointmentText(text: string): string {
   if (!NEGATED_BOOKING.test(text)) return text;
   return text.split(/[，,。;；、！？!?]/).filter(clause => !NEGATED_BOOKING.test(clause)).join('，');
+}
+export function onlyNegatedAppointment(text: string): boolean {
+  return NEGATED_BOOKING.test(text) && !positiveAppointmentText(text).trim();
 }
 
 export function looksLikeAppointment(text: string): boolean {
