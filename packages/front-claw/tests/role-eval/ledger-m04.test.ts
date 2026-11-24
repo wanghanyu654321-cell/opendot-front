@@ -358,3 +358,24 @@ describe('M04 内存实现（MemoryPerformanceStore）与 PG 实现同语义', (
     expect((await w.base.getTarget('s-b', 'p-zhao', '2026-11'))!.amount).toBe(1);
   });
 });
+
+it.each(['progress_self', 'correct_store', null] as const)('缓存入账候选结果重验两个独立权限 revoked=%s', async revoked => {
+  const w = await worldM04({store: new MemoryPerformanceStore()});
+  const reporter = peopleM04.find(p => p.memberId === 'm-wang-yj')!;
+  await w.base.insertEntries(['composite-a','composite-b'].map(id => ({...entry(id,'s-b',reporter,68000),customerName:'许姐'})));
+  const handler = createWecomBotHandler({legacyEntry:true,mode:'isolated-synthetic',resolve:id=>w.base.getPersonByMember(id),store:w.base,now:() => NOW,send:w.send,model:{complete:w.model},employeeLoop:true,accessPolicy:true});
+  const say = (text:string,messageId:string) => handler.handleMessage({memberId:'m-wang-yj',text,messageId,sessionId:'composite',bindingVersion:1});
+  expect((await say('把许姐那笔改成860','composite-create')).replies.join('')).toContain('改 1');
+  const first = await say('入账结果','composite-query');
+  expect(first.replies.join('')).toContain('改 1');
+
+  if (revoked) {
+    const members = membersM04();
+    members[reporter.personId]!.capabilities = ['report_self','report_proxy','progress_self','correct_store','correct_own'].filter(c => c !== revoked) as NonNullable<typeof members[typeof reporter.personId]['capabilities']>;
+    await bump(w.base,1,policyM04(2,members));
+  }
+  const replay = await say('入账结果','composite-query');
+  expect(replay.duplicate).toBe(true);
+  if (revoked) expect(replay.replies).toEqual([ACCESS_DENIED]);
+  else expect(replay.replies).toEqual(first.replies);
+});

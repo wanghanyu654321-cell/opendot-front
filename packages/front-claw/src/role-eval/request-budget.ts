@@ -11,7 +11,8 @@ export interface WorkResult {
   reply: string; operationId?: string; ledgerSettled?: boolean;
   /** R1：结果来自哪个入口及其依赖的能力（缓存命中时复核用）。 */
   target?: 'store' | 'marketing';
-  access?: { capability: import('./access-policy.js').Capability | null; storeIds: string[]; identity?: { personId: string; policyVersion: number } };
+  /** A composite reply may require one more capability on the same store scope. */
+  access?: { capability: import('./access-policy.js').Capability | null; additionalCapability?: import('./access-policy.js').Capability; storeIds: string[]; identity?: { personId: string; policyVersion: number } };
 }
 export interface Terminal extends WorkResult { requestId: string; state: TerminalState; elapsedMs: number; }
 export interface BudgetRun { terminal: Terminal; duplicate: boolean; }
