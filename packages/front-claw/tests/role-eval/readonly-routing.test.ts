@@ -713,75 +713,124 @@ it.each(['和平店', '中和店', '与邻店', '邻与里店', '及第店', '�
 );
 
 it('否定预约分句仍保留肯定预约分句', () => {
-  const request = parseAppointmentRequest('不要帮我约张女士，明天下午三点帮我约李女士', NOW, 'Asia/Shanghai');
+  const request = parseAppointmentRequest(
+    '不要帮我约张女士，明天下午三点帮我约李女士',
+    NOW,
+    'Asia/Shanghai',
+  );
   expect(request).not.toBeNull();
   expect(JSON.stringify(request)).toContain('李女士');
   expect(JSON.stringify(request)).not.toContain('张女士');
 });
 it('显式二店预约查询不回退本店且保留追问', async () => {
   const w = await fixture();
-  for (const p of await w.base.listPeople()) if (p.storeId === 's-a') await w.base.savePerson({...p, storeName: '二店'});
+  for (const p of await w.base.listPeople())
+    if (p.storeId === 's-a')
+      await w.base.savePerson({ ...p, storeName: '二店' });
   await w.call('m-zhao', '明天张女士要来店');
   const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
   const before = await w.base.getConfig(key);
   w.reset();
-  expect(await w.call('m-zhao', '查二店预约')).toBe('Front Claw：查不到，或你没有权限查看。');
-  expect(w.spy.reads.filter(r => r.method === 'listAppointments')).toEqual([]);
-  expect(w.spy.reads.filter(r => r.method === 'listDrafts')).toEqual([]);
+  expect(await w.call('m-zhao', '查二店预约')).toBe(
+    'Front Claw：查不到，或你没有权限查看。',
+  );
+  expect(w.spy.reads.filter((r) => r.method === 'listAppointments')).toEqual(
+    [],
+  );
+  expect(w.spy.reads.filter((r) => r.method === 'listDrafts')).toEqual([]);
   expect(await w.base.getConfig(key)).toBe(before);
   expect(await w.call('m-zhao', '查预约')).toContain('没有登记的预约');
 });
-it.each([false, true])('身份审计采用第二次授权 gate（denied=%s）', async denied => {
-  const w = await fixture();
-  const {ACCESS_POLICY_KEY} = await import('../../src/role-eval/access-policy.js');
-  const original = w.base.getConfig.bind(w.base);
-  let reads = 0;
-  w.base.getConfig = async key => {
-    if (key === ACCESS_POLICY_KEY && ++reads >= 2) {
-      const members = membersM05();
-      if (denied) members['p-zhao']!.status = 'suspended';
-      return JSON.stringify(policyM05(2, members));
+it.each([false, true])(
+  '身份审计采用第二次授权 gate（denied=%s）',
+  async (denied) => {
+    const w = await fixture();
+    const { ACCESS_POLICY_KEY } =
+      await import('../../src/role-eval/access-policy.js');
+    const original = w.base.getConfig.bind(w.base);
+    let reads = 0;
+    w.base.getConfig = async (key) => {
+      if (key === ACCESS_POLICY_KEY && ++reads >= 2) {
+        const members = membersM05();
+        if (denied) members['p-zhao']!.status = 'suspended';
+        return JSON.stringify(policyM05(2, members));
+      }
+      return original(key);
+    };
+    const boot = await bootFrontClaw({
+      env: {},
+      employeeLoop: true,
+      accessPolicy: true,
+      now: () => NOW,
+      open: async () => ({
+        store: w.base,
+        bindings: createMemoryBindingStore(),
+        driver: 'postgres',
+        async close() {},
+      }),
+      model: { complete: w.model },
+      send: w.send,
+    });
+    const input = {
+      memberId: 'm-zhao',
+      text: '我当前实际获授权门店有哪些',
+      messageId: 'identity-advance',
+      sessionId: 'identity-audit',
+      bindingVersion: 1,
+    };
+    const result = await boot.handler.handleMessage(input);
+    const key =
+      'business-audit:v1:' +
+      createHash('sha256')
+        .update(
+          JSON.stringify([input.memberId, input.sessionId, 1, input.messageId]),
+        )
+        .digest('hex');
+    const audit = JSON.parse((await original(key))!);
+    expect(audit.policyVersion).toBe(2);
+    if (denied) {
+      expect(result.replies).toEqual([ACCESS_DENIED]);
+      expect(audit.outcome).toBe('denied');
+    } else {
+      expect(result.replies).toEqual([
+        'Front Claw：当前业务身份为员工，获授权门店：s-b。',
+      ]);
+      expect(audit.actor).toEqual({ personId: 'p-zhao', role: 'employee' });
+      expect(audit.outcome).toBe('read');
+      expect(audit.readStoreIds).toEqual([]);
     }
-    return original(key);
-  };
-  const boot = await bootFrontClaw({env: {}, employeeLoop: true, accessPolicy: true, now: () => NOW,
-    open: async () => ({store: w.base, bindings: createMemoryBindingStore(), driver: 'postgres', async close() {}}),
-    model: {complete: w.model}, send: w.send});
-  const input = {memberId:'m-zhao',text:'我当前实际获授权门店有哪些',messageId:'identity-advance',sessionId:'identity-audit',bindingVersion:1};
-  const result = await boot.handler.handleMessage(input);
-  const key = 'business-audit:v1:' + createHash('sha256').update(JSON.stringify([input.memberId,input.sessionId,1,input.messageId])).digest('hex');
-  const audit = JSON.parse((await original(key))!);
-  expect(audit.policyVersion).toBe(2);
-  if (denied) {
-    expect(result.replies).toEqual([ACCESS_DENIED]);
-    expect(audit.outcome).toBe('denied');
-  } else {
-    expect(result.replies).toEqual(['Front Claw：当前业务身份为员工，获授权门店：s-b。']);
-    expect(audit.actor).toEqual({ personId: 'p-zhao', role: 'employee' });
-    expect(audit.outcome).toBe('read');
-    expect(audit.readStoreIds).toEqual([]);
-  }
-});
+  },
+);
 
+it.each(['明天下午三点不要帮我约张女士', '明天下午三点别给我约张女士'])(
+  '否定 %s 不创建或消费预约追问',
+  async (text) => {
+    const w = await fixture();
+    await w.call('m-zhao', text);
+    expect(await w.base.listDrafts()).toEqual([]);
+    const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+    expect(await w.base.getConfig(key)).toBeNull();
+    await w.call('m-zhao', '明天李女士要来店');
+    const before = await w.base.getConfig(key);
+    expect(before).toBeTruthy();
+    await w.call('m-zhao', text);
+    expect(await w.base.getConfig(key)).toBe(before);
+    expect(await w.base.listDrafts()).toEqual([]);
+  },
+);
 
-
-it.each(['明天下午三点不要帮我约张女士','明天下午三点别给我约张女士'])('否定 %s 不创建或消费预约追问', async text => {
+it.each([
+  '查我的预约',
+  '查一下我的预约',
+  '查看我的预约',
+  '查询我的预约',
+  '查看一下本人预约',
+  '查询一下我登记的预约',
+])('本人预约查询前缀 %s 保留兼容性和追问', async (command) => {
   const w = await fixture();
-  await w.call('m-zhao', text);
-  expect(await w.base.listDrafts()).toEqual([]);
-  const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
-  expect(await w.base.getConfig(key)).toBeNull();
-  await w.call('m-zhao', '明天李女士要来店');
-  const before = await w.base.getConfig(key);
-  expect(before).toBeTruthy();
-  await w.call('m-zhao', text);
-  expect(await w.base.getConfig(key)).toBe(before);
-  expect(await w.base.listDrafts()).toEqual([]);
-});
-
-it.each(['查我的预约','查一下我的预约','查看我的预约','查询我的预约','查看一下本人预约','查询一下我登记的预约'])('本人预约查询前缀 %s 保留兼容性和追问', async command => {
-  const w = await fixture();
-  expect(await w.call('m-zhao', '明天下午三点帮我预约张女士')).toContain('张女士');
+  expect(await w.call('m-zhao', '明天下午三点帮我预约张女士')).toContain(
+    '张女士',
+  );
   await w.call('m-zhao', '对');
   expect(await w.base.listAppointments()).toHaveLength(1);
   await w.call('m-zhao', '明天李女士要来店');
@@ -791,14 +840,294 @@ it.each(['查我的预约','查一下我的预约','查看我的预约','查询�
   expect(await w.call('m-zhao', command)).toContain('张女士');
   expect(await w.base.getConfig(key)).toBe(before);
 });
-it.each(['查二店预约','查一下二店预约','查看二店预约','查询二店预约','查看一下二店预约','查询一下测试A店预约'])('外店预约查询前缀 %s 在任何业务读取前拒绝', async command => {
+it.each([
+  '查二店预约',
+  '查一下二店预约',
+  '查看二店预约',
+  '查询二店预约',
+  '查看一下二店预约',
+  '查询一下测试A店预约',
+])('外店预约查询前缀 %s 在任何业务读取前拒绝', async (command) => {
   const w = await fixture();
   await w.call('m-zhao', '明天李女士要来店');
   const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
   const before = await w.base.getConfig(key);
   expect(before).toBeTruthy();
   w.reset();
-  expect(await w.call('m-zhao', command)).toBe('Front Claw：查不到，或你没有权限查看。');
-  expect(w.spy.reads.filter(r => ['listDrafts','listAppointments'].includes(r.method))).toEqual([]);
+  expect(await w.call('m-zhao', command)).toBe(
+    'Front Claw：查不到，或你没有权限查看。',
+  );
+  expect(
+    w.spy.reads.filter((r) =>
+      ['listDrafts', 'listAppointments'].includes(r.method),
+    ),
+  ).toEqual([]);
   expect(await w.base.getConfig(key)).toBe(before);
+});
+
+describe('企微实测只读自然问法泛化回归', () => {
+  it.each([
+    '我今天已经登记的预约有哪些？',
+    '帮我查看我接下来已有的预约记录。',
+    '我接下来有哪些已登记的预约？',
+    '查看我明天的预约记录',
+  ])('已有预约查询 %s 不进入新建预约流程', (text) => {
+    expect(looksLikeAppointment(text)).toBe(false);
+    expect(
+      parseAppointmentRequest(
+        text,
+        new Date('2026-11-12T02:00:00Z'),
+        'Asia/Shanghai',
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    '我这个月的个人业绩进度怎么样？',
+    '我不预约，只想查我这个月的个人业绩进度。',
+    '不报单、不预约，帮我查一下我本月的个人业绩进度。',
+  ])(
+    '个人业绩进度与前置否定预约 %s 确定性只读返回本人进度且保留追问',
+    async (text) => {
+      const w = await fixture();
+      await w.call('m-zhao', '明天李女士要来店');
+      const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+      const before = await w.base.getConfig(key);
+      expect(before).toBeTruthy();
+      w.reset();
+      const reply = await w.call('m-zhao', text);
+      expect(reply).toContain('900');
+      expect(w.entryStores()).toEqual(['s-b']);
+      expect(
+        w.spy.reads.filter((r) =>
+          /^(?:setConfig|putOperationRecord|compareAndSetPendingAsk|savePendingReport|insertEntries|saveDraft|createDraft)$/.test(
+            r.method,
+          ),
+        ),
+      ).toEqual([]);
+      expect(await w.base.getConfig(key)).toBe(before);
+    },
+  );
+
+  it('今日与后续已有预约自然查询按日期范围只读返回，不写追问也不消费已有追问', async () => {
+    const w = await fixture();
+    const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+    w.reset();
+    expect(await w.call('m-zhao', '我今天已经登记的预约有哪些？')).toBe(
+      'Front Claw：你这天没有登记的预约。',
+    );
+    expect(await w.call('m-zhao', '帮我查看我接下来已有的预约记录。')).toBe(
+      'Front Claw：你今天及以后没有登记的预约。',
+    );
+    expect(
+      w.spy.reads.filter((r) =>
+        /^(?:setConfig|putOperationRecord|compareAndSetPendingAsk)$/.test(
+          r.method,
+        ),
+      ),
+    ).toEqual([]);
+    expect(await w.base.getConfig(key)).toBeNull();
+
+    // 登记一条明天（11-13）预约，再挂起一条待补时间追问
+    expect(await w.call('m-zhao', '明天下午三点帮我预约张女士')).toContain(
+      '张女士',
+    );
+    await w.call('m-zhao', '对');
+    await w.call('m-zhao', '后天陈女士要来店');
+    const pendingAsk = await w.base.getConfig(key);
+    expect(pendingAsk).toBeTruthy();
+
+    w.reset();
+    // 问“今天”不应把明天的张女士混进来，且不消费待补时间追问
+    expect(await w.call('m-zhao', '我今天已经登记的预约有哪些？')).toBe(
+      'Front Claw：你这天没有登记的预约。',
+    );
+    // 问“接下来”应返回明天的张女士，且仍保留待补时间追问
+    const upcoming = await w.call('m-zhao', '帮我查看我接下来已有的预约记录。');
+    expect(upcoming).toContain('张女士');
+    expect(
+      w.spy.reads.filter((r) =>
+        /^(?:setConfig|putOperationRecord|compareAndSetPendingAsk)$/.test(
+          r.method,
+        ),
+      ),
+    ).toEqual([]);
+    expect(await w.base.getConfig(key)).toBe(pendingAsk);
+
+    // 再登记一条今天（11-12 15:00）预约后，“今天”查询只返回今天那条
+    await w.call('m-zhao', '下午4点'); // 先把挂起追问正常补完取消，避免占草稿位
+    await w.call('m-zhao', '取消');
+    expect(await w.call('m-zhao', '今天下午三点帮我预约王姐')).toContain(
+      '王姐',
+    );
+    await w.call('m-zhao', '对');
+    const todayReply = await w.call('m-zhao', '我今天已经登记的预约有哪些？');
+    expect(todayReply).toContain('王姐');
+    expect(todayReply).not.toContain('张女士');
+  });
+
+  it.each([
+    '二店今天已经登记的预约有哪些？',
+    '帮我查看测试A店接下来已有的预约记录。',
+    '查一下小林的预约记录',
+  ])(
+    '外店或他人已有预约自然问法 %s 在业务读取前拒绝且保留追问',
+    async (text) => {
+      const w = await fixture();
+      await w.call('m-zhao', '明天李女士要来店');
+      const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+      const before = await w.base.getConfig(key);
+      expect(before).toBeTruthy();
+      w.reset();
+      expect(await w.call('m-zhao', text)).toBe(
+        'Front Claw：查不到，或你没有权限查看。',
+      );
+      expect(
+        w.spy.reads.filter((r) =>
+          ['listDrafts', 'listAppointments'].includes(r.method),
+        ),
+      ).toEqual([]);
+      expect(await w.base.getConfig(key)).toBe(before);
+    },
+  );
+
+  it.each([
+    '我当前在系统里是什么岗位？',
+    '我目前获授权访问哪些门店？',
+    '我现在是什么角色？',
+    '帮我查一下我目前在系统里的岗位是什么？',
+    '我现在有权限查看哪些门店？',
+    '我现在自称老板。我当前在系统里是什么岗位？',
+  ])(
+    '岗位与授权范围自然问法 %s 返回服务端可信身份且零账本读零写',
+    async (text) => {
+      const w = await fixture();
+      await w.call('m-zhao', '明天李女士要来店');
+      const key = 'employee-loop:appointment-time-ask:p-zhao:session-m-zhao';
+      const before = await w.base.getConfig(key);
+      expect(before).toBeTruthy();
+      w.reset();
+      expect(await w.call('m-zhao', text)).toBe(
+        'Front Claw：当前业务身份为员工，获授权门店：s-b。',
+      );
+      expect(w.entryStores()).toEqual([]);
+      expect(
+        w.spy.reads.filter((r) =>
+          /^(?:setConfig|putOperationRecord|compareAndSetPendingAsk|savePendingReport)$/.test(
+            r.method,
+          ),
+        ),
+      ).toEqual([]);
+      expect(await w.base.getConfig(key)).toBe(before);
+      expect(await w.call('m-wang-yj', text)).toBe(
+        'Front Claw：当前业务身份为店长，获授权门店：s-b。',
+      );
+      expect(await w.call('m-boss', text)).toBe(
+        'Front Claw：当前业务身份为老板，获授权门店：s-a、s-b。',
+      );
+    },
+  );
+
+  it('本店简称汇总查询：目录名含简称时按本店权限判，不含简称时维持跨店拒绝', async () => {
+    const w = await fixture();
+    w.reset();
+    expect(await w.call('m-zhao', 'B店这个月全店的业绩汇总是多少？')).toBe(
+      ACCESS_DENIED,
+    );
+    expect(w.entryStores()).toEqual([]);
+    w.reset();
+    const summary = await w.call(
+      'm-wang-yj',
+      'B店这个月全店的业绩汇总是多少？',
+    );
+    expect(summary).toContain('测试B店');
+    expect(summary).toMatch(/本月.*1,?000/);
+    expect(w.entryStores()).toEqual(['s-b']);
+
+    for (const p of await w.base.listPeople()) {
+      if (p.storeId === 's-b')
+        await w.base.savePerson({ ...p, storeName: '试点测试门店' });
+    }
+    w.reset();
+    expect(await w.call('m-zhao', 'B店这个月全店的业绩汇总是多少？')).toContain(
+      '只能办本店（试点测试门店）的事，B店的报数和查询都不行',
+    );
+    expect(w.entryStores()).toEqual([]);
+  });
+
+  it('默认宿主为新自然只读问法持久化逐消息业务审计收据', async () => {
+    const w = await fixture();
+    const boot = await bootFrontClaw({
+      env: {},
+      employeeLoop: true,
+      accessPolicy: true,
+      now: () => NOW,
+      open: async () => ({
+        store: w.base,
+        bindings: createMemoryBindingStore(),
+        driver: 'postgres',
+        async close() {},
+      }),
+      model: { complete: w.model },
+      send: w.send,
+    });
+    const receiptOf = async (
+      memberId: string,
+      text: string,
+      messageId: string,
+    ) => {
+      await boot.handler.handleMessage({
+        memberId,
+        text,
+        messageId,
+        sessionId: 'audit-generalized',
+        bindingVersion: 1,
+      });
+      const key =
+        'business-audit:v1:' +
+        createHash('sha256')
+          .update(JSON.stringify([memberId, 'audit-generalized', 1, messageId]))
+          .digest('hex');
+      return JSON.parse((await w.base.getConfig(key))!);
+    };
+    expect(
+      await receiptOf('m-zhao', '我今天已经登记的预约有哪些？', 'q07-audit'),
+    ).toMatchObject({
+      actor: { personId: 'p-zhao', role: 'employee' },
+      policyVersion: 1,
+      targetStoreId: 's-b',
+      readStoreIds: ['s-b'],
+      writes: [],
+      attemptedWrites: [],
+      outcome: 'read',
+    });
+    expect(
+      await receiptOf(
+        'm-zhao',
+        '帮我查看测试A店接下来已有的预约记录。',
+        'q08-foreign-audit',
+      ),
+    ).toMatchObject({
+      actor: { personId: 'p-zhao', role: 'employee' },
+      policyVersion: 1,
+      targetStoreId: null,
+      targetDigest: createHash('sha256').update('测试A店').digest('hex'),
+      readStoreIds: [],
+      writes: [],
+      attemptedWrites: [],
+      outcome: 'denied',
+    });
+    expect(
+      await receiptOf('m-zhao', '我当前在系统里是什么岗位？', 'q04-audit'),
+    ).toMatchObject({
+      actor: { personId: 'p-zhao', role: 'employee' },
+      policyVersion: 1,
+      targetStoreId: null,
+      readStoreIds: [],
+      writes: [],
+      attemptedWrites: [],
+      outcome: 'read',
+    });
+    await boot.close();
+  });
 });
