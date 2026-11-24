@@ -293,6 +293,30 @@ it('rebuilds the single synthetic baseline without retaining older enterprise or
   expect(policy.version).toBe(4);
 });
 
+it('allows the child database owner with a session-specific equality operator', async () => {
+  await pool.query('CREATE SCHEMA synthetic_operator_test');
+  try {
+    await pool.query(
+      'CREATE FUNCTION synthetic_operator_test.different_oid(pg_catalog.oid, pg_catalog.oid) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT false $$',
+    );
+    await pool.query(
+      'CREATE OPERATOR synthetic_operator_test.= (LEFTARG = pg_catalog.oid, RIGHTARG = pg_catalog.oid, FUNCTION = synthetic_operator_test.different_oid)',
+    );
+    await control.query(
+      `ALTER DATABASE "${database}" SET search_path TO synthetic_operator_test, pg_catalog, public`,
+    );
+    await expect(resetBaseline()).resolves.toMatchObject({
+      changed: true,
+      after: { tier: 'manager', version: 3 },
+    });
+  } finally {
+    await control.query(`ALTER DATABASE "${database}" RESET search_path`);
+    await pool.query('DROP OPERATOR IF EXISTS synthetic_operator_test.= (pg_catalog.oid, pg_catalog.oid)');
+    await pool.query('DROP FUNCTION IF EXISTS synthetic_operator_test.different_oid(pg_catalog.oid, pg_catalog.oid)');
+    await pool.query('DROP SCHEMA synthetic_operator_test');
+  }
+});
+
 it.each([
   'postgresql://127.0.0.1/postgres',
   'postgresql://db.example/synthetic_pilot_switch_test',
