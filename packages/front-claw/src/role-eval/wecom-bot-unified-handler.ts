@@ -79,7 +79,7 @@ export interface HandleResult {
   requestId?: string; state?: 'completed' | 'failed' | 'timeout' | 'cancelled';
   target?: 'store' | 'chitchat' | 'marketing' | 'marketing-unavailable' | 'clarify'; duplicate?: boolean;
   /** R1：这条回复依赖的能力与门店（缓存命中/重放时按当前权限复核用）。capability=null 表示只要求有效身份。 */
-  access?: { capability: import('./access-policy.js').Capability | null; storeIds: string[] };
+  access?: import('./request-budget.js').WorkResult['access'];
 }
 
 const ASK = `${FRONT_CLAW}：这句还缺日期、金额或员工，请补全后再发。我不会猜。`;
