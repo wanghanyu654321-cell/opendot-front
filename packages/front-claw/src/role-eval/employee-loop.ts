@@ -1112,7 +1112,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       if (requested?.kind === 'existing') {
         text = requested.command;
         // Reject unsupported explicit appointment scope before reading pending state.
-        if (/^查.*预约$/.test(text) && !/^(?:查预约|查我的预约|查本人预约|查我登记的预约)$/.test(text)) return NOT_FOUND_OR_DENIED;
+        if (/^查.*预约$/.test(text) && !/^查(?:看|询)?(?:一下)?(?:预约|我的预约|本人预约|我登记的预约)$/.test(text)) return NOT_FOUND_OR_DENIED;
       }
       if (requested?.kind === 'unsupported') return 'Front Claw：暂不支持这项只读查询。';
       if (requested?.kind === 'managed') {
