@@ -300,10 +300,13 @@ async function executePilotSwitch(
     await query("SET LOCAL lock_timeout = '3s'");
     await query("SET LOCAL statement_timeout = '10s'");
     if (baseline) {
-      const { rows } = await query<{ name: string }>(
-        'SELECT current_database() AS name',
+      const { rows } = await query<{ name: string; owned: boolean }>(
+        'SELECT datname AS name, datdba = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned FROM pg_database WHERE datname = current_database()',
       );
-      if (!/^synthetic_pilot_switch_[a-z0-9_]+$/.test(rows[0]?.name ?? ''))
+      if (
+        !rows[0]?.owned ||
+        !/^synthetic_pilot_switch_[a-z0-9_]+$/.test(rows[0].name)
+      )
         throw Error('pilot_isolated_database_required');
     }
     const config: Record<string, string | null> = {};

@@ -888,6 +888,7 @@ export function createWeComConnection(
     if (closed && !client && !leaseCheckTimer && !leaseRenewTimer) return;
     stopping = true;
     closed = true;
+    admittedScopes.clear();
 
     if (leaseCheckTimer) {
       clearInterval(leaseCheckTimer);

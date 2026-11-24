@@ -312,3 +312,23 @@ it.each([
     ),
   ).rejects.toThrow('pilot_isolated_database_required');
 });
+
+it('refuses synthetic reset by a fully privileged role that does not own the child database', async () => {
+  const owner = 'reset_owner_' + randomUUID().replaceAll('-', '');
+  const { rows } = await control.query<{ role: string }>(
+    'SELECT current_user AS role',
+  );
+  const original = rows[0]!.role.replaceAll('"', '""');
+  await control.query(`CREATE ROLE "${owner}" NOLOGIN`);
+  try {
+    await control.query(`ALTER DATABASE "${database}" OWNER TO "${owner}"`);
+    const before = await snapshot();
+    await expect(resetBaseline()).rejects.toThrow(
+      'pilot_isolated_database_required',
+    );
+    expect(await snapshot()).toEqual(before);
+  } finally {
+    await control.query(`ALTER DATABASE "${database}" OWNER TO "${original}"`);
+    await control.query(`DROP ROLE "${owner}"`);
+  }
+});

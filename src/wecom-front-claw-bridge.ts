@@ -1210,20 +1210,19 @@ export function createModelClassifierFromOpenDotConfig(
   };
 }
 
-function isM03OrPermissionDenial(
+function canonicalDenial(
   result: RoutedResult,
   mods: FrontClawModules,
-): boolean {
-  if (result.target === 'marketing-unavailable') return true;
-  const combined = result.replies.join('\n');
-  if (!combined) return false;
-  return (
-    combined.includes(mods.loop.ACCESS_DENIED) ||
-    combined.includes(mods.loop.DENIED) ||
-    combined.includes(mods.entry.MARKETING_UNAVAILABLE) ||
-    combined.includes(mods.loop.STALE_CONSUMER) ||
-    combined.startsWith('Front Claw：不能做——')
-  );
+): string | undefined {
+  if (result.target === 'marketing-unavailable')
+    return mods.entry.MARKETING_UNAVAILABLE;
+  if (result.replies.length !== 1) return undefined;
+  return [
+    mods.loop.ACCESS_DENIED,
+    mods.loop.DENIED,
+    mods.entry.MARKETING_UNAVAILABLE,
+    mods.loop.STALE_CONSUMER,
+  ].find((reply) => reply && reply === result.replies[0]);
 }
 
 async function resolveDbWorkspaceProfileSnapshot(
@@ -2000,27 +1999,13 @@ export async function createWeComFrontClawBridge(
       };
     }
 
-    if (result.state && result.state !== 'completed') {
-      return {
-        kind: 'failed',
-        replies:
-          result.replies.length > 0
-            ? result.replies
-            : [BRIDGE_EXECUTION_FAILED_REPLY],
-      };
-    }
+    const denial = canonicalDenial(result, mods);
+    if (denial) return { kind: 'failed', replies: [denial] };
 
-    if (isM03OrPermissionDenial(result, mods)) {
-      return {
-        kind: 'failed',
-        replies:
-          result.replies.length > 0
-            ? result.replies
-            : [mods.loop.ACCESS_DENIED],
-      };
-    }
-
-    if (result.pass === true) {
+    if (
+      result.pass === true &&
+      (!result.state || result.state === 'completed')
+    ) {
       const actor = await refreshPerson();
       if (!actor) {
         return {
@@ -2199,11 +2184,19 @@ export async function createWeComFrontClawBridge(
         )
       );
     };
+    // A refusal may contain directory names. Its presentation never exempts it from the gate.
+    const failed =
+      (result.state !== undefined && result.state !== 'completed') ||
+      result.replies.some((reply) => reply.startsWith('Front Claw：不能做——'));
     return {
-      kind: 'handled',
-      ...(proof || result.target === 'store' ? { authorizeReply } : {}),
+      kind: failed ? 'failed' : 'handled',
+      ...(proof || failed || result.target === 'store'
+        ? { authorizeReply }
+        : {}),
       replies:
-        result.replies.length > 0 ? result.replies : [mods.entry.CLARIFY_REPLY],
+        result.replies.length > 0
+          ? result.replies
+          : [failed ? BRIDGE_EXECUTION_FAILED_REPLY : mods.entry.CLARIFY_REPLY],
     };
   }
 

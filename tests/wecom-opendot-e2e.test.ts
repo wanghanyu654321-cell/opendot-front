@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import type { WsFrame } from '@wecom/aibot-node-sdk';
+import { ACCESS_DENIED } from '../packages/front-claw/src/role-eval/employee-loop.js';
 import {
   afterAll,
   afterEach,
@@ -674,19 +675,93 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     );
   });
 
-  test.each(['transfer', 'revoke-read', 'narrow-stores'])(
+  test.each([
+    ['transfer', '经营汇总', '测试B店'],
+    ['revoke-read', '经营汇总', '测试B店'],
+    ['narrow-stores', '门店排名', 's-a'],
+    ['mixed-denial', '经营汇总', ACCESS_DENIED],
+    ['mixed-valid', '经营汇总', ACCESS_DENIED],
+    ['target-valid', '给小赵定本月目标3万', '已经是 30000元'],
+    ['target-revoked', '给小赵定本月目标3万', '已经是 30000元'],
+    ['store-target-valid', '给本店定本月目标3万', '已经是 30000元'],
+    ['store-target-revoked', '给本店定本月目标3万', '已经是 30000元'],
+    ['picker-valid', '把许姐那笔改成860', '小赵'],
+    ['picker-revoked', '把许姐那笔改成860', '小赵'],
+    ['picker-confirm-valid', '对', '小赵'],
+    ['picker-confirm-revoked', '对', '小赵'],
+    ['picker-query-revoked', '入账结果', '小赵'],
+  ])(
     'holds a completed business read until its authority is rechecked at SDK reply (%s)',
-    async (change) => {
+    async (change, query, expected) => {
       const now = () => new Date('2026-11-12T06:00:00Z');
       const world = await createSeededMemoryWorld(now);
+      const targetRead = change.includes('target');
+      const picker = change.startsWith('picker-');
+      const allowed = change.endsWith('-valid');
+      if (picker) {
+        await world.store.insertEntries(
+          [68000, 56000].map((amount, i) => ({
+            entryId: 'pick-' + i,
+            storeId: 's-b',
+            businessDay: '2026-11-12',
+            ownerPersonId: 'p-zhao',
+            ownerName: '小赵',
+            reporterPersonId: 'p-zhao',
+            customerName: '许姐',
+            amount,
+            amountType: 'consultant',
+            note: '',
+            status: 'confirmed',
+            disputed: false,
+            createdAt: '2026-11-12T03:00:00Z',
+          })),
+        );
+      }
+      if (targetRead) {
+        const target = {
+          storeId: 's-b',
+          periodMonth: '2026-11',
+          amount: 3000000,
+          updatedAt: now().toISOString(),
+        };
+        if (change.startsWith('store-target-'))
+          await world.store.saveStoreTarget({ ...target, setBy: 'p-wang' });
+        else
+          await world.store.saveTarget({
+            ...target,
+            personId: 'p-zhao',
+            updatedBy: 'p-wang',
+          });
+      }
+      if (change.startsWith('mixed-')) {
+        for (const person of await world.store.listPeople()) {
+          await world.store.savePerson({
+            ...person,
+            storeName: '测试B店 ' + ACCESS_DENIED,
+          });
+        }
+      }
       if (change === 'narrow-stores') {
         const person = (await world.store.getPerson('p-wang'))!;
-        await world.store.savePerson({...person, tier: 'owner'});
+        await world.store.savePerson({ ...person, tier: 'owner' });
         const policy = buildPolicy(2);
-        policy.members['p-wang'] = {role: 'owner', storeIds: ['s-b', 's-a'], status: 'active'};
+        policy.members['p-wang'] = {
+          role: 'owner',
+          storeIds: ['s-b', 's-a'],
+          status: 'active',
+        };
         policy.stores['s-a'] = [...CAPABILITIES];
-        expect((await updateAccessPolicy(world.store, { expectedVersion: 1, next: policy,
-          actor: 'test-admin', reason: 'authorize two stores', at: now().toISOString()})).ok).toBe(true);
+        expect(
+          (
+            await updateAccessPolicy(world.store, {
+              expectedVersion: 1,
+              next: policy,
+              actor: 'test-admin',
+              reason: 'authorize two stores',
+              at: now().toISOString(),
+            })
+          ).ok,
+        ).toBe(true);
       }
       const offline = createOfflineWsClient();
       const imManager = new IMConnectionManager();
@@ -701,20 +776,25 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
               precheck: async (event) => {
                 const result = await config.precheck!(event);
                 if (event.messageId === 'read-before-transfer') {
-                  if (result.kind !== 'handled')
-                    throw Error('expected a handled business read');
+                  if (result.kind === 'pass')
+                    throw Error('expected a business reply');
                   original = result.replies.join('');
                   const person = (await world.store.getPerson('p-wang'))!;
                   if (change === 'transfer')
                     await world.store.savePerson({ ...person, storeId: 's-a' });
-                  else {
+                  else if (!allowed) {
                     const policy = JSON.parse(
                       (await world.store.getConfig('front-claw-access'))!,
                     ) as AccessPolicy;
                     const next = structuredClone(policy);
                     next.version++;
-                    if (change === 'narrow-stores') next.members['p-wang']!.storeIds = ['s-b'];
-                    else next.members['p-wang']!.capabilities = ['progress_self', 'marketing'];
+                    if (change === 'narrow-stores')
+                      next.members['p-wang']!.storeIds = ['s-b'];
+                    else
+                      next.members['p-wang']!.capabilities = [
+                        'progress_self',
+                        'marketing',
+                      ];
                     expect(
                       (
                         await updateAccessPolicy(world.store, {
@@ -769,15 +849,27 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         await runtime!.close();
         await imManager.disconnectAll();
       });
+      if (picker && query !== '把许姐那笔改成860') {
+        offline.emitInboundText({
+          reqId: 'open-picker',
+          msgid: 'open-picker',
+          corpid: CORP_ID,
+          userid: 'm-wang-yj',
+          content: '把许姐那笔改成860',
+        });
+        await waitUntil(() =>
+          offline.sent.some((frame) => frame.headers.req_id === 'open-picker'),
+        );
+      }
       offline.emitInboundText({
         reqId: 'read-before-transfer',
         msgid: 'read-before-transfer',
         corpid: CORP_ID,
         userid: 'm-wang-yj',
-        content: change === 'narrow-stores' ? '门店排名' : '经营汇总',
+        content: query,
       });
       await waitUntil(() => original.length > 0);
-      expect(original).toContain(change === 'narrow-stores' ? 's-a' : '测试B店');
+      expect(original).toContain(expected);
       offline.emitInboundText({
         reqId: 'unbound-feedback',
         msgid: 'unbound-feedback',
@@ -798,7 +890,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
               (frame.body as { stream?: { content?: string } }).stream
                 ?.content === original,
           ),
-      ).toBe(false);
+      ).toBe(allowed);
     },
   );
 
@@ -3643,6 +3735,7 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     const sent = () =>
       offline.sent.filter((frame) => frame.cmd === WsCmd.SEND_MSG).length;
     const before = sent();
+    offline.client.connect();
     expect((await deliverOriginal('manager_ops')).status).toBe('failed');
     expect(
       (
