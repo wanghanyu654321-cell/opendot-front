@@ -6,7 +6,7 @@ import { createRequestBudget, type TerminalState, type WorkResult } from './requ
 import { createRouteLog, type RouteLogRecord } from './route-log.js';
 import type { EmployeeMessage, EmployeeLoopResult, PreflightReply } from './employee-loop.js';
 import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-handler.js';
-import type { Capability } from './access-policy.js';
+import { readPolicy, standing, type Capability } from './access-policy.js';
 import { checkGateNow } from './commit-gate.js';
 import { ACCESS_DENIED, REPORT_HINT, appointmentAskKey, appointmentTimeAskKey, isExplicitConfirmCommand } from './employee-loop.js';
 import { parseAddNewChoice, parseAskManagerChoice, parseCorrectionPick, parseCorrectionCommand, parseTargetCommand } from './ledger-commands.js';
@@ -114,12 +114,16 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
     return gate.ok ? actor : null;
   }
   /** R1（M03-04）：缓存命中/重复到达时，按当前权限复核原回复依赖的能力。 */
-  async function stillAllowed(memberId: string, access: { capability: Capability | null; storeIds: string[] }): Promise<boolean> {
+  async function stillAllowed(memberId: string, access: NonNullable<WorkResult['access']>): Promise<boolean> {
     if (options.accessPolicy !== true) return true;
     const actor = await options.store.getPersonByMember(memberId);
     if (!actor) return false;
     const storeIds = access.storeIds.length ? access.storeIds : [actor.storeId];
-    return (await checkGateNow(options.store, { actor, capability: access.capability, storeIds, policyMode: true, platform: options.platformCapabilities, nowMs: () => options.now().getTime() })).ok;
+    const policyVersion = access.additionalCapability ? standing(await readPolicy(options.store), actor).version ?? -1 : undefined;
+    for (const capability of [access.capability, ...(access.additionalCapability ? [access.additionalCapability] : [])]) {
+      if (!(await checkGateNow(options.store, { actor, capability, storeIds, policyVersion, policyMode: true, platform: options.platformCapabilities, nowMs: () => options.now().getTime() })).ok) return false;
+    }
+    return true;
   }
 
   /** R3：越权/跨店判定。身份按当前人员行；能力与入账门同一判定（非策略模式按档位：员工档无查他人/全店能力）。 */
@@ -329,6 +333,7 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
     return {
       entry: 'unified',
       replies: terminal.pass ? [] : [terminal.reply],
+      ...(terminal.access ? { access: structuredClone(terminal.access) } : {}),
       modelCalled,
       ...(terminal.ledgerSettled ? { ledgerSettled: true } : {}),
       requestId,

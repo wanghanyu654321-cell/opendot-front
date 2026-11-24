@@ -285,7 +285,19 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   /** M04：草稿所需能力与门店（确认前、提交事务内都按最新策略重判）。 */
   function needs(draft: Draft): { capability: Capability; storeIds: string[] } {
     if (draft.payload.type === 'target') return { capability: 'target_set', storeIds: [draft.payload.target.storeId] };
-    if (draft.payload.type === 'correction') return { capability: draft.payload.scope === 'own' ? 'correct_own' : 'correct_store', storeIds: [...new Set(draft.payload.changes.map(change => change.storeId))] };
+    if (draft.payload.type === 'correction') {
+      const { scope, changes, awaitingPick } = draft.payload;
+      if (awaitingPick) {
+        // Legacy drafts always stored scope=own. Only their exact own-query
+        // reason formats establish that an all-own list came from an own query.
+        const ownLookup = awaitingPick.sourceScope === 'own' ||
+          (awaitingPick.sourceScope === undefined &&
+            /^(?:没有找到客户「[^」\r\n]+」今天由你报的记录。|「[^」\r\n]+」今天由你报的有 \d+ 笔，(?:金额都是 [\d.]+元，)?不能确定是哪一笔。)$/.test(awaitingPick.reason));
+        const storeWide = scope === 'store' || !ownLookup || awaitingPick.listed.some(row => row.visibility !== 'own');
+        return { capability: storeWide ? 'correct_store' : 'correct_own', storeIds: [draft.storeId] };
+      }
+      return { capability: scope === 'own' ? 'correct_own' : 'correct_store', storeIds: [...new Set(changes.map(change => change.storeId))] };
+    }
     if (draft.payload.type === 'appointment') return { capability: 'appointment_submit', storeIds: [draft.storeId] };
     return { capability: capFor(draft), storeIds: [draft.storeId] };
   }
@@ -725,9 +737,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     return undefined;
   }
   /** M04：按策略算出可用门店，再只在这些门店里按名字匹配在职完整人员；无权者不读目录。 */
-  async function findInStores(actor: Person, capability: Capability, name: string): Promise<Person | string> {
+  async function findInStores(actor: Person, capability: Capability, name: string, tag: Tag): Promise<Person | string> {
     const stores = await authorizedStores(store, actor, capability, platform);
     if (!stores.length) return ACCESS_DENIED;
+    tag.access = { capability, storeIds: [...stores] };
     const people = await store.listPeople();
     const found: Person[] = [];
     for (const storeId of stores) {
@@ -751,7 +764,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     return draft;
   }
   /** M04 目标：只生成草稿（回显姓名/门店/周期/金额/原值），「对」后才写。 */
-  async function targetDraft(actor: Person, command: Exclude<ReturnType<typeof parseTargetCommand>, null>, input: EmployeeMessage, fingerprint: string, today: string): Promise<Draft | string> {
+  async function targetDraft(actor: Person, command: Exclude<ReturnType<typeof parseTargetCommand>, null>, input: EmployeeMessage, fingerprint: string, today: string, tag: Tag): Promise<Draft | string> {
     if (command === 'invalid') return 'Front Claw：目标没说清。请按「给小赵定本月目标3万」或「本月目标 5w」发，金额支持 30000 / 3万 / 5w。没有写入。';
     const peopleNow = await store.listPeople();
     const namedStore = command.personName === null ? null
@@ -761,6 +774,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     if (namedStore) {
       if (!await can(actor, 'target_set', namedStore.storeId)) return ACCESS_DENIED;
       if (command.periodMonth < monthKey(today)) return 'Front Claw：只能设本月或以后的目标，没有写入。';
+      tag.access = { capability: 'target_set', storeIds: [namedStore.storeId] };
       const current = await store.getStoreTarget(namedStore.storeId, command.periodMonth);
       if (current?.amount === command.amount) return `Front Claw：${namedStore.storeName} ${command.periodMonth} 门店月目标已经是 ${formatYuan(command.amount)}元，没有变化，没有写入。`;
       return ledgerDraft('target', actor, input, today, {
@@ -774,11 +788,12 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       if (!await can(actor, 'target_set', actor.storeId)) return ACCESS_DENIED;
       person = actor;
     } else {
-      const found = await findInStores(actor, 'target_set', command.personName);
+      const found = await findInStores(actor, 'target_set', command.personName, tag);
       if (typeof found === 'string') return found;
       person = found;
     }
     if (command.periodMonth < monthKey(today)) return 'Front Claw：只能设本月或以后的目标，没有写入。';
+    tag.access = { capability: 'target_set', storeIds: [person.storeId] };
     const current = await store.getTarget(person.storeId, person.personId, command.periodMonth);
     if (current?.amount === command.amount) return `Front Claw：${person.displayName} ${command.periodMonth} 月目标已经是 ${formatYuan(command.amount)}元，没有变化，没有写入。`;
     return ledgerDraft('target', actor, input, today, {
@@ -810,6 +825,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     }
     return { ...base, visibility: 'peer-redacted' as const };
   }
+  function selectedCorrectionAccess(entry: LedgerEntry, actor: Person): { scope: CorrectionPayload['scope']; capability: Capability } {
+    const own = entry.reporterPersonId === actor.personId && entry.businessDay === businessDate(now(), cutoff, timeZone) && entry.storeId === actor.storeId;
+    return own ? { scope: 'own', capability: 'correct_own' } : { scope: 'store', capability: 'correct_store' };
+  }
   function changesFrom(rows: readonly LedgerEntry[], command: Exclude<ReturnType<typeof parseCorrectionCommand>, null | 'invalid'>): CorrectionChange[] {
     return rows.map(row => ({
       entryId: row.entryId, storeId: row.storeId, businessDay: row.businessDay, ownerPersonId: row.ownerPersonId, ownerName: row.ownerName,
@@ -823,18 +842,20 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
    * 说了原金额则作附加核对（不符则拒绝）；0 或多项列出今天已报请「改 N」。
    * 无人名「刚才那笔」仍按本人最近批次（既有口径）。
    */
-  async function correctionDraft(actor: Person, command: Exclude<ReturnType<typeof parseCorrectionCommand>, null>, input: EmployeeMessage, fingerprint: string, today: string): Promise<Draft | string> {
+  async function correctionDraft(actor: Person, command: Exclude<ReturnType<typeof parseCorrectionCommand>, null>, input: EmployeeMessage, fingerprint: string, today: string, tag: Tag): Promise<Draft | string> {
     if (command === 'invalid') return 'Front Claw：改账没说清。请说「把刚才那笔改成600」「把刚才第2笔改成600」或「把许姐那笔改成860」。没有写入。';
-    const pickDraft = (listed: LedgerEntry[], reason: string, amount: number): Draft => {
-      const awaitingPick = { newAmount: amount, listed: listed.map((row, i) => toPickItem(row, i + 1, actor)), reason };
+    const pickDraft = (listed: LedgerEntry[], reason: string, amount: number, scope: CorrectionPayload['scope']): Draft => {
+      const awaitingPick = { sourceScope: scope, newAmount: amount, listed: listed.map((row, i) => toPickItem(row, i + 1, actor)), reason };
       return ledgerDraft('correction', actor, input, today, {
-        type: 'correction', employeeContext: contextFor(actor, input, fingerprint), action: 'amend', scope: 'own', changes: [], awaitingPick,
+        type: 'correction', employeeContext: contextFor(actor, input, fingerprint), action: 'amend', scope, changes: [], awaitingPick,
       });
     };
     let rows: LedgerEntry[];
     if (command.customerName) {
       if (!await can(actor, 'correct_own') && !await can(actor, 'correct_store')) return ACCESS_DENIED;
       const canStore = await can(actor, 'correct_store', actor.storeId);
+      const scope = canStore ? 'store' : 'own';
+      tag.access = { capability: canStore ? 'correct_store' : 'correct_own', storeIds: [actor.storeId] };
       const todayRows = (await store.listEntries({ storeId: actor.storeId, businessDay: today, status: 'confirmed' }))
         .filter(row => row.status === 'confirmed' && row.storeId === actor.storeId && (canStore || row.reporterPersonId === actor.personId));
       const named = todayRows.filter(row => row.customerName === command.customerName);
@@ -847,10 +868,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (amt.length === 1) rows = amt;
         else if (amt.length > 1) {
           if (command.action !== 'amend') return 'Front Claw：对上多笔，撤回请指定「改 N」或写清哪一笔。没有写入。';
-          return pickDraft(amt, `「${command.customerName}」${canStore ? '今天本店' : '今天由你报的'}有 ${amt.length} 笔，金额都是 ${formatYuan(command.originalAmount)}元，不能确定是哪一笔。`, command.amount);
+          return pickDraft(amt, `「${command.customerName}」${canStore ? '今天本店' : '今天由你报的'}有 ${amt.length} 笔，金额都是 ${formatYuan(command.originalAmount)}元，不能确定是哪一笔。`, command.amount, scope);
         } else {
           if (command.action !== 'amend') return `Front Claw：没有找到客户「${command.customerName}」今天由你报的记录，没有写入。`;
-          return pickDraft(todayRows, `没有找到客户「${command.customerName}」${canStore ? '今天本店' : '今天由你报'}的记录。`, command.amount);
+          return pickDraft(todayRows, `没有找到客户「${command.customerName}」${canStore ? '今天本店' : '今天由你报'}的记录。`, command.amount, scope);
         }
       } else if (named.length === 1) {
         rows = named;
@@ -860,12 +881,13 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         const reason = named.length
           ? `「${command.customerName}」${canStore ? '今天本店' : '今天由你报的'}有 ${named.length} 笔，不能确定是哪一笔。`
           : `没有找到客户「${command.customerName}」${canStore ? '今天本店' : '今天由你报'}的记录。`;
-        return pickDraft(listed, reason, command.amount);
+        return pickDraft(listed, reason, command.amount, scope);
       }
     } else if (command.personName !== null) {
       if (command.index !== null) return 'Front Claw：指名更正只改该员工最近一笔，请不要同时写第几笔。没有写入。';
-      const found = await findInStores(actor, 'correct_store', command.personName);
+      const found = await findInStores(actor, 'correct_store', command.personName, tag);
       if (typeof found === 'string') return found;
+      tag.access = { capability: 'correct_store', storeIds: [found.storeId] };
       const recent = await store.listEntries({ storeId: found.storeId, ownerPersonId: found.personId, status: 'confirmed' });
       const last = recent.at(-1);
       if (!last) return `Front Claw：${found.displayName} 没有可更正的账目，没有写入。`;
@@ -874,7 +896,9 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       rows = [last];
     } else {
       // 无本人更正或门店更正能力者，不读本人批次与账目。
-      if (!await can(actor, 'correct_own') && !await can(actor, 'correct_store')) return ACCESS_DENIED;
+      const ownRead = await can(actor, 'correct_own');
+      if (!ownRead && !await can(actor, 'correct_store')) return ACCESS_DENIED;
+      tag.access = { capability: ownRead ? 'correct_own' : 'correct_store', storeIds: [actor.storeId] };
       const batches = (await store.listDrafts({ kind: 'report', status: 'confirmed', reporterPersonId: actor.personId, storeId: actor.storeId }))
         .filter(d => d.payload.type === 'report' && !!d.payload.employeeContext)
         .sort((a, b) => (a.closedAt ?? a.createdAt).localeCompare(b.closedAt ?? b.createdAt));
@@ -962,18 +986,18 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     }
     if (withdraw) {
       const command = { action: 'withdraw' as const, index: c.slots.index ?? null, personName: null, customerName: c.slots.customer ?? null };
-      const built = await correctionDraft(actor, command, input, fingerprint, today);
+      const built = await correctionDraft(actor, command, input, fingerprint, today, tag);
       return await submitClassifiedDraft(built, actor, input, fingerprint, text, tag);
     }
     if (chain.amountCents === undefined) return { reply: clarifyQuestion('missing_amount'), kind: 'ask' };
     const command = { action: 'amend' as const, amount: chain.amountCents, index: c.slots.index ?? null, personName: null, customerName: c.slots.customer ?? null };
-    const built = await correctionDraft(actor, command, input, fingerprint, today);
+    const built = await correctionDraft(actor, command, input, fingerprint, today, tag);
     return await submitClassifiedDraft(built, actor, input, fingerprint, text, tag);
   }
   async function submitClassifiedDraft(
     built: Draft | string, actor: Person, input: EmployeeMessage, fingerprint: string, text: string, tag: Tag,
   ): Promise<{ reply: string; operationId?: string; access?: Access }> {
-    if (typeof built === 'string') return { reply: built };
+    if (typeof built === 'string') return { reply: built, ...(tag.access ? { access: tag.access } : {}) };
     const latest = await actorFor(input.memberId);
     if (!latest || !owned(built, latest, input) || !await enabled(latest)) return { reply: DENIED };
     if (!await draftAllowed(latest, built)) return { reply: ACCESS_DENIED };
@@ -987,7 +1011,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       await writesFor(input).putOperationRecord(interleavedKey, '');
     }
     tag.access = needs(saved);
-    return { reply: withLeftover(resultText(saved), text, 'correction'), operationId: saved.draftId, access: needs(saved) };
+    return { reply: withLeftover(resultText(saved), text, 'correction'), operationId: saved.draftId, access: tag.access };
   }
   return async (original: EmployeeMessage, preflightReply?: PreflightReply): Promise<EmployeeLoopResult> => {
     const input = { ...original };
@@ -1119,8 +1143,13 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         const current = await actorFor(input.memberId);
         if (!current || !owned(found, current, input)) return DENIED;
         if (!await can(current, 'progress_self')) return ACCESS_DENIED;
+        if (found.status === 'pending' && found.payload.type === 'correction' && found.payload.awaitingPick) {
+          if (!await draftAllowed(current, found)) return ACCESS_DENIED;
+          tag.access = { ...needs(found), additionalCapability: 'progress_self' };
+        } else {
+          tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
+        }
         operationId = found.draftId; ledgerSettled = found.status === 'confirmed';
-        tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
         return resultText(found);
       }
       // R18 / D160：确认指令保留「刚确认过」标记，其余消息清掉。
@@ -1198,31 +1227,37 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       if (pickCmd) {
         const waitingReport = pending.find(d => d.payload.type === 'report' && d.payload.awaitingDuplicateChoice);
         if (waitingReport && waitingReport.payload.type === 'report' && waitingReport.payload.awaitingDuplicateChoice) {
+          const latestChoice = await actorFor(input.memberId);
+          if (!latestChoice || !owned(waitingReport, latestChoice, input) || !await enabled(latestChoice) || !active()) return DENIED;
+          if (!await draftAllowed(latestChoice, waitingReport)) return ACCESS_DENIED;
           const listedChoice = waitingReport.payload.awaitingDuplicateChoice.listed;
           const rowChoice = listedChoice.find(item => item.index === pickCmd.index);
           if (!rowChoice || rowChoice.visibility === 'peer-redacted' || !rowChoice.entryId || rowChoice.amount === undefined || !rowChoice.beforeJson) {
+            tag.access = needs(waitingReport);
             if (listedChoice.some(r => r.visibility === 'peer-redacted')) return PEER_ENTRY_HINT;
             return `Front Claw：没有第${pickCmd.index}笔，请从清单里选一个编号回复「改 ${listedChoice.filter(r => r.visibility !== 'peer-redacted')[0]?.index ?? 1}」。没有写入。`;
           }
           if (!policyMode) return 'Front Claw：目标设置和改账当前未开放，没有写入。';
-          const latestChoice = await actorFor(input.memberId);
-          if (!latestChoice || !owned(waitingReport, latestChoice, input) || !await enabled(latestChoice) || !active()) return DENIED;
           const newAmount = waitingReport.payload.awaitingDuplicateChoice.newAmount;
-          if (rowChoice.amount === newAmount) return `Front Claw：金额已经是 ${formatYuan(rowChoice.amount)}元，没有变化，没有写入。`;
           const commandChoice = { action: 'amend' as const, amount: newAmount, index: null, personName: null, customerName: rowChoice.customerName };
           const entryChoice = await store.getEntry(rowChoice.entryId);
-          if (!entryChoice || entryChoice.status !== 'confirmed' || entryVersion(entryChoice) !== rowChoice.beforeJson) return 'Front Claw：这笔在你指定前已被改动，这次没有写入，请重新发起。';
+          if (!entryChoice) return ACCESS_DENIED;
+          const accessChoice = selectedCorrectionAccess(entryChoice, latestChoice);
+          if (!await can(latestChoice, accessChoice.capability, entryChoice.storeId)) return ACCESS_DENIED;
+          tag.access = { capability: accessChoice.capability, storeIds: [entryChoice.storeId] };
+          if (entryChoice.status !== 'confirmed' || entryVersion(entryChoice) !== rowChoice.beforeJson) return 'Front Claw：这笔在你指定前已被改动，这次没有写入，请重新发起。';
           const changesChoice = changesFrom([entryChoice], commandChoice);
-          const ownChoice = entryChoice.reporterPersonId === latestChoice.personId && entryChoice.businessDay === businessDate(now(), cutoff, timeZone) && entryChoice.storeId === latestChoice.storeId;
           const ctxChoice = waitingReport.payload.employeeContext;
           if (!ctxChoice) return DENIED;
           const nextPayloadChoice: CorrectionPayload = {
             type: 'correction', employeeContext: { ...ctxChoice, fingerprint: hash([text]), messageId: input.messageId!, itemsDigest: '' },
-            action: 'amend', scope: ownChoice ? 'own' : 'store', changes: changesChoice,
+            action: 'amend', scope: accessChoice.scope, changes: changesChoice,
           };
           const nextChoice: Draft = { ...waitingReport, kind: 'correction', payload: nextPayloadChoice };
           nextPayloadChoice.employeeContext.itemsDigest = ledgerDigest(nextChoice)!;
-          if (!await draftAllowed(latestChoice, nextChoice)) return ACCESS_DENIED;
+          if (rowChoice.amount === newAmount) {
+            return `Front Claw：金额已经是 ${formatYuan(rowChoice.amount)}元，没有变化，没有写入。`;
+          }
           await writesFor(input).rewriteDraft(nextChoice);
           await clearInterleaved(actor);
           const savedChoice = await store.getDraft(nextChoice.draftId);
@@ -1234,27 +1269,34 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!waiting || waiting.payload.type !== 'correction' || !waiting.payload.awaitingPick) {
           return 'Front Claw：当前没有待指定的改账清单。请先说明要改哪一笔。没有写入。';
         }
-        const listed = waiting.payload.awaitingPick.listed;
-        const row = listed.find(item => item.index === pickCmd.index);
-        if (!row || !row.entryId || row.amount === undefined || !row.beforeJson) return `Front Claw：没有第${pickCmd.index}笔，请从清单里选一个编号回复「改 N」。没有写入。`;
-        if (row.amount === waiting.payload.awaitingPick.newAmount) return `Front Claw：金额已经是 ${formatYuan(row.amount)}元，没有变化，没有写入。`;
         if (!policyMode) return 'Front Claw：目标设置和改账当前未开放，没有写入。';
         const latest = await actorFor(input.memberId);
         if (!latest || !owned(waiting, latest, input) || !await enabled(latest) || !active()) return DENIED;
+        if (!await draftAllowed(latest, waiting)) return ACCESS_DENIED;
+        const row = waiting.payload.awaitingPick.listed.find(item => item.index === pickCmd.index);
+        if (!row || !row.entryId || row.amount === undefined || !row.beforeJson) {
+          tag.access = needs(waiting);
+          return `Front Claw：没有第${pickCmd.index}笔，请从清单里选一个编号回复「改 N」。没有写入。`;
+        }
         const command = { action: 'amend' as const, amount: waiting.payload.awaitingPick.newAmount, index: null, personName: null, customerName: row.customerName };
         const entry = await store.getEntry(row.entryId);
-        if (!entry || entry.status !== 'confirmed' || entryVersion(entry) !== row.beforeJson) return 'Front Claw：这笔在你指定前已被改动，这次没有写入，请重新发起。';
+        if (!entry) return ACCESS_DENIED;
+        const access = selectedCorrectionAccess(entry, latest);
+        if (!await can(latest, access.capability, entry.storeId)) return ACCESS_DENIED;
+        tag.access = { capability: access.capability, storeIds: [entry.storeId] };
+        if (entry.status !== 'confirmed' || entryVersion(entry) !== row.beforeJson) return 'Front Claw：这笔在你指定前已被改动，这次没有写入，请重新发起。';
         const changes = changesFrom([entry], command);
-        const own = entry.reporterPersonId === latest.personId && entry.businessDay === businessDate(now(), cutoff, timeZone) && entry.storeId === latest.storeId;
         const ctx = waiting.payload.employeeContext;
         if (!ctx) return DENIED;
         const nextPayload: CorrectionPayload = {
           type: 'correction', employeeContext: { ...ctx, fingerprint: hash([text]), messageId: input.messageId!, itemsDigest: '' },
-          action: 'amend', scope: own ? 'own' : 'store', changes,
+          action: 'amend', scope: access.scope, changes,
         };
         const next: Draft = { ...waiting, payload: nextPayload };
         nextPayload.employeeContext.itemsDigest = ledgerDigest(next)!;
-        if (!await draftAllowed(latest, next)) return ACCESS_DENIED;
+        if (row.amount === waiting.payload.awaitingPick.newAmount) {
+          return `Front Claw：金额已经是 ${formatYuan(row.amount)}元，没有变化，没有写入。`;
+        }
         await writesFor(input).rewriteDraft(next);
         await clearInterleaved(actor);
         const saved = await store.getDraft(next.draftId);
@@ -1390,6 +1432,8 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
           return DRAFT_EXPIRED_REREPORT;
         }
         if (text !== '取消' && draft.payload.type === 'correction' && draft.payload.awaitingPick) {
+          if (!await draftAllowed(actor, draft)) return ACCESS_DENIED;
+          tag.access = needs(draft);
           return `${resultText(draft)}
 请回复「改 N」指定要改哪一笔，或回「取消」。不要直接回「对」。`;
         }
@@ -1605,7 +1649,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         // M04：目标与更正只在策略模式开放，且每一步都过 M03 鉴权；非策略模式不扩大权限。
         if (!policyMode) return 'Front Claw：目标设置和改账当前未开放，没有写入。';
         if (pending.length || drafts.some(d => d.status === 'confirming')) return 'Front Claw：请先确认或取消当前草稿，结果未知时查原操作号。';
-        const built = targetCommand ? await targetDraft(actor, targetCommand, input, fingerprint, today) : await correctionDraft(actor, correctionCommand!, input, fingerprint, today);
+        const built = targetCommand ? await targetDraft(actor, targetCommand, input, fingerprint, today, tag) : await correctionDraft(actor, correctionCommand!, input, fingerprint, today, tag);
         if (typeof built === 'string') return built;
         operationId = built.draftId;
         const latest = await actorFor(input.memberId);
@@ -1812,6 +1856,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         const current = await actorFor(input.memberId);
         if (!same(current) || !await can(current!, 'progress_self')) return `${head}\n后半句「${tail}」没有办：你当前没有查进度的权限。`;
         const progress = await tools.myProgress(actor.accountId);
+        tag.access = { ...needs(saved), additionalCapability: 'progress_self' };
         return `${head}\n后半句「${tail}」——已查（上面这笔还没确认，不算在内）：\n${progress.reply.replace(/^Front Claw[：:]?/, '')}`;
       }
       return withLeftover(head, text, 'report');

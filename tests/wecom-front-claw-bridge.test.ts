@@ -319,6 +319,7 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     );
     expect(passed).toEqual({
       kind: 'pass',
+      principal: { personId: 'p-wang', tier: 'employee', bindingVersion: 1 },
       corpId: CORP_A,
       accountId: 'a-wang',
       storeId: 's-a',

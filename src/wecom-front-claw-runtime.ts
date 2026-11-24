@@ -10,6 +10,7 @@ import {
   type ChannelOutboxDeliveryResult,
   type DeliverChannelOutboxInput,
 } from './channel-outbox-delivery.js';
+import { getChannelTurnRun } from './channel-reliability-store.js';
 import { DATA_DIR, GROUPS_DIR } from './config.js';
 import {
   assignWorkspaceAgentProfile,
@@ -33,6 +34,7 @@ import {
 } from './personal-agent/host-observability.js';
 import { getContainerEnvConfig } from './runtime-config.js';
 import { type AgentProfile, RegisteredGroup } from './types.js';
+import { wecomInputContext } from './wecom.js';
 import type {
   WeComDeliveryOutcomeEvent,
   WeComOutboundAuthorizePort,
@@ -125,28 +127,13 @@ export function deriveWeComEmployeeWorkspace(ctx: {
   const role: WeComSoftRole = isKnownWeComSoftRole(ctx.targetRole)
     ? ctx.targetRole
     : 'marketing';
-  const normalizedStoreId = ctx.storeId?.trim() || undefined;
-  const seed =
-    role === 'marketing'
-      ? [ctx.corpId, ctx.botId, ctx.memberId]
-      : [
-          ctx.corpId,
-          ctx.botId,
-          ctx.memberId,
-          normalizedStoreId ?? 'default',
-          role,
-        ];
+  const storeId = ctx.storeId?.trim();
+  if (!storeId) throw Error('wecom_workspace_store_required');
+  const seed = [ctx.corpId, ctx.botId, ctx.memberId, storeId, role];
   const digest = createHash('sha256')
     .update(JSON.stringify(seed))
     .digest('hex')
     .slice(0, 16);
-  if (role === 'marketing') {
-    return {
-      role,
-      jid: `${WECOM_MANAGED_WORKSPACE_JID_PREFIX}${digest}`,
-      folder: `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${digest}`,
-    };
-  }
   return {
     role,
     jid: `${WECOM_MANAGED_WORKSPACE_JID_PREFIX}${role}:${digest}`,
@@ -205,20 +192,6 @@ export function isWeComManagedWorkspaceJid(jid: string | undefined): boolean {
         ),
     )
   );
-}
-
-function parseWeComC2cJid(
-  baseJid: string,
-): { corpId: string; memberId: string } | null {
-  const prefix = 'wecom:c2c:';
-  if (!baseJid.startsWith(prefix)) return null;
-  const rest = baseJid.slice(prefix.length);
-  const splitAt = rest.indexOf(':');
-  if (splitAt <= 0 || splitAt >= rest.length - 1) return null;
-  return {
-    corpId: rest.slice(0, splitAt),
-    memberId: rest.slice(splitAt + 1),
-  };
 }
 
 const SAFE_TELEMETRY_CODE = /^[a-zA-Z0-9._:-]{1,64}$/;
@@ -365,6 +338,7 @@ export async function deliverWeComTextViaOutbox(params: {
   readonly targetJid: string;
   readonly text: string;
   readonly correlationId: string;
+  readonly workspaceJid?: string;
   readonly outbox: Omit<DeliverChannelOutboxInput, 'delivery'>;
 }): Promise<ChannelOutboxDeliveryResult> {
   let capturedOutcome: WeComOutboxDeliveryOutcome | null = null;
@@ -374,13 +348,29 @@ export async function deliverWeComTextViaOutbox(params: {
     delivery: {
       mode: 'single',
       send: async () => {
-        const outcome = await runInWeComOutboxContext(() =>
-          params.imManager.sendMessageWithReceipt(
-            params.targetJid,
-            params.text,
-            { correlationId: params.correlationId },
-          ),
-        );
+        const send = () =>
+          runInWeComOutboxContext(() =>
+            params.imManager.sendMessageWithReceipt(
+              params.targetJid,
+              params.text,
+              { correlationId: params.correlationId },
+            ),
+          );
+        const turn = getChannelTurnRun(params.outbox.turnRunId);
+        const outcome =
+          turn?.correlationId &&
+          params.workspaceJid &&
+          turn.sourceJid === params.targetJid &&
+          turn.accountId === params.outbox.accountId &&
+          turn.provider === 'wecom'
+            ? await wecomInputContext.run(
+                Object.freeze({
+                  messageId: turn.correlationId,
+                  workspaceJid: params.workspaceJid,
+                }),
+                send,
+              )
+            : await wecomInputContext.exit(send);
         if (!outcome) {
           throw new DefinitiveChannelDeliveryError(
             'wecom_receipt_delivery_unavailable',
@@ -893,10 +883,6 @@ export async function startWeComFrontClawRuntime(
     groupsDir,
   });
 
-  const employeeWorkspaceByChat = new Map<
-    string,
-    { jid: string; folder: string; role: WeComSoftRole }
-  >();
   const ensureEmployeeTargetWorkspace = (ctx: {
     corpId: string;
     memberId: string;
@@ -915,11 +901,11 @@ export async function startWeComFrontClawRuntime(
       corpId: ctx.corpId,
       botId,
       memberId: ctx.memberId,
-      ...(requestedRole !== 'marketing' && ctx.storeId
-        ? { storeId: ctx.storeId }
-        : {}),
+      storeId: ctx.storeId,
       targetRole: requestedRole,
     });
+    const existing = deps.getGroup(derived.jid);
+    if (existing && existing.folder !== derived.folder) return undefined;
     const label = WECOM_SAFE_ROLE_WORKSPACE_LABELS[derived.role];
     ensureManagedWeComWorkspace({
       workspaceJid: derived.jid,
@@ -933,7 +919,6 @@ export async function startWeComFrontClawRuntime(
       groupsDir,
     });
     const baseC2cJid = `wecom:c2c:${ctx.corpId}:${ctx.memberId}`;
-    employeeWorkspaceByChat.set(baseC2cJid, derived);
     const existingC2c = deps.getGroup(baseC2cJid);
     if (
       existingC2c &&
@@ -963,44 +948,7 @@ export async function startWeComFrontClawRuntime(
   // 自愈历史上 front-claw-system 归属与旧共享 web:wecom-front-claw 员工路由
   const historicalGroups = (deps.listGroups ?? getAllRegisteredGroups)();
   for (const [existingJid, existingGroup] of Object.entries(historicalGroups)) {
-    if (isWeComManagedWorkspaceJid(existingJid)) {
-      ensureManagedWeComWorkspace({
-        workspaceJid: existingJid,
-        ownerUserId,
-        resolveRoleSkillIds: resolveRoleSkillIdsForOwner,
-        getGroup: deps.getGroup,
-        registerGroup: deps.registerGroup,
-        groupsDir,
-      });
-      continue;
-    }
     if (!existingJid.startsWith('wecom:')) {
-      continue;
-    }
-    const baseJid = channelConversationJid(existingJid);
-    const parsedC2c = managedWorkspaceEnabled
-      ? parseWeComC2cJid(baseJid)
-      : null;
-    if (
-      parsedC2c &&
-      (existingGroup.target_main_jid === WECOM_MANAGED_WORKSPACE_JID ||
-        existingGroup.created_by === SYSTEM_WECOM_OWNER_ID)
-    ) {
-      const derived = ensureEmployeeTargetWorkspace(parsedC2c);
-      if (derived && existingJid !== baseJid) {
-        deps.registerGroup(existingJid, {
-          ...existingGroup,
-          created_by:
-            existingGroup.created_by === SYSTEM_WECOM_OWNER_ID
-              ? ownerUserId
-              : existingGroup.created_by,
-          channel_account_id: existingGroup.channel_account_id || botId,
-          folder: derived.folder,
-          target_main_jid: derived.jid,
-          executionMode: 'container',
-          is_home: false,
-        });
-      }
       continue;
     }
     if (existingGroup.created_by === SYSTEM_WECOM_OWNER_ID) {
@@ -1082,7 +1030,30 @@ export async function startWeComFrontClawRuntime(
   const rawBridge = await createWeComFrontClawBridge(bridgeOptions);
   const observedPrecheck: WeComFrontClawBridge['precheck'] = async (event) => {
     try {
-      const outcome = await rawBridge.precheck(event);
+      let outcome = await rawBridge.precheck(event);
+      if (outcome.kind === 'pass') {
+        const expected =
+          outcome.targetRole &&
+          outcome.storeId &&
+          deriveWeComEmployeeWorkspace({
+            corpId: outcome.corpId,
+            botId,
+            memberId: event.memberId,
+            storeId: outcome.storeId,
+            targetRole: outcome.targetRole,
+          });
+        if (
+          !managedWorkspaceEnabled ||
+          !expected ||
+          outcome.workspaceJid !== expected.jid ||
+          deps.getGroup(expected.jid)?.folder !== expected.folder
+        ) {
+          outcome = {
+            kind: 'failed',
+            replies: [BRIDGE_AGENT_GUARDRAIL_DENIED_REPLY],
+          };
+        }
+      }
       const correlationId = event.messageId.trim() || event.reqId;
       const obs = recentObservations.get(event.messageId);
       const isGuardrailDenied =
@@ -1142,11 +1113,19 @@ export async function startWeComFrontClawRuntime(
     const correlationId =
       input.correlationId?.trim() || `${input.botId}:${input.chatId}`;
     try {
-      const decision = await bridge.authorizeOutbound({
-        memberId: input.memberId,
-        ...(input.corpId !== undefined ? { corpId: input.corpId } : {}),
-        capability: 'marketing',
-      });
+      const scope = input.scope;
+      const decision = !scope
+        ? { allowed: false as const, reason: 'missing_admitted_scope' }
+        : await bridge.authorizeOutbound({
+            botId: input.botId,
+            principal: scope.principal,
+            accountId: scope.accountId,
+            storeId: scope.storeId,
+            targetRole: scope.targetRole,
+            memberId: input.memberId,
+            ...(input.corpId !== undefined ? { corpId: input.corpId } : {}),
+            capability: 'marketing',
+          });
       observeWeComOutboundAuth({
         correlationId,
         botId: input.botId,
@@ -1197,28 +1176,16 @@ export async function startWeComFrontClawRuntime(
 
   const onNewChat = (jid: string, name: string) => {
     const baseJid = channelConversationJid(jid);
-    const resolvedTarget = (() => {
-      if (!managedWorkspaceEnabled) {
-        return {
-          jid: workspaceJid,
-          folder:
-            managedGroup?.folder ??
-            deps.getGroup(workspaceJid)?.folder ??
-            WECOM_MANAGED_WORKSPACE_FOLDER,
-        };
-      }
-      const cached = employeeWorkspaceByChat.get(baseJid);
-      if (cached) return cached;
-      const parsedC2c = parseWeComC2cJid(baseJid);
-      if (parsedC2c) {
-        const derived = ensureEmployeeTargetWorkspace(parsedC2c);
-        if (derived) return derived;
-      }
-      return {
-        jid: workspaceJid,
-        folder: managedGroup?.folder ?? WECOM_MANAGED_WORKSPACE_FOLDER,
-      };
-    })();
+    const admitted = wecomInputContext.getStore()?.workspaceJid;
+    if (
+      !managedWorkspaceEnabled ||
+      !admitted ||
+      !isWeComManagedWorkspaceJid(admitted)
+    )
+      return;
+    const target = deps.getGroup(admitted);
+    if (!target) return;
+    const resolvedTarget = { jid: admitted, folder: target.folder };
 
     deps.onNewChat(ownerUserId, resolvedTarget.folder)(jid, name);
     const group = deps.getGroup(baseJid);
@@ -1228,21 +1195,17 @@ export async function startWeComFrontClawRuntime(
       botId,
       resolvedTarget.jid,
     );
-    const nextGroup: RegisteredGroup = managedWorkspaceEnabled
-      ? {
-          ...withFallback,
-          created_by:
-            withFallback.created_by === SYSTEM_WECOM_OWNER_ID
-              ? ownerUserId
-              : withFallback.created_by,
-          folder: resolvedTarget.folder,
-          target_main_jid: resolvedTarget.jid,
-          executionMode: 'container',
-          is_home: false,
-        }
-      : withFallback.executionMode === 'host' || withFallback.is_home
-        ? { ...withFallback, executionMode: 'container', is_home: false }
-        : withFallback;
+    const nextGroup: RegisteredGroup = {
+      ...withFallback,
+      created_by:
+        withFallback.created_by === SYSTEM_WECOM_OWNER_ID
+          ? ownerUserId
+          : withFallback.created_by,
+      folder: resolvedTarget.folder,
+      target_main_jid: resolvedTarget.jid,
+      executionMode: 'container',
+      is_home: false,
+    };
     const changed =
       nextGroup.target_main_jid !== group.target_main_jid ||
       nextGroup.folder !== group.folder ||
