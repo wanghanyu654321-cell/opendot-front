@@ -733,6 +733,7 @@ interface FrontClawModules {
 interface RoutedResult {
   access?: {
     capability: string | null;
+    additionalCapability?: string;
     storeIds: string[];
     identity?: { personId: string; policyVersion: number };
   };
@@ -2172,15 +2173,20 @@ export async function createWeComFrontClawBridge(
       }
       return (
         proof.storeIds.length > 0 &&
-        proof.storeIds.every(
-          (store) =>
-            mods.accessPolicy.decideAccess(
-              policy,
-              current,
-              proof.capability!,
-              store,
-              platformCapabilities,
-            ).allowed,
+        [
+          proof.capability,
+          ...(proof.additionalCapability ? [proof.additionalCapability] : []),
+        ].every((capability) =>
+          proof.storeIds.every(
+            (store) =>
+              mods.accessPolicy.decideAccess(
+                policy,
+                current,
+                capability!,
+                store,
+                platformCapabilities,
+              ).allowed,
+          ),
         )
       );
     };

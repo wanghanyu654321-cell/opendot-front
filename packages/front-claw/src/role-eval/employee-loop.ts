@@ -1145,7 +1145,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!await can(current, 'progress_self')) return ACCESS_DENIED;
         if (found.status === 'pending' && found.payload.type === 'correction' && found.payload.awaitingPick) {
           if (!await draftAllowed(current, found)) return ACCESS_DENIED;
-          tag.access = needs(found);
+          tag.access = { ...needs(found), additionalCapability: 'progress_self' };
         } else {
           tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
         }
@@ -1856,6 +1856,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         const current = await actorFor(input.memberId);
         if (!same(current) || !await can(current!, 'progress_self')) return `${head}\n后半句「${tail}」没有办：你当前没有查进度的权限。`;
         const progress = await tools.myProgress(actor.accountId);
+        tag.access = { ...needs(saved), additionalCapability: 'progress_self' };
         return `${head}\n后半句「${tail}」——已查（上面这笔还没确认，不算在内）：\n${progress.reply.replace(/^Front Claw[：:]?/, '')}`;
       }
       return withLeftover(head, text, 'report');
