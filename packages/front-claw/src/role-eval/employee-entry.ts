@@ -12,6 +12,8 @@ import { ACCESS_DENIED, REPORT_HINT, appointmentAskKey, appointmentTimeAskKey, i
 import { parseAddNewChoice, parseAskManagerChoice, parseCorrectionPick, parseCorrectionCommand, parseTargetCommand } from './ledger-commands.js';
 import { parseAppointmentRequest, parseStandaloneAppointmentTime } from './appointments.js';
 import { extractReport, nonClosingReportReason } from './report-extract.js';
+import { clarifyQuestion } from './clarify.js';
+import { parseRuleReadQuery } from './read-query.js';
 import { isStandardAmountLine } from './amount-guard.js';
 import { parseLooseReport, parseReportText } from './report-parse.js';
 import type { Person } from './performance-store.js';
@@ -172,7 +174,7 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
       };
       const today = businessDate(options.now(), cutoff, timeZone);
-      if (businessRead(input.text, today)) {
+      if (parseRuleReadQuery(input.text, today)) {
         decision = { target: 'store', label: 'progress', intents: ['progress'] };
         const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline });
         return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
@@ -192,6 +194,17 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       let grantedActor = classified.label === 'marketing' && marketingEnabled ? await marketingActor(input.memberId) : null;
       decision = decideRoute(classified, { marketingEnabled, marketingGranted: !!grantedActor });
       log.classify(requestId, { label: decision.label, target: decision.target, source: classified.source, reason: classified.reason });
+      // 明确的未成交/否定报单优先于残片追问与模型兜底：绝不建草稿，并在存在活跃待确认草稿时启用 D175 显式口令保护。
+      const nonClosingReason = classified.unclear === 'not_closed' || classified.unclear === 'negation'
+        ? classified.unclear
+        : nonClosingReportReason(input.text);
+      if (nonClosingReason && (decision.target === 'clarify' || decision.target === 'store')) {
+        const handled = await loop(
+          { ...input, signal: child.signal, deadline: child.deadline },
+          { text: clarifyQuestion(nonClosingReason), kind: 'reply', markInterleaved: true },
+        );
+        return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
+      }
       // R3（D81 已定口径）：非今天的报数说法 → 固定一句，不追问、不写。
       // R15 / D146：没见过的否定补报（含带时间词前缀）先问，不走「只能报今天的单」，不出可确认草稿。
       {
@@ -248,11 +261,8 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       const crossDomainMultiIntent = classified.reason === 'multi-intent'
         && classified.intents.some(isStoreIntent)
         && classified.intents.includes('marketing');
-      const nonClosingReport = classified.unclear === 'not_closed'
-        || classified.unclear === 'negation'
-        || nonClosingReportReason(input.text) !== null;
       // 规则层已判定未成交/否定报单或明确跨类多意图时，不交模型分类器覆盖原判。
-      if (decision.target === 'clarify' && !nonClosingReport && !crossDomainMultiIntent) {
+      if (decision.target === 'clarify' && !nonClosingReason && !crossDomainMultiIntent) {
         const classifier = modelClassifier;
         modelAttempted = true;
         const output = await runModelClassifier(input.text, classifier, child.signal, child.deadline, modelClassifyTimeoutMs, diagnostic => {

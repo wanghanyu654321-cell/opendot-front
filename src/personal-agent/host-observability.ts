@@ -55,7 +55,13 @@ export interface WeComAgentTurnTelemetry {
   readonly workspaceFolder: string;
   readonly profileId?: string;
   readonly skillIds?: readonly string[];
+  /** Manifest-selected skills for this workspace run (not per-message tool invocation proof). */
+  readonly selectedSkillIds?: readonly string[];
+  /** Backward-compatible alias for selectedSkillIds. */
   readonly loadedSkillIds?: readonly string[];
+  /** Batch-level marker indicating at least one queued message in this turn carried readonlyContext. */
+  readonly batchReadonlyContextMarked?: boolean;
+  /** Backward-compatible alias for batchReadonlyContextMarked. */
   readonly readonlyContextInjected?: boolean;
   readonly durationMs: number;
   readonly status: 'success' | 'error' | 'aborted';
@@ -97,6 +103,7 @@ const success: ExportResult = { code: ExportResultCode.SUCCESS };
 const hash = (value: string) =>
   createHash('sha256').update(value).digest('hex');
 const hashRef = (value: string) => hash(value).slice(0, 24);
+export const hashWeComAuditRef = (value: string): string => hashRef(value);
 const SAFE_CODE_PATTERN = /^[a-zA-Z0-9._:-]{1,64}$/;
 const SAFE_SKILL_ID_PATTERN = /^[\w.:-]{1,64}$/;
 const WECOM_OUTCOME_KINDS = new Set<WeComPrecheckTelemetry['outcomeKind']>([
@@ -917,7 +924,11 @@ export class HostObservability {
             ? hashRef(input.profileId.trim())
             : undefined;
         const skillIds = sanitizeSkillIds(input.skillIds);
-        const loadedSkillIds = sanitizeSkillIds(input.loadedSkillIds);
+        const selectedSkillIds = sanitizeSkillIds(
+          input.selectedSkillIds ?? input.loadedSkillIds,
+        );
+        const batchReadonlyMarked =
+          input.batchReadonlyContextMarked ?? input.readonlyContextInjected;
         const coveredRefs = Array.isArray(input.coveredCorrelationIds)
           ? [
               ...new Set(
@@ -942,13 +953,18 @@ export class HostObservability {
           workspace_ref: hashRef(input.workspaceFolder),
           ...(profileRef ? { profile_ref: profileRef } : {}),
           ...(skillIds ? { skill_ids: skillIds } : {}),
-          ...(loadedSkillIds ? { loaded_skill_ids: loadedSkillIds } : {}),
-          ...(input.readonlyContextInjected === undefined
+          ...(selectedSkillIds
+            ? {
+                selected_skill_ids: selectedSkillIds,
+                loaded_skill_ids: selectedSkillIds,
+                skill_evidence_level: 'workspace_manifest_selection',
+              }
+            : {}),
+          ...(batchReadonlyMarked === undefined
             ? {}
             : {
-                readonly_context_injected: Boolean(
-                  input.readonlyContextInjected,
-                ),
+                batch_readonly_context_marked: Boolean(batchReadonlyMarked),
+                readonly_context_injected: Boolean(batchReadonlyMarked),
               }),
           duration_ms: normalizeDurationMs(input.durationMs),
           status: WECOM_AGENT_STATUSES.has(input.status)

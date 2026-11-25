@@ -508,12 +508,115 @@ describe('HostObservability WeCom four-stage telemetry', () => {
     expect(turnAttrs['langfuse.observation.metadata.loaded_skill_ids']).toBe(
       JSON.stringify(['beauty-manager-daily', 'invalid_skill_id']),
     );
+    expect(turnAttrs['langfuse.observation.metadata.selected_skill_ids']).toBe(
+      JSON.stringify(['beauty-manager-daily', 'invalid_skill_id']),
+    );
+    expect(
+      turnAttrs['langfuse.observation.metadata.skill_evidence_level'],
+    ).toBe('"workspace_manifest_selection"');
     expect(
       turnAttrs['langfuse.observation.metadata.readonly_context_injected'],
+    ).toBe('true');
+    expect(
+      turnAttrs['langfuse.observation.metadata.batch_readonly_context_marked'],
     ).toBe('true');
     const turnSerialized = JSON.stringify(turnAttrs);
     expect(turnSerialized).not.toContain(msg1);
     expect(turnSerialized).not.toContain(msg2);
     expect(turnSerialized).not.toContain('invalid skill!');
+  });
+
+  test('Issue #18: emits honest selectedSkillIds / batchReadonlyContextMarked and precheck tier/store_ref on handled & failed paths', async () => {
+    const memory = new InMemorySpanExporter();
+    const observer = createObserver(1, memory);
+    const storeId = 'mvp-store-alpha-secret';
+
+    observer.wecomPrecheck({
+      correlationId: 'msg-handled-01',
+      botId: 'bot-01',
+      memberId: 'member-emp-01',
+      storeId,
+      route: 'fast_path',
+      gateReason: 'ok',
+      modelMs: 4,
+      errorCategory: 'none',
+      outcomeKind: 'handled',
+      tier: 'employee',
+    });
+    observer.wecomPrecheck({
+      correlationId: 'msg-failed-02',
+      botId: 'bot-01',
+      memberId: 'member-emp-01',
+      storeId,
+      route: 'manager_ops_denied',
+      gateReason: 'capability_denied',
+      modelMs: 2,
+      errorCategory: 'permission_denied',
+      outcomeKind: 'failed',
+      tier: 'employee',
+      targetRole: 'manager_ops',
+    });
+    observer.wecomAgentTurn({
+      correlationId: 'msg-pass-03',
+      workspaceFolder: 'wecom-front-claw-ws',
+      selectedSkillIds: ['beauty-ad-review'],
+      batchReadonlyContextMarked: false,
+      durationMs: 180,
+      status: 'success',
+    });
+    await observer.flush();
+
+    const spans = memory.getFinishedSpans();
+    expect(spans.map((s) => s.name)).toEqual([
+      'dot.wecom.precheck',
+      'dot.wecom.precheck',
+      'dot.wecom.agent_turn',
+    ]);
+
+    const handledAttrs = spans[0]!.attributes;
+    expect(handledAttrs['langfuse.observation.metadata.outcome_kind']).toBe(
+      '"handled"',
+    );
+    expect(handledAttrs['langfuse.observation.metadata.tier']).toBe(
+      '"employee"',
+    );
+    expect(handledAttrs['langfuse.observation.metadata.store_ref']).toBe(
+      JSON.stringify(sha256Ref(storeId)),
+    );
+
+    const failedAttrs = spans[1]!.attributes;
+    expect(failedAttrs['langfuse.observation.metadata.outcome_kind']).toBe(
+      '"failed"',
+    );
+    expect(failedAttrs['langfuse.observation.metadata.tier']).toBe(
+      '"employee"',
+    );
+    expect(failedAttrs['langfuse.observation.metadata.target_role']).toBe(
+      '"manager_ops"',
+    );
+    expect(failedAttrs['langfuse.observation.metadata.store_ref']).toBe(
+      JSON.stringify(sha256Ref(storeId)),
+    );
+
+    const turnAttrs = spans[2]!.attributes;
+    expect(turnAttrs['langfuse.observation.metadata.selected_skill_ids']).toBe(
+      JSON.stringify(['beauty-ad-review']),
+    );
+    expect(turnAttrs['langfuse.observation.metadata.loaded_skill_ids']).toBe(
+      JSON.stringify(['beauty-ad-review']),
+    );
+    expect(
+      turnAttrs['langfuse.observation.metadata.skill_evidence_level'],
+    ).toBe('"workspace_manifest_selection"');
+    expect(
+      turnAttrs['langfuse.observation.metadata.batch_readonly_context_marked'],
+    ).toBe('false');
+    expect(
+      turnAttrs['langfuse.observation.metadata.readonly_context_injected'],
+    ).toBe('false');
+
+    const serialized = JSON.stringify(spans.map((s) => s.attributes));
+    expect(serialized).not.toContain(storeId);
+    expect(serialized).not.toContain('member-emp-01');
   });
 });

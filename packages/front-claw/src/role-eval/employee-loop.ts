@@ -5,7 +5,7 @@ import { pausePoint } from './pause-points.js';
 import { createHash } from 'node:crypto';
 import { createAssistantTools } from './assistant-tools.js';
 import { businessDate, DEFAULT_BUSINESS_CUTOFF, DEFAULT_TIME_ZONE, zonedDateTime } from './metrics.js';
-import { matchPerson } from './people-match.js';
+import { matchPeople, matchPerson } from './people-match.js';
 import { parseLooseReport, parseReportText, type ParsedEntry } from './report-parse.js';
 import { ambiguityOf, extractReport, HONORIFIC, moneyIssueOf, nonClosingReportReason, splitStore } from './report-extract.js';
 import { clarifyQuestion } from './clarify.js';
@@ -27,7 +27,9 @@ import { businessRead, existingReadCommand, labelledStoreTargets, otherProgressC
 import { consumerWrites } from './consumer-writes.js';
 import { CommitContentionRejected, FencedWriteRejected } from './performance-store.js';
 import { resolveStoreHours } from './store-hours.js';
-import { ranking, storeById, storeByName, storeSummary, storeTargetSummary, unreported } from './store-queries.js';
+import { formatTargetBreakdown, ranking, storeById, storeByName, storeMonthTotal, storeSummary, storeTargetSummary, unreported } from './store-queries.js';
+import { formatAmount } from './reply.js';
+import { fromModelReadQuery, parseRuleReadQuery, type ReadQuerySpec } from './read-query.js';
 import { formatYuan } from './money.js';
 import { cannot } from './scope-refusal.js';
 import { guardUtteranceAmounts, guardIssueToReason, sealDraftAmounts, UnvalidatedAmountError, isStandardAmountLine } from './amount-guard.js';
@@ -599,12 +601,32 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   }
 
   /** M05 预约查询：本人（appointment_submit）或本店（appointment_receive）；提醒状态如实取自通知表。 */
-  async function appointmentQuery(actor: Person, text: string, memberId: string, tag: Tag): Promise<string | undefined> {
-    const confirmCommand = /^确认预约(?:\s*\S+)?$/.test(text);
-    if (confirmCommand) return 'Front Claw：现在预约登记即成立，店长只收提醒，不需要确认或回复。这条没有写入。';
-    const readSpec = parseAppointmentReadQuery(text);
+  async function appointmentQuery(
+    actor: Person,
+    text: string,
+    memberId: string,
+    tag: Tag,
+    specOverride?: Extract<ReadQuerySpec, { kind: 'appointment' }>,
+  ): Promise<string | undefined> {
+    if (!specOverride) {
+      const confirmCommand = /^确认预约(?:\s*\S+)?$/.test(text);
+      if (confirmCommand) return 'Front Claw：现在预约登记即成立，店长只收提醒，不需要确认或回复。这条没有写入。';
+    }
+    const readSpec = specOverride ?? (() => {
+      const parsed = parseAppointmentReadQuery(text);
+      if (!parsed) return undefined;
+      return {
+        kind: 'appointment' as const,
+        source: 'rule' as const,
+        scope: parsed.scope,
+        ...(parsed.day ? { day: parsed.day } : {}),
+        ...(parsed.target ? { target: parsed.target } : {}),
+        detailMode: parsed.countOnly ? 'count' as const : 'list' as const,
+      };
+    })();
     if (!readSpec) return undefined;
     if (readSpec.scope === 'other' && readSpec.target !== actor.storeId && readSpec.target !== actor.storeName) {
+      auditTarget(readSpec.target ?? text);
       return NOT_FOUND_OR_DENIED;
     }
     const storeList = readSpec.scope === 'store' || readSpec.scope === 'other';
@@ -613,25 +635,38 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     const wantStore = storeList && await can(actor, 'appointment_receive', actor.storeId);
     if (!wantStore && !await can(actor, 'appointment_submit', actor.storeId)) return ACCESS_DENIED;
     auditTarget(actor.storeId, actor.storeId);
-    const day = readSpec.day === 'tomorrow' ? addDay(today, 1) : readSpec.day === 'today' ? today : null;
+    const day = readSpec.day === 'day_after_tomorrow'
+      ? addDay(today, 2)
+      : readSpec.day === 'tomorrow'
+        ? addDay(today, 1)
+        : readSpec.day === 'today'
+          ? today
+          : null;
     const all = await store.listAppointments(wantStore ? { storeId: actor.storeId, status: 'registered' } : { storeId: actor.storeId, employeePersonId: actor.personId, status: 'registered' });
     const rows = all.filter(row => day ? row.whenText.startsWith(day) : row.whenText.slice(0, 10) >= today).sort((a, b) => a.whenText.localeCompare(b.whenText));
-    const notices = await store.listNotifications();
-    const people = wantStore ? await store.listPeople() : [];
-    const lines = rows.map(row => {
-      const notice = notices.find(n => n.kind === 'appointment' && n.relatedId === row.appointmentId);
-      const [date, time] = row.whenText.split(' ');
-      const who = wantStore ? `${people.find(p => p.personId === row.employeePersonId)?.displayName ?? '同事'}登记，` : '';
-      return `${describeWhen({ date: date!, time: time! })} ${row.customerName}${row.note ? ` ${row.note}` : ''}（${who}预约号 ${shortAppointmentNo(row.appointmentId)}；提醒：${notice ? reminderState(notice) : '待配置/未排队'}）`;
-    });
-    const dayLabel = readSpec.day === 'tomorrow' ? '明天' : readSpec.day === 'today' ? '今天' : '今天及以后';
-    const reply = readSpec.countOnly
-      ? rows.length
-        ? `Front Claw：${wantStore ? actor.storeName : '你'}${dayLabel}共有 ${rows.length} 条已登记的预约（登记即成立，店长无需回复）：\n${lines.join('\n')}`
-        : `Front Claw：${wantStore ? '本店' : '你'}${dayLabel}共有 0 条已登记的预约。`
-      : rows.length
+    const dayLabel = readSpec.day === 'day_after_tomorrow'
+      ? '后天'
+      : readSpec.day === 'tomorrow'
+        ? '明天'
+        : readSpec.day === 'today'
+          ? '今天'
+          : '今天及以后';
+    let reply: string;
+    if (readSpec.detailMode === 'count') {
+      reply = `Front Claw：${wantStore ? actor.storeName : '你'}${dayLabel}共有 ${rows.length} 条已登记的预约。`;
+    } else {
+      const notices = await store.listNotifications();
+      const people = wantStore ? await store.listPeople() : [];
+      const lines = rows.map(row => {
+        const notice = notices.find(n => n.kind === 'appointment' && n.relatedId === row.appointmentId);
+        const [date, time] = row.whenText.split(' ');
+        const who = wantStore ? `${people.find(p => p.personId === row.employeePersonId)?.displayName ?? '同事'}登记，` : '';
+        return `${describeWhen({ date: date!, time: time! })} ${row.customerName}${row.note ? ` ${row.note}` : ''}（${who}预约号 ${shortAppointmentNo(row.appointmentId)}；提醒：${notice ? reminderState(notice) : '待配置/未排队'}）`;
+      });
+      reply = rows.length
         ? `Front Claw ${wantStore ? `${actor.storeName}预约` : '你登记的预约'}（登记即成立，店长无需回复）：\n${lines.join('\n')}`
         : `Front Claw：${wantStore ? '本店' : '你'}${day ? '这天' : '今天及以后'}没有登记的预约。`;
+    }
     // 发送前再验身份与授权。
     const current = await actorFor(memberId);
     if (!current || current.personId !== actor.personId) return DENIED;
@@ -954,74 +989,361 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     return await draftAllowed(actor, draft) ? draft : ACCESS_DENIED;
   }
 
-  async function selfProgress(actor: Person, memberId: string, tag: Tag): Promise<string> {
+  async function selfProgress(
+    actor: Person,
+    memberId: string,
+    tag: Tag,
+    opts?: { wantsTarget?: boolean },
+  ): Promise<string> {
     if (!await can(actor, 'progress_self')) return ACCESS_DENIED;
     const result = await tools.myProgress(actor.accountId);
+    const day = businessDate(now(), cutoff, timeZone);
+    let reply = result.reply;
+    if (opts?.wantsTarget && result.ok) {
+      const targetRec = await store.getTarget(actor.storeId, actor.personId, monthKey(day));
+      reply = `${reply}\n${formatTargetBreakdown('个人', targetRec ? targetRec.amount : null, result.data.month)}`;
+    }
     const current = await actorFor(memberId);
     if (!current || current.personId !== actor.personId || current.accountId !== actor.accountId || current.storeId !== actor.storeId) return DENIED;
     if (!await can(current, 'progress_self', actor.storeId)) return ACCESS_DENIED;
     tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
-    return result.reply;
+    return reply;
   }
-  async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, text: string, memberId: string, tag: Tag): Promise<string> {
-    const object = c.object;
-    const day = businessDate(now(), cutoff, timeZone);
-    if (object !== 'appointment' && (isUnsupportedHistoricalPeriodSlot(c.slots.period, day) || hasUnsupportedHistoricalPeriod(text, day))) {
-      return HISTORICAL_PERIOD_UNSUPPORTED;
-    }
-    const explicit = labelledStoreTargets(text);
-    if (!explicit || explicit.length > 1 || (explicit[0] && c.slots.store && explicit[0] !== c.slots.store)) return NOT_FOUND_OR_DENIED;
-    const named = explicit[0] ?? c.slots.store;
-    const wantsTarget = object === 'target' || object === 'completion' || /目标|完成率|差额|还差/.test(text);
-    if (named !== undefined) {
-      if (!policyMode) return ACCESS_DENIED;
-      const people = await store.listPeople();
-      const scope = resolveStoreTarget(people, actor, named);
-      auditTarget(named, scope?.storeId);
-      if (!scope) return NOT_FOUND_OR_DENIED;
-      if (['performance', 'summary', 'completion', 'target'].includes(object ?? '')) {
-        return (await managementQuery(actor, '经营汇总 ' + scope.storeId, memberId, tag, { withTarget: wantsTarget })) ?? NOT_FOUND_OR_DENIED;
+
+  /**
+   * 统一只读查询执行器：无论由规则（parseRuleReadQuery）还是模型（fromModelReadQuery）产出，
+   * 全部汇聚到此处按同一套权限与业务口径执行，消除两套解释。
+   */
+  async function executeReadQuery(
+    spec: ReadQuerySpec,
+    actor: Person,
+    input: EmployeeMessage,
+    tag: Tag,
+    day: string,
+    hooks?: {
+      readAsk?: (key: string) => Promise<string | null | undefined>;
+      setExpiredReminder?: (reminder: string) => void;
+      setOperation?: (id: string, settled: boolean) => void;
+    },
+  ): Promise<string> {
+    const memberId = input.memberId;
+    const finalCheck = async (capability: Capability, storeIds: readonly string[], reply: string): Promise<string> => {
+      const current = await actorFor(memberId);
+      if (!current || current.personId !== actor.personId) return DENIED;
+      for (const storeId of storeIds) if (!await can(current, capability, storeId)) return ACCESS_DENIED;
+      tag.access = { capability, storeIds: [...storeIds] };
+      return reply;
+    };
+
+    switch (spec.kind) {
+      case 'historical_unsupported':
+        return HISTORICAL_PERIOD_UNSUPPORTED;
+      case 'unsupported':
+        return 'Front Claw：暂不支持这项只读查询。';
+      case 'denied_scope':
+        auditDecision('denied');
+        return NOT_FOUND_OR_DENIED;
+      case 'clarify_query': {
+        const drafts = (await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
+          .filter(d => owned(d, actor, input));
+        const activePending = drafts.filter(d => d.status === 'pending' && d.kind === 'report' && !pendingExpired(d.expiresAt, now()));
+        if (activePending.length === 1 && input.sessionId) {
+          await writesFor(input).putOperationRecord(d175InterleavedKey(actor.personId, input.sessionId), activePending[0]!.draftId);
+        }
+        return spec.message;
       }
-      if (scope.storeId !== actor.storeId || object === 'ranking') return NOT_FOUND_OR_DENIED;
+      case 'identity': {
+        const current = await actorFor(memberId);
+        const raw = await readPolicy(store);
+        const gate = standing(raw, current);
+        auditAuthorization(current ?? actor, gate);
+        const policy = parseAccessPolicy(raw.policy);
+        if (!policyMode || !current || current.personId !== actor.personId || !gate.allowed || !policy || policy === 'missing') return ACCESS_DENIED;
+        const grant = policy.members[current.personId]!;
+        const scopes = grant.storeIds.filter(id => !!policy.stores[id] && (current.tier === 'owner' || id === current.storeId));
+        tag.access = { capability: null, storeIds: scopes, identity: { personId: current.personId, policyVersion: gate.version } };
+        return `Front Claw：当前业务身份为${{ employee: '员工', manager: '店长', owner: '老板' }[gate.role]}，获授权门店：${scopes.join('、') || '无'}。`;
+      }
+      case 'self_progress': {
+        auditTarget(actor.storeId, actor.storeId);
+        return selfProgress(actor, memberId, tag, spec.wantsTarget ? { wantsTarget: true } : undefined);
+      }
+      case 'other_progress': {
+        if (!policyMode) return ACCESS_DENIED;
+        const stores = await authorizedStores(store, actor, 'progress_other', platform);
+        // 单账号/本人点名查自己时优先核实同店是否重名；无重名则走本人进度（progress_self）。
+        if (!stores.length) {
+          if (spec.employee === actor.displayName) {
+            return selfProgress(actor, memberId, tag, spec.wantsTarget ? { wantsTarget: true } : undefined);
+          }
+          auditDecision('denied');
+          return spec.strictCommand
+            ? NOT_FOUND_OR_DENIED
+            : cannot(`你没有权限查同事（${spec.employee}）的业绩，这个需要店长来查；查自己的请发「我的进度」`);
+        }
+        const people = await store.listPeople();
+        const matched = new Map<string, Person>();
+        for (const storeId of stores) {
+          const aliases = await store.listAliases(storeId);
+          for (const person of matchPeople(people, aliases, storeId, spec.employee)) {
+            if (person.personId === actor.personId || await can(actor, 'progress_other', storeId)) {
+              matched.set(person.personId, person);
+            }
+          }
+        }
+        if (matched.size > 1) return 'Front Claw：这个名字对上不止一位，请说全名。';
+        const target = [...matched.values()][0];
+        if (!target) {
+          if (spec.employee === actor.displayName) {
+            return selfProgress(actor, memberId, tag, spec.wantsTarget ? { wantsTarget: true } : undefined);
+          }
+          auditDecision('denied');
+          return NOT_FOUND_OR_DENIED;
+        }
+        if (target.personId === actor.personId) {
+          return selfProgress(actor, memberId, tag, spec.wantsTarget ? { wantsTarget: true } : undefined);
+        }
+        const result = await tools.myProgress(target.accountId);
+        let reply = result.reply.replace(/^Front Claw/, `Front Claw ${target.displayName}`);
+        if (spec.wantsTarget && result.ok) {
+          const targetRec = await store.getTarget(target.storeId, target.personId, monthKey(day));
+          reply = `${reply}\n${formatTargetBreakdown('个人', targetRec ? targetRec.amount : null, result.data.month)}`;
+        }
+        return finalCheck('progress_other', [target.storeId], reply);
+      }
+      case 'store_summary': {
+        if (!policyMode) return ACCESS_DENIED;
+        const people = await store.listPeople();
+        const scope = spec.store ? resolveStoreTarget(people, actor, spec.store) : storeById(people, actor.storeId);
+        auditTarget(spec.store ?? actor.storeId, scope?.storeId);
+        if (!scope || !await can(actor, 'store_summary', scope.storeId)) {
+          auditDecision('denied');
+          if (!scope && spec.store && otherStoreShortNames(spec.store, actor.storeName).length) {
+            return cannot(`只能办本店（${actor.storeName}）的事，${otherStoresNamed(spec.store, people, actor).join('、')}的报数和查询都不行（跨店不能代报，也不能查）`);
+          }
+          if (spec.mentionsReturningCustomer && scope && scope.storeId === actor.storeId) {
+            return cannot('你没有权限看全店的排名和汇总，这个需要店长来；查自己的请发「我的进度」');
+          }
+          return !scope || (spec.store && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
+        }
+        let reply = spec.wantsTarget
+          ? await storeTargetSummary(store, scope, day)
+          : await storeSummary(store, scope, day);
+        if (spec.mentionsReturningCustomer) {
+          reply = `${reply}\n说明：当前账本未记录老客/新客分类，以上仅提供全店业绩汇总，无法单列老客消费金额。`;
+        }
+        return finalCheck('store_summary', [scope.storeId], reply);
+      }
+      case 'self_and_summary': {
+        if (!policyMode) return ACCESS_DENIED;
+        const people = await store.listPeople();
+        const scope = spec.store ? resolveStoreTarget(people, actor, spec.store) : storeById(people, actor.storeId);
+        auditTarget(spec.store ?? actor.storeId, scope?.storeId);
+        if (!scope) {
+          auditDecision('denied');
+          if (spec.store && otherStoreShortNames(spec.store, actor.storeName).length) {
+            return cannot(`只能办本店（${actor.storeName}）的事，${otherStoresNamed(spec.store, people, actor).join('、')}的报数和查询都不行（跨店不能代报，也不能查）`);
+          }
+          return NOT_FOUND_OR_DENIED;
+        }
+        if (scope.storeId !== actor.storeId) {
+          auditDecision('denied');
+          return NOT_FOUND_OR_DENIED;
+        }
+        if (!await can(actor, 'progress_self', actor.storeId) || !await can(actor, 'store_summary', scope.storeId)) {
+          auditDecision('denied');
+          return ACCESS_DENIED;
+        }
+        const own = await tools.myProgress(actor.accountId);
+        if (!own.ok) return own.reply;
+        let ownBody = own.reply.replace(/^Front Claw\n?/, '');
+        if (spec.wantsTarget) {
+          const targetRec = await store.getTarget(actor.storeId, actor.personId, monthKey(day));
+          ownBody = `${ownBody}\n${formatTargetBreakdown('个人', targetRec ? targetRec.amount : null, own.data.month)}`;
+        }
+        const summaryReply = spec.wantsTarget
+          ? await storeTargetSummary(store, scope, day)
+          : await storeSummary(store, scope, day);
+        const current = await actorFor(memberId);
+        if (!current || current.personId !== actor.personId || current.accountId !== actor.accountId || current.storeId !== actor.storeId) return DENIED;
+        if (!await can(current, 'progress_self', actor.storeId) || !await can(current, 'store_summary', scope.storeId)) {
+          auditDecision('denied');
+          return ACCESS_DENIED;
+        }
+        tag.access = { capability: 'progress_self', additionalCapability: 'store_summary', storeIds: [actor.storeId] };
+        const summaryBody = summaryReply.replace(/^Front Claw\s*/, '');
+        return `Front Claw 本人业绩（${actor.displayName}）：\n${ownBody}\n\n本店汇总（${scope.storeName}）：\n${summaryBody}`;
+      }
+      case 'unreported': {
+        if (!policyMode) return ACCESS_DENIED;
+        const people = await store.listPeople();
+        const scope = spec.store ? resolveStoreTarget(people, actor, spec.store) : storeById(people, actor.storeId);
+        auditTarget(spec.store ?? actor.storeId, scope?.storeId);
+        if (!scope || !await can(actor, 'unreported', scope.storeId)) {
+          auditDecision('denied');
+          if (!scope && spec.store && otherStoreShortNames(spec.store, actor.storeName).length) {
+            return cannot(`只能办本店（${actor.storeName}）的事，${otherStoresNamed(spec.store, people, actor).join('、')}的报数和查询都不行（跨店不能代报，也不能查）`);
+          }
+          if (scope && scope.storeId === actor.storeId && !spec.strictCommand && !await can(actor, 'store_summary', actor.storeId)) {
+            return cannot('你没有权限看全店的排名和汇总，这个需要店长来；查自己的请发「我的进度」');
+          }
+          return !scope || (spec.store && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
+        }
+        return finalCheck('unreported', [scope.storeId], await unreported(store, scope, day));
+      }
+      case 'ranking': {
+        if (!policyMode) return ACCESS_DENIED;
+        const storeIds = await authorizedStores(store, actor, 'stores_ranking', platform);
+        if (!storeIds.length) {
+          auditDecision('denied');
+          if (!spec.strictCommand && !await can(actor, 'store_summary', actor.storeId)) {
+            return cannot('你没有权限看全店的排名和汇总，这个需要店长来；查自己的请发「我的进度」');
+          }
+          return ACCESS_DENIED;
+        }
+        const people = await store.listPeople();
+        if (spec.employeeRanking) {
+          if (spec.store) {
+            const scope = resolveStoreTarget(people, actor, spec.store);
+            auditTarget(spec.store, scope?.storeId);
+            if (!scope || !storeIds.includes(scope.storeId)) {
+              auditDecision('denied');
+              return NOT_FOUND_OR_DENIED;
+            }
+          }
+          return 'Front Claw：当前暂不支持门店内的员工排名，仅支持已授权门店之间的月业绩排名。没有读取或写入任何账目。';
+        }
+        if (spec.store || spec.ownStoreOnly) {
+          const scope = spec.store ? resolveStoreTarget(people, actor, spec.store) : storeById(people, actor.storeId);
+          auditTarget(spec.store ?? actor.storeId, scope?.storeId);
+          if (!scope || !storeIds.includes(scope.storeId)) {
+            auditDecision('denied');
+            return NOT_FOUND_OR_DENIED;
+          }
+          if (storeIds.length === 1) {
+            const total = await storeMonthTotal(store, scope.storeId, day);
+            return finalCheck(
+              'stores_ranking',
+              [scope.storeId],
+              `Front Claw ${scope.storeName} 门店排名说明（${day}）：当前你仅获授权 1 家门店（${scope.storeName}，本月已确认业绩 ${formatAmount(total)}），没有其他已授权门店可做跨店排名；如需查看本店汇总可发「经营汇总 ${scope.storeName}」（店内员工排名暂不支持）。`,
+            );
+          }
+          if (spec.excludedOtherStores?.length || spec.ownStoreOnly) {
+            return `Front Claw：门店排名需要跨门店对比，但你限定了只看${scope.storeName}（不含其他门店）。请问你是想看「${scope.storeName}本月业绩汇总」，还是想看「${scope.storeName}在你全部已授权门店中的名次」？（店内员工排名暂不支持）`;
+          }
+          const scopes = storeIds.map(id => storeById(people, id) ?? { storeId: id, storeName: id });
+          const totals = await Promise.all(scopes.map(async s => ({ ...s, total: await storeMonthTotal(store, s.storeId, day) })));
+          totals.sort((a, b) => b.total - a.total || a.storeName.localeCompare(b.storeName, 'zh'));
+          const idx = totals.findIndex(item => item.storeId === scope.storeId);
+          const item = totals[idx]!;
+          return finalCheck(
+            'stores_ranking',
+            storeIds,
+            `Front Claw 门店排名（${day}）：${scope.storeName} 在你已授权的 ${storeIds.length} 家门店中排第 ${idx + 1} 名（本月已确认业绩 ${formatAmount(item.total)}）。`,
+          );
+        }
+        const scopes = storeIds.map(id => storeById(people, id) ?? { storeId: id, storeName: id });
+        return finalCheck('stores_ranking', storeIds, await ranking(store, scopes, day));
+      }
+      case 'appointment': {
+        const got = await appointmentQuery(actor, input.text.trim(), memberId, tag, spec);
+        return got ?? ACCESS_DENIED;
+      }
+      case 'entry_result': {
+        if (!await can(actor, 'progress_self', actor.storeId)) {
+          auditDecision('denied');
+          return ACCESS_DENIED;
+        }
+        auditTarget(actor.storeId, actor.storeId);
+        const drafts = (await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
+          .filter(d => owned(d, actor, input));
+        const ask = hooks?.readAsk ? await hooks.readAsk(newCustomerAskKey(actor.personId, input.sessionId ?? '')) : null;
+        const expiredSlot = expiredPendingView(drafts, ask, now());
+        if (spec.mode === 'by_ref' && spec.ref) {
+          const ref = spec.ref;
+          const foundDraft = drafts.find(d => d.draftId === ref || meta(d)?.messageId === ref || meta(d)?.actionMessageId === ref);
+          if (foundDraft) {
+            const current = await actorFor(memberId);
+            if (!current || !owned(foundDraft, current, input)) return DENIED;
+            if (!await can(current, 'progress_self', actor.storeId)) return ACCESS_DENIED;
+            if (foundDraft.status === 'pending' && foundDraft.payload.type === 'correction' && foundDraft.payload.awaitingPick) {
+              if (!await draftAllowed(current, foundDraft)) return ACCESS_DENIED;
+              tag.access = { ...needs(foundDraft), additionalCapability: 'progress_self' };
+            } else {
+              tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
+            }
+            hooks?.setOperation?.(foundDraft.draftId, foundDraft.status === 'confirmed');
+            hooks?.setExpiredReminder?.(expiredSlot.expiredReminder);
+            return foundDraft.status === 'pending' && pendingExpired(foundDraft.expiresAt, now())
+              ? resultText({ ...foundDraft, status: 'void' })
+              : resultText(foundDraft);
+          }
+          const entries = (await store.listEntries({ storeId: actor.storeId }))
+            .filter(e => e.entryId === ref && (e.ownerPersonId === actor.personId || e.reporterPersonId === actor.personId));
+          const foundEntry = entries[0];
+          const current = await actorFor(memberId);
+          if (!current || current.personId !== actor.personId || current.storeId !== actor.storeId) return DENIED;
+          if (!await can(current, 'progress_self', actor.storeId)) return ACCESS_DENIED;
+          tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
+          if (foundEntry) {
+            hooks?.setOperation?.(foundEntry.entryId, foundEntry.status === 'confirmed');
+            return `Front Claw：已查到本人入账记录（${foundEntry.businessDay} ${foundEntry.customerName ?? '未留名'} ${formatAmount(foundEntry.amount)}元，状态：${foundEntry.status === 'confirmed' ? '已入账' : '已作废'}，操作号 ${foundEntry.entryId}）。`;
+          }
+          return `Front Claw：没有查到操作号「${ref}」对应的本人入账结果。`;
+        }
+        if (spec.mode === 'latest_confirmed') {
+          const confirmed = (await store.listEntries({ storeId: actor.storeId, status: 'confirmed' }))
+            .filter(e => e.status === 'confirmed' && (e.ownerPersonId === actor.personId || e.reporterPersonId === actor.personId))
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.entryId.localeCompare(b.entryId));
+          const latest = confirmed.at(-1);
+          const current = await actorFor(memberId);
+          if (!current || current.personId !== actor.personId || current.storeId !== actor.storeId) return DENIED;
+          if (!await can(current, 'progress_self', actor.storeId)) return ACCESS_DENIED;
+          tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
+          if (!latest) return 'Front Claw：目前没有本人已入账的业绩记录。';
+          hooks?.setOperation?.(latest.entryId, true);
+          return `Front Claw：你最近一笔已入账记录为 ${latest.businessDay} ${latest.customerName ?? '未留名'} ${formatAmount(latest.amount)}元（归属 ${latest.ownerName}）。`;
+        }
+        // latest_operation（保持「入账结果」既有语义，可展示 pending/void/confirmed 草稿）
+        const found = drafts.at(-1);
+        if (!found) {
+          hooks?.setExpiredReminder?.(expiredSlot.expiredReminder);
+          return 'Front Claw：没有可查的本人操作结果。';
+        }
+        const current = await actorFor(memberId);
+        if (!current || !owned(found, current, input)) return DENIED;
+        if (!await can(current, 'progress_self', actor.storeId)) return ACCESS_DENIED;
+        if (found.status === 'pending' && found.payload.type === 'correction' && found.payload.awaitingPick) {
+          if (!await draftAllowed(current, found)) return ACCESS_DENIED;
+          tag.access = { ...needs(found), additionalCapability: 'progress_self' };
+        } else {
+          tag.access = { capability: 'progress_self', storeIds: [actor.storeId] };
+        }
+        hooks?.setOperation?.(found.draftId, found.status === 'confirmed');
+        hooks?.setExpiredReminder?.(expiredSlot.expiredReminder);
+        return found.status === 'pending' && pendingExpired(found.expiresAt, now())
+          ? resultText({ ...found, status: 'void' })
+          : resultText(found);
+      }
     }
-    const wantsSelfScope = named === undefined && /(?:我|本人|自己)/.test(text) && !/(?:本店|全店|门店|店里|我们店)/.test(text);
-    if (object === 'progress' || object === 'entry' || (wantsSelfScope && (object === 'target' || object === 'completion' || object === 'performance'))) {
-      return selfProgress(actor, memberId, tag);
-    }
-    if (object === 'performance' || object === 'summary' || object === 'completion' || object === 'target') {
-      if (!policyMode) return ACCESS_DENIED;
-      const capability: Capability = 'store_summary';
-      const people = await store.listPeople();
-      const scope = storeById(people, actor.storeId);
-      if (!scope || !await can(actor, capability, scope.storeId)) return ACCESS_DENIED;
-      const reply = wantsTarget ? await storeTargetSummary(store, scope, day) : await storeSummary(store, scope, day);
-      const current = await actorFor(memberId);
-      if (!current || current.personId !== actor.personId) return DENIED;
-      if (!await can(current, capability, scope.storeId)) return ACCESS_DENIED;
-      tag.access = { capability, storeIds: [scope.storeId] };
-      return reply;
-    }
-    if (object === 'ranking') {
-      if (!policyMode) return ACCESS_DENIED;
-      const storeIds = await authorizedStores(store, actor, 'stores_ranking', platform);
-      if (!storeIds.length) return ACCESS_DENIED;
-      const people = await store.listPeople();
-      const scopes = storeIds.map(id => storeById(people, id) ?? { storeId: id, storeName: id });
-      const day = businessDate(now(), cutoff, timeZone);
-      const reply = await ranking(store, scopes, day);
-      const current = await actorFor(memberId);
-      if (!current || current.personId !== actor.personId) return DENIED;
-      tag.access = { capability: 'stores_ranking', storeIds: [...storeIds] };
-      return reply;
-    }
-    if (object === 'appointment') {
-      if (otherStoreShortNames(text, actor.storeName).length > 0) return NOT_FOUND_OR_DENIED;
-      if (c.slots.employee && c.slots.employee !== actor.displayName && !/^(?:我|本人)$/.test(c.slots.employee)) return NOT_FOUND_OR_DENIED;
-      const cmd = /明天|明日/.test(text) ? '查我明天的预约' : (/今天|今日/.test(text) && !/今天及以后/.test(text) ? '查我今天的预约' : '我的预约');
-      const got = await appointmentQuery(actor, cmd, memberId, tag);
-      return got ?? ACCESS_DENIED;
-    }
-    return ACCESS_DENIED;
+  }
+
+  async function dispatchClassifiedQuery(
+    actor: Person,
+    c: ModelClassification,
+    text: string,
+    input: EmployeeMessage,
+    tag: Tag,
+    hooks?: {
+      readAsk?: (key: string) => Promise<string | null | undefined>;
+      setExpiredReminder?: (reminder: string) => void;
+      setOperation?: (id: string, settled: boolean) => void;
+    },
+  ): Promise<string> {
+    const day = businessDate(now(), cutoff, timeZone);
+    const spec = fromModelReadQuery(c, text, day);
+    if (!spec) return ACCESS_DENIED;
+    return executeReadQuery(spec, actor, input, tag, day, hooks);
   }
   async function handleClassified(
     actor: Person, text: string, input: EmployeeMessage, tag: Tag,
@@ -1033,7 +1355,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     if (!chain.ok) return { reply: chain.ask, kind: 'ask' };
     const c = chain.classification;
     if (isReadOnlyQuery(c)) {
-      const q = await dispatchClassifiedQuery(actor, c, text, input.memberId, tag);
+      const q = await dispatchClassifiedQuery(actor, c, text, input, tag);
       return { reply: q, ...(tag.access ? { access: tag.access } : {}) };
     }
     const amend = c.intent === 'amend' || c.action === 'amend';
@@ -1142,88 +1464,62 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         if (!gate.allowed) return ACCESS_DENIED;
       }
       const businessDayNow = businessDate(now(), cutoff, timeZone);
-      const requested = businessRead(text, businessDayNow);
-      if (onlyNegatedAppointment(text)) return 'Front Claw：没有登记预约。';
-      if (requested?.kind === 'historical') return HISTORICAL_PERIOD_UNSUPPORTED;
-      if (requested?.kind === 'existing') {
-        text = requested.command;
-        // Reject unsupported explicit appointment scope before reading pending state.
-        const apptRead = parseAppointmentReadQuery(text);
-        if (apptRead?.scope === 'other' && apptRead.target !== actor.storeId && apptRead.target !== actor.storeName) {
-          auditTarget(apptRead.target ?? text);
-          return NOT_FOUND_OR_DENIED;
+      let readExpiredHandled = false;
+      const readHooks = {
+        readAsk,
+        setExpiredReminder: (reminder: string) => { expiredPendingReminder = reminder; readExpiredHandled = true; },
+        setOperation: (id: string, settled: boolean) => { operationId = id; ledgerSettled = settled; },
+      };
+      const finalizeReadQuery = async (spec: ReadQuerySpec | undefined, reply: string): Promise<string> => {
+        if (
+          readExpiredHandled
+          || spec?.kind === 'identity'
+          || spec?.kind === 'denied_scope'
+          || spec?.kind === 'unsupported'
+          || spec?.kind === 'historical_unsupported'
+        ) {
+          return reply;
         }
-      }
-      if (requested?.kind === 'unsupported') return 'Front Claw：暂不支持这项只读查询。';
-      if (requested?.kind === 'managed') {
-        if (!policyMode) return ACCESS_DENIED;
-        return (await managementQuery(actor, requested.command, input.memberId, tag)) ?? NOT_FOUND_OR_DENIED;
-      }
-      if (requested?.kind === 'identity') {
-        const current = await actorFor(input.memberId);
-        const raw = await readPolicy(store);
-        const gate = standing(raw, current);
-        auditAuthorization(current ?? actor, gate);
-        const policy = parseAccessPolicy(raw.policy);
-        if (!policyMode || !current || current.personId !== actor.personId || !gate.allowed || !policy || policy === 'missing') return ACCESS_DENIED;
-        const grant = policy.members[current.personId]!;
-        const scopes = grant.storeIds.filter(id => !!policy.stores[id] && (current.tier === 'owner' || id === current.storeId));
-        tag.access = { capability: null, storeIds: scopes, identity: { personId: current.personId, policyVersion: gate.version } };
-        return `Front Claw：当前业务身份为${{ employee: '员工', manager: '店长', owner: '老板' }[gate.role]}，获授权门店：${scopes.join('、') || '无'}。`;
-      }
-      if (requested?.kind === 'self_and_summary') {
-        if (!policyMode) return ACCESS_DENIED;
-        const people = await store.listPeople();
-        const scope = requested.store ? resolveStoreTarget(people, actor, requested.store) : storeById(people, actor.storeId);
-        auditTarget(requested.store ?? actor.storeId, scope?.storeId);
-        if (!scope) {
-          auditDecision('denied');
-          if (requested.store && otherStoreShortNames(requested.store, actor.storeName).length) {
-            return cannot(`只能办本店（${actor.storeName}）的事，${otherStoresNamed(requested.store, people, actor).join('、')}的报数和查询都不行（跨店不能代报，也不能查）`);
-          }
-          return NOT_FOUND_OR_DENIED;
+        // 严格权限拒绝（ACCESS_DENIED / DENIED / NOT_FOUND_OR_DENIED）绝不触碰任何业务草稿/账本读取，保持 readStoreIds = []。
+        if (reply === ACCESS_DENIED || reply === DENIED || reply === NOT_FOUND_OR_DENIED) {
+          return reply;
         }
-        if (scope.storeId !== actor.storeId) {
-          auditDecision('denied');
-          return NOT_FOUND_OR_DENIED;
+        // 跨店授权查询（例如老板只查 s-b 汇总）不额外读取本人档案店（如 s-a）的草稿表，保证 readStoreIds 严格等于目标店。
+        if (tag.access && tag.access.storeIds.length > 0 && !tag.access.storeIds.includes(actor.storeId)) {
+          return reply;
         }
-        if (!await can(actor, 'progress_self', actor.storeId) || !await can(actor, 'store_summary', scope.storeId)) {
-          auditDecision('denied');
-          return ACCESS_DENIED;
+        const draftsNow = structuredClone(await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
+          .filter(d => owned(d, actor, input));
+        const strictReadonly = isManagedQueryPhrase(text) || existingReadCommand(text)
+          || /^(?:[A-Za-z]+-[A-Za-z]*\d+[：:]\s*)?只读(?:查询|核对)/.test(text);
+        if (reply.startsWith('Front Claw：不能做——') && !strictReadonly) {
+          const expiredSlot = await advance(actor, draftsNow, undefined, true);
+          if (expiredSlot.blocked) return 'Front Claw：请求已取消或草稿版本已变化，请查原操作结果。';
+          if (expiredSlot.expired.length > 0 && active()) await clearInterleaved(actor);
+          return reply;
         }
-        const own = await tools.myProgress(actor.accountId);
-        if (!own.ok) return own.reply;
-        const summaryReply = await storeSummary(store, scope, businessDayNow);
-        const current = await actorFor(input.memberId);
-        if (!current || current.personId !== actor.personId || current.accountId !== actor.accountId || current.storeId !== actor.storeId) return DENIED;
-        if (!await can(current, 'progress_self', actor.storeId) || !await can(current, 'store_summary', scope.storeId)) {
-          auditDecision('denied');
-          return ACCESS_DENIED;
-        }
-        tag.access = { capability: 'progress_self', additionalCapability: 'store_summary', storeIds: [actor.storeId] };
-        const ownBody = own.reply.replace(/^Front Claw\n?/, '');
-        const summaryBody = summaryReply.replace(/^Front Claw\s*/, '');
-        return `Front Claw 本人业绩（${actor.displayName}）：\n${ownBody}\n\n本店汇总（${scope.storeName}）：\n${summaryBody}`;
-      }
-      if (requested?.kind === 'summary') {
-        if (!policyMode) return ACCESS_DENIED;
-        return (await managementQuery(actor, requested.store ? '经营汇总 ' + requested.store : '经营汇总', input.memberId, tag, requested.withTarget ? { withTarget: true } : undefined)) ?? NOT_FOUND_OR_DENIED;
-      }
-      if (requested?.kind === 'self') {
-        auditTarget(actor.storeId, actor.storeId);
-        const reply = await selfProgress(actor, input.memberId, tag);
-        if (tag.access) {
-          const drafts = (await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId })).filter(d => owned(d, actor, input));
-          const ask = await readAsk(newCustomerAskKey(actor.personId, input.sessionId ?? ''));
-          expiredPendingReminder = expiredPendingView(drafts, ask, now()).expiredReminder;
-        }
+        const expiredSlot = expiredPendingView(
+          draftsNow,
+          await readAsk(newCustomerAskKey(actor.personId, input.sessionId ?? '')),
+          now(),
+        );
+        expiredPendingReminder = expiredSlot.expiredReminder;
         return reply;
+      };
+      const ruleReadSpec = preflightReply === undefined ? parseRuleReadQuery(text, businessDayNow) : undefined;
+      if (onlyNegatedAppointment(text) && !ruleReadSpec) return 'Front Claw：没有登记预约。';
+      if (ruleReadSpec) {
+        return finalizeReadQuery(ruleReadSpec, await executeReadQuery(ruleReadSpec, actor, input, tag, businessDayNow, readHooks));
       }
       if (input.modelClassification?.intent === 'query') {
         if (!isReadOnlyQuery(input.modelClassification)) return 'Front Claw：暂不支持这项只读查询。';
         const chain = validateModelChain({ text, output: input.modelClassification });
         if (!chain.ok) return askReply(chain.ask);
-        return dispatchClassifiedQuery(actor, chain.classification, text, input.memberId, tag);
+        const modelSpec = fromModelReadQuery(chain.classification, text, businessDayNow);
+        const reply = modelSpec
+          ? await executeReadQuery(modelSpec, actor, input, tag, businessDayNow, readHooks)
+          : ACCESS_DENIED;
+        return finalizeReadQuery(modelSpec, reply);
       }
       // D179 统一过期收尾：先生成本请求私有快照并关闭过期项，所有正常分支共用；
       // 回复只在循环出口追加。expireOnly 不消费有效追问，正常确认仍复用这一次 config 读取。
@@ -1667,11 +1963,18 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       }
       const today = businessDate(now(), cutoff, timeZone);
       const rawText = text;
+      const markActivePendingInterleaved = async () => {
+        const activePending = pending.filter(d => d.kind === 'report' && !pendingExpired(d.expiresAt, now()));
+        if (activePending.length === 1 && input.sessionId) {
+          await writesFor(input).putOperationRecord(d175InterleavedKey(actor.personId, input.sessionId), activePending[0]!.draftId);
+        }
+      };
       if (input.modelClassification?.intent === 'report') {
-        const deniedReason = nonClosingReportReason(rawText);
+        const deniedReason = nonClosingReportReason(rawText, { requireAmount: false });
         if (deniedReason) {
           input.onGate?.('model_candidate_rejected');
-          return askReply(clarifyQuestion(deniedReason));
+          await markActivePendingInterleaved();
+          return clarifyQuestion(deniedReason);
         }
         const candidate = modelReportCandidate(rawText, input.modelClassification, actor, today);
         if (!candidate) {
@@ -1679,6 +1982,12 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
           return askReply(REPORT_HINT);
         }
         text = candidate;
+      } else {
+        const directDenied = nonClosingReportReason(rawText);
+        if (directDenied) {
+          await markActivePendingInterleaved();
+          return clarifyQuestion(directDenied);
+        }
       }
       // R8：标准行先走同一份语法（D125）。否定/小额小数追问（D122/D123），非今天拒（D124）。
       const oralProjectLine = oralProjectReportLine(text);

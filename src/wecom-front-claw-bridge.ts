@@ -126,7 +126,9 @@ export interface BridgeStoreLike {
   updateConfigLocked?(
     key: string,
     extraKeys: readonly string[],
-    fn: (current: Record<string, string | null>) => Record<string, string> | null,
+    fn: (
+      current: Record<string, string | null>,
+    ) => Record<string, string> | null,
   ): Promise<unknown>;
 }
 
@@ -151,7 +153,10 @@ export interface BridgeGrantTransaction {
   readonly store: BridgeStoreLike;
   readonly bindings: BridgeBindingStoreLike;
   /** Called after locking the policy and lease, in the same transaction. */
-  lockIdentity(personId: string, binding: Readonly<BridgeWecomBotBinding>): Promise<void>;
+  lockIdentity(
+    personId: string,
+    binding: Readonly<BridgeWecomBotBinding>,
+  ): Promise<void>;
 }
 
 export interface OpenDotClassifierRuntimeConfig {
@@ -175,7 +180,10 @@ export interface TargetAgentProfileSnapshot {
   readonly executionMode?: ExecutionMode | string;
   readonly contextSource?: 'managed' | 'host_claude' | string;
   readonly hostSkillsMode?: 'inherit' | 'custom' | 'disabled' | string;
-  readonly runtimePolicy?: Pick<AgentProfile['runtime_policy'], 'context' | 'skills'>;
+  readonly runtimePolicy?: Pick<
+    AgentProfile['runtime_policy'],
+    'context' | 'skills'
+  >;
   readonly allowedTools?: readonly string[];
   readonly disallowedTools?: readonly string[];
   readonly excludedTools?: readonly string[];
@@ -254,6 +262,13 @@ export interface WeComFrontClawBridgeOptions {
     pendingSequence: string | null;
     modelMs: number;
     errorCategory: string;
+  }) => void;
+  /** 旁路脱敏审计回调：为快通道、拒绝与放行路径统一透出可信身份 tier / storeId（不改变 precheck 返回契约）。 */
+  readonly onPrecheckAudit?: (record: {
+    readonly messageId: string;
+    readonly storeId?: string;
+    readonly tier?: BridgePerson['tier'];
+    readonly targetRole?: WeComSoftRole;
   }) => void;
   readonly onRoute?: (record: unknown) => void;
   readonly platformCapabilitiesRaw?: string;
@@ -392,46 +407,57 @@ const MODEL_CLASSIFIER_SYSTEM_PROMPT = [
   '只输出一个合法 JSON 对象，不要包含 Markdown 代码块、解释或多余文本。',
   '顶层仅允许这 6 个键：intent, object, action, slots, confidence, uncertain。',
   'intent 仅可为：report | query | amend | withdraw | appointment | target | chitchat | marketing | unknown。',
-  'object 仅可为：null | performance | target | completion | entry | appointment | progress | ranking | summary。',
+  'object 仅可为：null | performance | target | completion | entry | appointment | progress | ranking | summary | unreported | identity | self_and_summary。',
   'action 仅可为：null | query | report | amend | cancel | delete。',
-  'slots 仅允许这 6 个键：amountText, customer, employee, index, period, store（禁止输出 customerName、projectName、amount、cents 等未定义键）。',
+  'slots 仅允许这 9 个键：amountText, customer, employee, index, period, store, ref, countOnly, entryMode（禁止输出 customerName、projectName、amount、cents 等未定义键）。',
   '映射规则：',
-  '- 员工报业绩：intent="report", object="performance", action="report"，客户称呼放入 slots.customer（须为原文子串），金额原文放入 slots.amountText（绝不猜数字或换算）。',
-  '- 查本人业绩/进度：intent="query", object="progress", action="query"；查全店汇总：object="summary", action="query"；查排名：object="ranking", action="query"。',
+  '- 员工报业绩：intent="report", object="performance", action="report"，客户称呼放入 slots.customer（须为原文子串），金额原文放入 slots.amountText（绝不猜数字或换算）。明确未成交或否定报单不要判为 report。',
+  '- 查本人业绩/进度：intent="query", object="progress", action="query"；查同事进度同样用 object="progress" 并将姓名放入 slots.employee。',
+  '- 查全店汇总：object="summary", action="query"；同时查本人与本店：object="self_and_summary", action="query"；查今天谁没报/未报名单：object="unreported", action="query"；查排名：object="ranking", action="query"；查当前岗位/授权门店：object="identity", action="query"。',
+  '- 查入账结果或指定操作号/单号：intent="query", object="entry", action="query"，如有单号放入 slots.ref，区分最近已入账（slots.entryMode="latest_confirmed"）与最近一次操作结果（slots.entryMode="latest_operation"）。',
   '- 改账：intent="amend", object="entry", action="amend"；撤回/作废：intent="withdraw", object="entry", action="cancel"。',
-  '- 预约：intent="appointment", object="appointment", action="report"|"query"|"cancel"；目标：intent="target", object="target", action="report"|"query"|"amend"。',
+  '- 预约：新建/取消用 intent="appointment", object="appointment", action="report"|"cancel"；查已有预约用 intent="query", object="appointment", action="query"（只问数量设 slots.countOnly=true，日期放 slots.period）。目标设置用 intent="target", object="target", action="report"|"amend"，查目标/完成率用 intent="query", object="target"|"completion", action="query"。',
   '- 客套闲聊：intent="chitchat", object=null, action=null, slots={}。',
-  '- 营销文案、教学培训/家访带教、客服接待/异议话术、投流团购诊断、店长经营复盘建议等非账本咨询：intent="marketing", object=null, action=null, slots={}。纯查账、报数、改账、预约、设目标仍按上面的店务规则分类。',
+  '- 营销文案、教学培训/家访带教、客服接待/异议话术、投流团购诊断/投流复盘、店长经营复盘建议等非账本咨询：intent="marketing", object=null, action=null, slots={}。纯查账、报数、改账、预约、设目标仍按上面的店务规则分类。',
   'confidence 为 0..1 数值，uncertain 为布尔值；若拿不准或含糊请设为 {"intent":"unknown","object":null,"action":null,"slots":{},"confidence":0,"uncertain":true}。',
 ].join('\n');
 
 export function classifyWeComSoftRole(text: string): WeComSoftRole {
+  // 1. 培训/带教/演练作为主请求动作时优先（例如「培训如何做投流复盘」→ training）。
   if (
-    /培训|带教|家访|五步法|企业诊断|指导员|考核|试卷|演练|新人怎么|课程|作战地图|鱼骨图|热力图|客户盘点|信念|U字形/i.test(
+    /培训|带教|家访|五步法|企业诊断|指导员|考核|试卷|演练|新人怎么|教新人|课程|课件|作战地图|鱼骨图|热力图|客户盘点|信念|U字形/i.test(
       text,
     )
   ) {
     return 'training';
   }
+  // 2. 明确指向门店/店长经营复盘与业绩管理（例如「店长复盘中提到美团」→ manager_ops）。
   if (
-    /复盘|经营诊断|经营分析|门店诊断|日报建议|周报建议|旬总结建议|怎么提升业绩|业绩怎么抓|目标怎么拆|挂零怎么管/.test(
+    /经营复盘|门店复盘|店长复盘|业绩复盘|店务复盘|经营诊断|经营分析|门店诊断|日报建议|周报建议|旬总结建议|怎么提升业绩|业绩怎么抓|目标怎么拆|挂零怎么管/.test(
       text,
     )
   ) {
     return 'manager_ops';
   }
+  // 3. 客户接待话术/客诉/质检与平台投流团购诊断/复盘（例如「美团团购投流效果不好，做个只读复盘」→ reception_ads）。
   if (
-    /接待话术|怎么接待|客诉|嫌贵|异议|怎么回复客户|退卡安抚|质检|投流|美团|大众点评|团购诊断|\bROI\b|点击率|线索转化/i.test(
+    /接待话术|怎么接待|客诉|嫌贵|异议|怎么回复客户|退卡安抚|质检|投流|美团|大众点评|团购|\bROI\b|点击率|线索转化/i.test(
       text,
     )
   ) {
     return 'reception_ads';
   }
+  // 4. 仅剩裸「复盘」而未指定投流/培训对象时，默认按门店经营复盘收口（受店长/老板权限门禁保护）。
+  if (/复盘/.test(text)) {
+    return 'manager_ops';
+  }
   return 'marketing';
 }
 
 interface FrontClawBootModule {
-  bootFrontClaw: (options: Record<string, unknown>) => Promise<FrontClawBootInstance>;
+  bootFrontClaw: (
+    options: Record<string, unknown>,
+  ) => Promise<FrontClawBootInstance>;
 }
 
 interface FrontClawEntryModule {
@@ -779,14 +805,17 @@ let cachedModulesPromise: Promise<FrontClawModules> | undefined;
 
 async function importFrontClawSubpath<T>(subpath: string): Promise<T> {
   const srcRel = `../packages/front-claw/src/${subpath}`;
-  const distAbs = path.join(REPO_ROOT, 'packages', 'front-claw', 'dist', subpath);
+  const distAbs = path.join(
+    REPO_ROOT,
+    'packages',
+    'front-claw',
+    'dist',
+    subpath,
+  );
   const srcAbs = path.join(REPO_ROOT, 'packages', 'front-claw', 'src', subpath);
 
   const candidates = RUNNING_FROM_DIST
-    ? [
-        ...(existsSync(distAbs) ? [pathToFileURL(distAbs).href] : []),
-        srcRel,
-      ]
+    ? [...(existsSync(distAbs) ? [pathToFileURL(distAbs).href] : []), srcRel]
     : [
         srcRel,
         ...(existsSync(distAbs) ? [pathToFileURL(distAbs).href] : []),
@@ -825,9 +854,15 @@ async function loadFrontClawModules(): Promise<FrontClawModules> {
         money,
         storeHours,
       ] = await Promise.all([
-        importFrontClawSubpath<FrontClawBootModule>('role-eval/front-claw-boot.js'),
-        importFrontClawSubpath<FrontClawEntryModule>('role-eval/employee-entry.js'),
-        importFrontClawSubpath<FrontClawLoopModule>('role-eval/employee-loop.js'),
+        importFrontClawSubpath<FrontClawBootModule>(
+          'role-eval/front-claw-boot.js',
+        ),
+        importFrontClawSubpath<FrontClawEntryModule>(
+          'role-eval/employee-entry.js',
+        ),
+        importFrontClawSubpath<FrontClawLoopModule>(
+          'role-eval/employee-loop.js',
+        ),
         importFrontClawSubpath<FrontClawUnifiedModule>(
           'role-eval/wecom-bot-unified-handler.js',
         ),
@@ -841,7 +876,9 @@ async function loadFrontClawModules(): Promise<FrontClawModules> {
         importFrontClawSubpath<FrontClawAccessPolicyModule>(
           'role-eval/access-policy.js',
         ),
-        importFrontClawSubpath<FrontClawLeaseModule>('opendot/consumer-lease.js'),
+        importFrontClawSubpath<FrontClawLeaseModule>(
+          'opendot/consumer-lease.js',
+        ),
         importFrontClawSubpath<FrontClawFencingModule>('role-eval/fencing.js'),
         importFrontClawSubpath<FrontClawNotificationModule>(
           'role-eval/notification-dispatch.js',
@@ -882,7 +919,10 @@ const nonEmpty = (value: unknown): value is string =>
   typeof value === 'string' && value.trim().length > 0;
 
 function normalizeToolName(name: string): string {
-  return name.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
 }
 
 function isDangerousTool(name: string): boolean {
@@ -1182,7 +1222,8 @@ export function createModelClassifierFromOpenDotConfig(
       'anthropic-version': '2023-06-01',
     };
     if (runtime.apiKey) headers['x-api-key'] = runtime.apiKey;
-    if (runtime.authToken) headers.authorization = `Bearer ${runtime.authToken}`;
+    if (runtime.authToken)
+      headers.authorization = `Bearer ${runtime.authToken}`;
 
     const res = await fetch(url, {
       method: 'POST',
@@ -1203,7 +1244,9 @@ export function createModelClassifierFromOpenDotConfig(
     };
     const combined = Array.isArray(payload.content)
       ? payload.content
-          .filter((item) => item?.type === 'text' && typeof item.text === 'string')
+          .filter(
+            (item) => item?.type === 'text' && typeof item.text === 'string',
+          )
           .map((item) => item.text as string)
           .join('')
       : '';
@@ -1245,7 +1288,8 @@ async function resolveDbWorkspaceProfileSnapshot(
             profileId: profile.id,
             status: profile.status,
             contextSource: profile.runtime_policy.context.source,
-            hostSkillsMode: profile.runtime_policy.skills.host?.mode ?? 'disabled',
+            hostSkillsMode:
+              profile.runtime_policy.skills.host?.mode ?? 'disabled',
             runtimePolicy: {
               context: profile.runtime_policy.context,
               skills: profile.runtime_policy.skills,
@@ -1316,7 +1360,10 @@ export async function createWeComFrontClawBridge(
   // 保证模型分类超时永远早于外层请求截止时间，超时一定收口到 clarify（handled）而不是 budget timeout（failed）。
   const effectiveModelTimeoutMs =
     budgetMs >= 200
-      ? Math.min(requestedModelTimeoutMs, Math.max(50, Math.floor(budgetMs * 0.6)))
+      ? Math.min(
+          requestedModelTimeoutMs,
+          Math.max(50, Math.floor(budgetMs * 0.6)),
+        )
       : requestedModelTimeoutMs;
 
   const resolvedModelClassifier =
@@ -1330,7 +1377,9 @@ export async function createWeComFrontClawBridge(
 
   let sendHandler = options.sendNotification;
   let bootRef: FrontClawBootInstance | undefined;
-  let lease: ReturnType<FrontClawLeaseModule['createConsumerLease']> | undefined;
+  let lease:
+    | ReturnType<FrontClawLeaseModule['createConsumerLease']>
+    | undefined;
   let leaseTimer: ReturnType<typeof setInterval> | undefined;
   let grantPool: Promise<GrantPgPool> | undefined;
   let withGrantTransaction: BridgeOpenedStore['withGrantTransaction'];
@@ -1349,18 +1398,28 @@ export async function createWeComFrontClawBridge(
       ? { maintenanceIntervalMs: options.maintenanceIntervalMs }
       : {}),
     ...(platformCapabilities ? { platformCapabilities } : {}),
-    ...(open ? {
-      open: async () => {
-        const opened = await open();
-        withGrantTransaction = opened.withGrantTransaction?.bind(opened);
-        return opened;
-      },
-    } : {}),
-    ...(options.onEmployeeTrace ? { onEmployeeTrace: options.onEmployeeTrace } : {}),
+    ...(open
+      ? {
+          open: async () => {
+            const opened = await open();
+            withGrantTransaction = opened.withGrantTransaction?.bind(opened);
+            return opened;
+          },
+        }
+      : {}),
+    ...(options.onEmployeeTrace
+      ? { onEmployeeTrace: options.onEmployeeTrace }
+      : {}),
     model: {
       complete: async () => ({ type: 'chat', text: 'Front Claw 在。' }),
     },
-    send: async ({ toPersonId, text }: { toPersonId: string; text: string }) => {
+    send: async ({
+      toPersonId,
+      text,
+    }: {
+      toPersonId: string;
+      text: string;
+    }) => {
       if (closing || !isLeaseHeld() || !sendHandler || !bootRef) {
         return 'not_sent';
       }
@@ -1382,12 +1441,16 @@ export async function createWeComFrontClawBridge(
       passthroughMarketing: true,
       budgetMs,
       modelClassifyTimeoutMs: effectiveModelTimeoutMs,
-      ...(resolvedModelClassifier ? { modelClassify: resolvedModelClassifier } : {}),
+      ...(resolvedModelClassifier
+        ? { modelClassify: resolvedModelClassifier }
+        : {}),
       ...(options.modelConfig !== undefined && !resolvedModelClassifier
         ? { modelConfig: options.modelConfig }
         : {}),
       ...(options.semantic !== undefined ? { semantic: options.semantic } : {}),
-      ...(options.onObservation ? { onObservation: options.onObservation } : {}),
+      ...(options.onObservation
+        ? { onObservation: options.onObservation }
+        : {}),
       ...(options.onRoute ? { onRoute: options.onRoute } : {}),
     },
   });
@@ -1442,7 +1505,8 @@ export async function createWeComFrontClawBridge(
     if (!fence || !lease.held() || lease.fence()?.epoch !== fence.epoch) {
       return false;
     }
-    const raw = (await boot.store.getConfig?.(fence.key).catch(() => null)) ?? null;
+    const raw =
+      (await boot.store.getConfig?.(fence.key).catch(() => null)) ?? null;
     const record = mods.fencing.parseLeaseRecord(raw);
     return mods.fencing.fenceHolds(record, fence, now().getTime());
   }
@@ -1743,7 +1807,10 @@ export async function createWeComFrontClawBridge(
     } catch {
       return { reason: 'invalid_directory' };
     }
-    if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== 'object')) {
+    if (
+      !Array.isArray(rows) ||
+      rows.some((row) => !row || typeof row !== 'object')
+    ) {
       return { reason: 'invalid_directory' };
     }
 
@@ -1871,6 +1938,32 @@ export async function createWeComFrontClawBridge(
 
   const employeeQueues = new Map<string, Promise<void>>();
 
+  function formatStoreLocalDateTime(date: Date, timeZone: string): string {
+    const dtParts = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(date);
+    const get = (t: string) => dtParts.find((p) => p.type === t)?.value ?? '';
+    const hour = get('hour') === '24' ? '00' : get('hour');
+    const offsetName =
+      new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        timeZoneName: 'longOffset',
+      })
+        .formatToParts(date)
+        .find((p) => p.type === 'timeZoneName')?.value ?? 'GMT+00:00';
+    const match = /GMT([+-]\d{2}:?\d{2})/.exec(offsetName);
+    let offset = match?.[1] ?? '+00:00';
+    if (offset.length === 5)
+      offset = `${offset.slice(0, 3)}:${offset.slice(3)}`;
+    return `${get('year')}-${get('month')}-${get('day')} ${hour}:${get('minute')} (${offset}, ${timeZone})`;
+  }
+
   async function readManagerSnapshot(
     actor: BridgePerson,
     rawHours: string | null,
@@ -1878,8 +1971,9 @@ export async function createWeComFrontClawBridge(
     const hours = mods.storeHours.resolveStoreHours(rawHours, actor.storeId);
     if (!hours || !boot.store.listEntries)
       throw new Error('store_snapshot_unavailable');
+    const currentNow = now();
     const today = mods.metrics.businessDate(
-      now(),
+      currentNow,
       hours.cutoff,
       hours.timeZone,
     );
@@ -1902,6 +1996,7 @@ export async function createWeComFrontClawBridge(
     }
     return [
       '【本店只读经营快照（供复盘参考，严禁声称可改账）】',
+      `当前当地时间：${formatStoreLocalDateTime(currentNow, hours.timeZone)}`,
       `业务日：${today}`,
       `今日已确认业绩：${mods.money.formatYuan(todayAmount)}元（${todayCount}笔）`,
       `本月累计已确认业绩：${mods.money.formatYuan(monthAmount)}元（${monthCount}笔）`,
@@ -1944,10 +2039,30 @@ export async function createWeComFrontClawBridge(
     }
 
     const { binding, person } = resolved.identity;
+    const emitPrecheckAudit = (
+      candidate: BridgePerson,
+      targetRole?: WeComSoftRole,
+    ) => {
+      try {
+        options.onPrecheckAudit?.({
+          messageId: event.messageId,
+          storeId: candidate.storeId,
+          tier: candidate.tier,
+          ...(targetRole ? { targetRole } : {}),
+        });
+      } catch {
+        /* 观测回调不得影响业务主链路 */
+      }
+    };
+    emitPrecheckAudit(person);
     const refreshPerson = (source?: GrantStores) =>
       refreshBoundPerson(resolved.identity, source);
     try {
-      await provisionDefaultGrant(resolved.identity, refreshPerson, activeFence);
+      await provisionDefaultGrant(
+        resolved.identity,
+        refreshPerson,
+        activeFence,
+      );
     } catch {
       logger.warn('Front Claw automatic role grant failed');
     }
@@ -2015,6 +2130,7 @@ export async function createWeComFrontClawBridge(
         };
       }
       const targetRole = classifyWeComSoftRole(event.text);
+      emitPrecheckAudit(actor, targetRole);
       const canReview = async (candidate: BridgePerson): Promise<boolean> =>
         candidate.tier !== 'employee' &&
         decideManagerReview(await readPolicy(), candidate, candidate.storeId)
@@ -2206,7 +2322,9 @@ export async function createWeComFrontClawBridge(
     };
   }
 
-  function precheck(event: WeComInboundTextEvent): Promise<WeComPrecheckOutcome> {
+  function precheck(
+    event: WeComInboundTextEvent,
+  ): Promise<WeComPrecheckOutcome> {
     if (closing || closed) {
       return Promise.resolve({
         kind: 'failed',

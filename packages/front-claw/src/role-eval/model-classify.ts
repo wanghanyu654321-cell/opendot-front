@@ -14,14 +14,17 @@ import { clarifyQuestion } from './clarify.js';
 import type { UnclearReason } from './report-extract.js';
 
 export const MODEL_INTENTS = ['report', 'query', 'amend', 'withdraw', 'appointment', 'target', 'chitchat', 'marketing', 'unknown'] as const;
-export const MODEL_OBJECTS = ['performance', 'target', 'completion', 'entry', 'appointment', 'progress', 'ranking', 'summary'] as const;
+export const MODEL_OBJECTS = ['performance', 'target', 'completion', 'entry', 'appointment', 'progress', 'ranking', 'summary', 'unreported', 'identity', 'self_and_summary'] as const;
 export const MODEL_ACTIONS = ['query', 'report', 'amend', 'cancel', 'delete'] as const;
+export const MODEL_ENTRY_MODES = ['latest_operation', 'latest_confirmed', 'by_ref'] as const;
+export const MODEL_SLOT_KEYS = ['amountText', 'customer', 'employee', 'index', 'period', 'store', 'ref', 'countOnly', 'entryMode'] as const;
 
 export type ModelIntent = (typeof MODEL_INTENTS)[number];
 export type ModelObject = (typeof MODEL_OBJECTS)[number];
 export type ModelAction = (typeof MODEL_ACTIONS)[number];
+export type ModelEntryMode = (typeof MODEL_ENTRY_MODES)[number];
 
-/** 槽位只收原始文本。金额必须是字符串，由金额校验函数换成分数；模型不得直接给分。 */
+/** 槽位只收原始文本或纯只读标志。金额必须是字符串，由金额校验函数换成分数；模型不得直接给分。 */
 export interface ModelSlots {
   amountText?: string;
   customer?: string;
@@ -29,6 +32,9 @@ export interface ModelSlots {
   index?: number;
   period?: string;
   store?: string;
+  ref?: string;
+  countOnly?: boolean;
+  entryMode?: ModelEntryMode;
 }
 
 export interface ModelClassification {
@@ -62,7 +68,8 @@ export function isModelStub(classifier: unknown): boolean {
 const INTENT_SET = new Set<string>(MODEL_INTENTS);
 const OBJECT_SET = new Set<string>(MODEL_OBJECTS);
 const ACTION_SET = new Set<string>(MODEL_ACTIONS);
-const SLOT_KEYS = new Set(['amountText', 'customer', 'employee', 'index', 'period', 'store']);
+const ENTRY_MODE_SET = new Set<string>(MODEL_ENTRY_MODES);
+const SLOT_KEYS = new Set<string>(MODEL_SLOT_KEYS);
 
 /**
  * 严格解析模型输出。多字段、错误类型、未知枚举、金额以数字（分）给出、缺必填 → 全部拒绝（视为拿不准）。
@@ -112,6 +119,18 @@ export function parseModelClassification(output: unknown): ModelClassification |
   if (rawSlots.store !== undefined) {
     if (typeof rawSlots.store !== 'string' || !rawSlots.store.trim() || rawSlots.store.length > 120) return null;
     slots.store = rawSlots.store.trim();
+  }
+  if (rawSlots.ref !== undefined) {
+    if (typeof rawSlots.ref !== 'string' || !rawSlots.ref.trim() || rawSlots.ref.trim().length > 64) return null;
+    slots.ref = rawSlots.ref.trim();
+  }
+  if (rawSlots.countOnly !== undefined) {
+    if (typeof rawSlots.countOnly !== 'boolean') return null;
+    slots.countOnly = rawSlots.countOnly;
+  }
+  if (rawSlots.entryMode !== undefined) {
+    if (typeof rawSlots.entryMode !== 'string' || !ENTRY_MODE_SET.has(rawSlots.entryMode)) return null;
+    slots.entryMode = rawSlots.entryMode as ModelEntryMode;
   }
   return {
     intent: o.intent as ModelIntent,
@@ -183,7 +202,8 @@ export function isReadOnlyQuery(c: ModelClassification): boolean {
   if (c.action !== null && c.action !== 'query') return false;
   return c.object === 'progress' || c.object === 'performance' || c.object === 'completion'
     || c.object === 'entry' || c.object === 'appointment' || c.object === 'ranking'
-    || c.object === 'summary' || c.object === 'target';
+    || c.object === 'summary' || c.object === 'target'
+    || c.object === 'unreported' || c.object === 'identity' || c.object === 'self_and_summary';
 }
 
 export const DEFAULT_MODEL_TIMEOUT_MS = 8000;
@@ -304,7 +324,7 @@ function liveClassifier(cfg: ModelRuntimeConfig, env: Readonly<Record<string, st
         intent: MODEL_INTENTS,
         object: MODEL_OBJECTS,
         action: MODEL_ACTIONS,
-        slots: ['amountText', 'customer', 'employee', 'index', 'period', 'store'],
+        slots: MODEL_SLOT_KEYS,
         confidence: '0..1',
         uncertain: 'boolean',
       },

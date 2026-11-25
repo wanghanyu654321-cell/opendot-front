@@ -28,6 +28,7 @@ import type { WeComConnectConfig } from './im-manager.js';
 import { IMConnectionManager } from './im-manager.js';
 import { logger } from './logger.js';
 import {
+  hashWeComAuditRef,
   observeWeComDelivery,
   observeWeComOutboundAuth,
   observeWeComPrecheck,
@@ -971,6 +972,14 @@ export async function startWeComFrontClawRuntime(
       errorCategory: string;
     }
   >();
+  const recentPrecheckAudits = new Map<
+    string,
+    {
+      storeId?: string;
+      tier?: 'employee' | 'manager' | 'owner';
+      targetRole?: WeComSoftRole;
+    }
+  >();
 
   const bridgeOptions: WeComFrontClawBridgeOptions = {
     ...deps.bridgeOptions,
@@ -989,6 +998,20 @@ export async function startWeComFrontClawRuntime(
         ),
       });
       deps.bridgeOptions?.onObservation?.(record);
+    },
+    onPrecheckAudit: (record) => {
+      if (recentPrecheckAudits.size >= 1024) {
+        const oldest = recentPrecheckAudits.keys().next().value;
+        if (oldest !== undefined) recentPrecheckAudits.delete(oldest);
+      }
+      const prev = recentPrecheckAudits.get(record.messageId);
+      recentPrecheckAudits.set(record.messageId, {
+        ...prev,
+        ...(record.storeId ? { storeId: record.storeId } : {}),
+        ...(record.tier ? { tier: record.tier } : {}),
+        ...(record.targetRole ? { targetRole: record.targetRole } : {}),
+      });
+      deps.bridgeOptions?.onPrecheckAudit?.(record);
     },
     resolveWorkspaceJid:
       deps.bridgeOptions?.resolveWorkspaceJid ??
@@ -1059,6 +1082,7 @@ export async function startWeComFrontClawRuntime(
       }
       const correlationId = event.messageId.trim() || event.reqId;
       const obs = recentObservations.get(event.messageId);
+      const audit = recentPrecheckAudits.get(event.messageId);
       const isGuardrailDenied =
         outcome.kind === 'failed' &&
         outcome.replies.includes(BRIDGE_AGENT_GUARDRAIL_DENIED_REPLY);
@@ -1079,29 +1103,66 @@ export async function startWeComFrontClawRuntime(
             : outcome.kind === 'failed'
               ? 'precheck_failed'
               : 'none';
+      const resolvedStoreId =
+        outcome.kind === 'pass' ? outcome.storeId : audit?.storeId;
+      const resolvedTier =
+        outcome.kind === 'pass'
+          ? (outcome.principal?.tier ?? audit?.tier)
+          : audit?.tier;
+      const resolvedTargetRole =
+        outcome.kind === 'pass'
+          ? (outcome.targetRole ?? audit?.targetRole)
+          : audit?.targetRole;
+      const readonlyContextInjected =
+        outcome.kind === 'pass'
+          ? Boolean(outcome.readonlyContext?.trim())
+          : undefined;
       observeWeComPrecheck({
         correlationId,
         botId: event.botId,
         memberId: event.memberId,
-        ...(outcome.kind === 'pass'
-          ? {
-              storeId: outcome.storeId,
-              ...(outcome.targetRole ? { targetRole: outcome.targetRole } : {}),
-              ...(outcome.principal?.tier
-                ? { tier: outcome.principal.tier }
-                : {}),
-              readonlyContextInjected: Boolean(outcome.readonlyContext?.trim()),
-            }
-          : {}),
+        ...(resolvedStoreId ? { storeId: resolvedStoreId } : {}),
+        ...(resolvedTargetRole ? { targetRole: resolvedTargetRole } : {}),
+        ...(resolvedTier ? { tier: resolvedTier } : {}),
+        ...(readonlyContextInjected === undefined
+          ? {}
+          : { readonlyContextInjected }),
         route,
         gateReason,
         modelMs,
         errorCategory,
         outcomeKind: outcome.kind,
       });
+      try {
+        logger.info(
+          {
+            event: 'wecom_precheck_audit',
+            correlationRef: hashWeComAuditRef(correlationId),
+            botRef: hashWeComAuditRef(event.botId),
+            memberRef: hashWeComAuditRef(event.memberId),
+            ...(resolvedStoreId
+              ? { storeRef: hashWeComAuditRef(resolvedStoreId) }
+              : {}),
+            ...(resolvedTier ? { tier: resolvedTier } : {}),
+            ...(resolvedTargetRole ? { targetRole: resolvedTargetRole } : {}),
+            ...(readonlyContextInjected === undefined
+              ? {}
+              : { readonlyContextInjected }),
+            route,
+            gateReason,
+            modelMs: Math.max(0, Math.round(modelMs)),
+            errorCategory,
+            outcomeKind: outcome.kind,
+          },
+          'WeCom Front Claw precheck audit',
+        );
+      } catch {
+        /* 审计日志失败不得阻塞主循环 */
+      }
       return outcome;
     } finally {
       recentObservations.delete(event.messageId);
+      recentPrecheckAudits.delete(event.messageId);
     }
   };
   const bridge: WeComFrontClawBridge = {
@@ -1173,17 +1234,34 @@ export async function startWeComFrontClawRuntime(
               wecomOutcome.sentChunkCount === 0
             ? 'failed'
             : 'uncertain';
+    const deliveryCorrelationId =
+      event.correlationId?.trim() || `${event.botId}:${event.chatId}`;
+    const chunkCount =
+      wecomOutcome.state === 'accepted'
+        ? wecomOutcome.chunkCount
+        : wecomOutcome.sentChunkCount;
     observeWeComDelivery({
-      correlationId:
-        event.correlationId?.trim() || `${event.botId}:${event.chatId}`,
+      correlationId: deliveryCorrelationId,
       botId: event.botId,
       outboxStatus,
       wecomState: wecomOutcome.state,
-      chunkCount:
-        wecomOutcome.state === 'accepted'
-          ? wecomOutcome.chunkCount
-          : wecomOutcome.sentChunkCount,
+      chunkCount,
     });
+    try {
+      logger.info(
+        {
+          event: 'wecom_delivery_audit',
+          correlationRef: hashWeComAuditRef(deliveryCorrelationId),
+          botRef: hashWeComAuditRef(event.botId),
+          outboxStatus,
+          wecomState: wecomOutcome.state,
+          chunkCount,
+        },
+        'WeCom Front Claw delivery audit',
+      );
+    } catch {
+      /* 审计日志失败不得阻塞主循环 */
+    }
   };
 
   const onNewChat = (jid: string, name: string) => {

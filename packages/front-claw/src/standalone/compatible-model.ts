@@ -13,7 +13,7 @@ export function standaloneModelClassifier(env: Readonly<Record<string, string | 
     if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || !key || !model) throw Error();
   } catch { throw Error('invalid_model_configuration'); }
   const schema = { intent: MODEL_INTENTS, object: MODEL_OBJECTS, action: MODEL_ACTIONS,
-    slots: { amountText: 'original amount text only', customer: 'string', employee: 'string', index: 'integer', period: 'string', store: 'string' }, confidence: 'number 0..1', uncertain: 'boolean' };
+    slots: { amountText: 'original amount text only', customer: 'string', employee: 'string', index: 'integer', period: 'string', store: 'string', ref: 'operation/entry id string', countOnly: 'boolean', entryMode: 'latest_operation|latest_confirmed|by_ref' }, confidence: 'number 0..1', uncertain: 'boolean' };
   const system = 'Classify this employee message. Return one JSON object with only these fields and enum values: ' + JSON.stringify(schema)
     + '. Optional object and action may be null; slots may be empty. Do not invent amounts or missing facts. When uncertain use intent unknown, confidence 0, uncertain true. Never execute actions.';
   const url = endpoint.href;

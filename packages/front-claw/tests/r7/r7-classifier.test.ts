@@ -6,9 +6,10 @@ import { describe, expect, it } from 'vitest';
 import {
   parseModelClassification, validateModelChain, isUncertain, isReadOnlyQuery, isModelStub,
   runModelClassifier, stubModelClassifier, uncertainClassification, createModelClassifier,
-  loadModelRuntimeConfig, DEFAULT_MODEL_TIMEOUT_MS,
+  loadModelRuntimeConfig, DEFAULT_MODEL_TIMEOUT_MS, MODEL_OBJECTS, MODEL_ENTRY_MODES,
   type ModelClassification, type ModelClassifier, type ModelObject,
 } from '../../src/role-eval/model-classify.js';
+import { standaloneModelClassifier } from '../../src/standalone/compatible-model.js';
 import { worldM05 } from '../role-eval/appointment-fixture-m05.js';
 import { CLARIFY_REPLY } from '../../src/role-eval/employee-entry.js';
 import { REPORT_HINT } from '../../src/role-eval/employee-loop.js';
@@ -104,6 +105,64 @@ describe('R7 分类 schema 与校验链（单元）', () => {
     expect(isModelStub(stubModelClassifier)).toBe(true);
     expect(isModelStub(createModelClassifier({ mode: 'stub' }))).toBe(true);
     expect(loadModelRuntimeConfig().timeoutMs).toBe(DEFAULT_MODEL_TIMEOUT_MS);
+  });
+
+  it('Issue #18: 新只读枚举 unreported/identity/self_and_summary 与 slots(ref/countOnly/entryMode) 严格校验', async () => {
+    expect(MODEL_OBJECTS).toEqual(expect.arrayContaining(['unreported', 'identity', 'self_and_summary']));
+    expect(MODEL_ENTRY_MODES).toEqual(['latest_operation', 'latest_confirmed', 'by_ref']);
+
+    for (const object of ['unreported', 'identity', 'self_and_summary'] as const) {
+      const parsed = parseModelClassification(ok({ intent: 'query', object, action: 'query' }));
+      expect(parsed).toMatchObject({ intent: 'query', object, action: 'query' });
+      expect(isReadOnlyQuery(parsed!)).toBe(true);
+    }
+
+    const withSlots = parseModelClassification(ok({
+      intent: 'query',
+      object: 'entry',
+      action: 'query',
+      slots: { ref: 'op-123', countOnly: true, entryMode: 'by_ref' },
+    }));
+    expect(withSlots?.slots).toEqual({ ref: 'op-123', countOnly: true, entryMode: 'by_ref' });
+
+    // 非法类型/越界枚举必须被严格拒绝
+    expect(parseModelClassification(ok({
+      intent: 'query', object: 'appointment', action: 'query',
+      slots: { countOnly: 'true' as unknown as boolean },
+    }))).toBeNull();
+    expect(parseModelClassification(ok({
+      intent: 'query', object: 'entry', action: 'query',
+      slots: { entryMode: 'all_history' as unknown as 'by_ref' },
+    }))).toBeNull();
+    expect(parseModelClassification(ok({
+      intent: 'query', object: 'entry', action: 'query',
+      slots: { ref: 12345 as unknown as string },
+    }))).toBeNull();
+
+    // standaloneModelClassifier schema 同步包含新增对象与槽位
+    let capturedBody = '';
+    const fakeFetch = (async (_url: unknown, init?: RequestInit) => {
+      capturedBody = String(init?.body ?? '');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: JSON.stringify(ok({ intent: 'query', object: 'unreported', action: 'query' })) } }],
+        }),
+      } as unknown as Response;
+    }) as typeof fetch;
+    const classifier = standaloneModelClassifier({
+      FC_MODEL_MODE: 'live',
+      FC_MODEL_BASE_URL: 'https://api.example.test/v1',
+      FC_MODEL_API_KEY: 'sk-test',
+      FC_MODEL_NAME: 'test-model',
+    }, fakeFetch);
+    const out = await classifier({ text: '谁今天没报', signal: new AbortController().signal });
+    expect(parseModelClassification(out)).toMatchObject({ intent: 'query', object: 'unreported' });
+    expect(capturedBody).toContain('unreported');
+    expect(capturedBody).toContain('self_and_summary');
+    expect(capturedBody).toContain('countOnly');
+    expect(capturedBody).toContain('entryMode');
   });
 });
 

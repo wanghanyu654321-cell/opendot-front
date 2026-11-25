@@ -61,8 +61,19 @@ function cleanPolicy(
     },
     roles: {
       employee: wangMarketing
-        ? ['report_self', 'report_proxy', 'progress_self', 'marketing', 'appointment_submit']
-        : ['report_self', 'report_proxy', 'progress_self', 'appointment_submit'],
+        ? [
+            'report_self',
+            'report_proxy',
+            'progress_self',
+            'marketing',
+            'appointment_submit',
+          ]
+        : [
+            'report_self',
+            'report_proxy',
+            'progress_self',
+            'appointment_submit',
+          ],
       manager: allCaps,
       owner: allCaps,
     },
@@ -81,7 +92,8 @@ function cleanPolicy(
         role: 'employee',
         storeIds: ['s-a'],
         status: options.wangStatus ?? 'active',
-        capabilities: options.wangCapabilities ?? (wangMarketing ? ['marketing'] : []),
+        capabilities:
+          options.wangCapabilities ?? (wangMarketing ? ['marketing'] : []),
       },
       'p-empty-name': {
         role: 'employee',
@@ -113,7 +125,9 @@ interface FixtureOptions {
   autoRoleGrant?: '0' | '1';
   wangTier?: Person['tier'];
   now?: () => Date;
-  wrapStore?: (store: ReturnType<typeof createPostgresPerformanceStore>) => ReturnType<typeof createPostgresPerformanceStore>;
+  wrapStore?: (
+    store: ReturnType<typeof createPostgresPerformanceStore>,
+  ) => ReturnType<typeof createPostgresPerformanceStore>;
 }
 
 async function createBridgeFixture(opts: FixtureOptions = {}) {
@@ -214,7 +228,8 @@ async function createBridgeFixture(opts: FixtureOptions = {}) {
     now: nowFn,
     env: {
       FRONT_CLAW_MEM0: '0',
-      FRONT_CLAW_DATABASE_URL: 'postgres://secret-user:secret-pass@127.0.0.1:5432/front_claw_secret',
+      FRONT_CLAW_DATABASE_URL:
+        'postgres://secret-user:secret-pass@127.0.0.1:5432/front_claw_secret',
       FRONT_CLAW_WECOM_AUTO_ROLE_GRANT: opts.autoRoleGrant,
     },
     open: async () => ({
@@ -231,7 +246,8 @@ async function createBridgeFixture(opts: FixtureOptions = {}) {
       hostSkillsMode: 'disabled',
       disallowedTools: [...SAFE_MARKETING_DISALLOWED_TOOLS],
     },
-    resolveWorkspaceJid: ({ memberId }) => `wecom:c2c:${memberId}#account:default`,
+    resolveWorkspaceJid: ({ memberId }) =>
+      `wecom:c2c:${memberId}#account:default`,
     ...opts.bridgeOptions,
   });
 
@@ -335,12 +351,15 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
 
     // 确认桥接器输出与句柄绝不泄漏 PG store 或连接串
     expect(JSON.stringify(passed)).not.toContain('postgres://');
-    expect('store' in (fx.bridge as unknown as Record<string, unknown>)).toBe(false);
+    expect('store' in (fx.bridge as unknown as Record<string, unknown>)).toBe(
+      false,
+    );
 
     // D175 确认歧义门禁：穿插软对话后发单字「对」严禁入账，保留草稿并给出明确二次提示
     const blockedSingleChar = await fx.send('m-wang', '对');
     expect(blockedSingleChar.kind).toBe('handled');
-    if (blockedSingleChar.kind !== 'handled') throw new Error('expected handled');
+    if (blockedSingleChar.kind !== 'handled')
+      throw new Error('expected handled');
     const guardReply = blockedSingleChar.replies.join('\n');
     expect(guardReply).toContain(D175_INTERLEAVED_GUIDANCE);
     expect(guardReply).toContain('王姐');
@@ -366,7 +385,8 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     // 再次重复发「对」提示已经入账，不重复写账
     const duplicateConfirm = await fx.send('m-wang', '对');
     expect(duplicateConfirm.kind).toBe('handled');
-    if (duplicateConfirm.kind !== 'handled') throw new Error('expected handled');
+    if (duplicateConfirm.kind !== 'handled')
+      throw new Error('expected handled');
     expect(duplicateConfirm.replies).toEqual([ALREADY_CONFIRMED_TEXT]);
     expect(await fx.store.listEntries()).toHaveLength(1);
   });
@@ -382,10 +402,7 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     // 推进时钟使草稿过期（跨过营业日截止时刻）
     fx.setNow(new Date('2026-11-14T00:00:00Z'));
 
-    const passed = await fx.send(
-      'm-wang',
-      '帮我写一条周末活动的朋友圈文案',
-    );
+    const passed = await fx.send('m-wang', '帮我写一条周末活动的朋友圈文案');
     expect(passed.kind).toBe('pass');
     if (passed.kind !== 'pass') throw new Error('expected pass');
     expect(passed.expiredReminder).toBeTruthy();
@@ -422,7 +439,10 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     cleanups.push(() => fx.bridge.close());
 
     // 无挂起项时，分类超时纯粹返回 CLARIFY_REPLY（handled），绝不放行 pass
-    const plainTimedOut = await fx.send('m-wang', '帮我处理下刚才那段不太确定的事');
+    const plainTimedOut = await fx.send(
+      'm-wang',
+      '帮我处理下刚才那段不太确定的事',
+    );
     expect(plainTimedOut.kind).toBe('handled');
     if (plainTimedOut.kind !== 'handled') throw new Error('expected handled');
     expect(plainTimedOut.replies).toEqual([CLARIFY_REPLY]);
@@ -573,11 +593,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
       ...(await origListBindings()),
       ...multiBindings,
     ];
-    const ambiguous = await fx.send(
-      'm-dup',
-      '帮我写一条周末活动的朋友圈文案',
-      { corpId: undefined },
-    );
+    const ambiguous = await fx.send('m-dup', '帮我写一条周末活动的朋友圈文案', {
+      corpId: undefined,
+    });
     expect(ambiguous.kind).toBe('failed');
   });
 
@@ -586,11 +604,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     cleanups.push(() => fx.bridge.close());
 
     // 撤权前同文可放行
-    const ok = await fx.send(
-      'm-wang',
-      '帮我写一条周末活动的朋友圈文案',
-      { messageId: 'mk-replay-1' },
-    );
+    const ok = await fx.send('m-wang', '帮我写一条周末活动的朋友圈文案', {
+      messageId: 'mk-replay-1',
+    });
     expect(ok.kind).toBe('pass');
 
     // 管理员通过 M03 更新策略：收掉 p-wang 的 marketing 能力
@@ -712,7 +728,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     });
     expect(BigInt(captureOrder[0]!)).toBeLessThan(BigInt(captureOrder[1]!));
     // 第二个请求因同员工串行队列等待，不得在第一个模型调用结束前提前落草稿
-    expect(executionOrder).toEqual(['classify:1:帮我构思一段优雅的客户到店邀约开场白']);
+    expect(executionOrder).toEqual([
+      'classify:1:帮我构思一段优雅的客户到店邀约开场白',
+    ]);
     expect(await fx.store.getOpenDraft('p-wang')).toBeNull();
 
     releaseFirstClassify();
@@ -730,7 +748,10 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
       validateTargetAgentProfile({ allowedTools: ['Read', 'Write'] }).ok,
     ).toBe(false);
     expect(
-      validateTargetAgentProfile({ executionMode: 'host', allowedTools: ['Read'] }).ok,
+      validateTargetAgentProfile({
+        executionMode: 'host',
+        allowedTools: ['Read'],
+      }).ok,
     ).toBe(false);
     expect(
       validateTargetAgentProfile({
@@ -778,19 +799,13 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     });
     cleanups.push(() => fx.bridge.close());
 
-    const blocked = await fx.send(
-      'm-wang',
-      '帮我写一条周末活动的朋友圈文案',
-    );
+    const blocked = await fx.send('m-wang', '帮我写一条周末活动的朋友圈文案');
     expect(blocked.kind).toBe('failed');
     if (blocked.kind !== 'failed') throw new Error('expected failed');
     expect(blocked.replies[0]).toBe(BRIDGE_AGENT_GUARDRAIL_DENIED_REPLY);
 
     profileAllowsBash = false;
-    const allowed = await fx.send(
-      'm-wang',
-      '帮我写一条周末活动的朋友圈文案',
-    );
+    const allowed = await fx.send('m-wang', '帮我写一条周末活动的朋友圈文案');
     expect(allowed.kind).toBe('pass');
   });
 
@@ -813,7 +828,10 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
 
     await fx.bridge.close();
     expect(fx.bridge.leaseHeld()).toBe(false);
-    const afterClose = await fx.send('m-wang', '帮我写一条周末活动的朋友圈文案');
+    const afterClose = await fx.send(
+      'm-wang',
+      '帮我写一条周末活动的朋友圈文案',
+    );
     expect(afterClose.kind).toBe('failed');
   });
 
@@ -831,11 +849,12 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     expect(cfg.authToken).toBe('sk-ant-test-token');
 
     const originalFetch = globalThis.fetch;
-    const fetchSpy = vi.fn(async () =>
-      new Response('not-json-garbage', {
-        status: 502,
-        headers: { 'content-type': 'text/plain' },
-      }),
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response('not-json-garbage', {
+          status: 502,
+          headers: { 'content-type': 'text/plain' },
+        }),
     );
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
     cleanups.push(async () => {
@@ -872,7 +891,10 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     let capturedBody: Record<string, unknown> | undefined;
     const originalFetch = globalThis.fetch;
     const fetchSpy = vi.fn(async (_url: unknown, init?: RequestInit) => {
-      capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
       return new Response(
         JSON.stringify({
           content: [
@@ -899,11 +921,18 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     });
     cleanups.push(() => fx.bridge.close());
 
-    const outcome = await fx.send('m-wang', '张姐刚刚做了一个补水项目六百八十块');
+    const outcome = await fx.send(
+      'm-wang',
+      '张姐刚刚做了一个补水项目六百八十块',
+    );
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(Number(capturedBody?.max_tokens)).toBeGreaterThanOrEqual(1024);
-    expect(String(capturedBody?.system)).toContain('object="performance", action="report"');
-    expect(String(capturedBody?.system)).toContain('amountText, customer, employee, index, period, store');
+    expect(String(capturedBody?.system)).toContain(
+      'object="performance", action="report"',
+    );
+    expect(String(capturedBody?.system)).toContain(
+      'amountText, customer, employee, index, period, store',
+    );
 
     expect(outcome.kind).toBe('handled');
     if (outcome.kind !== 'handled') throw new Error('expected handled');
@@ -920,7 +949,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
 
     // 1. 穿插后回复「全部确认」精准入账 1 笔并清理标记
     await fx.send('m-wang', '12号测试A店\n420（王姐）');
-    expect((await fx.send('m-wang', '帮我写一条春日促销文案')).kind).toBe('pass');
+    expect((await fx.send('m-wang', '帮我写一条春日促销文案')).kind).toBe(
+      'pass',
+    );
     const singleBlocked = await fx.send('m-wang', '对');
     expect(singleBlocked.kind).toBe('handled');
     expect(await fx.store.listEntries()).toHaveLength(0);
@@ -933,7 +964,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
 
     // 2. 穿插后回复「取消」作废草稿并清标记
     await fx.send('m-wang', '12号测试A店\n310（王姐）');
-    expect((await fx.send('m-wang', '再帮我写一条七夕促销文案')).kind).toBe('pass');
+    expect((await fx.send('m-wang', '再帮我写一条七夕促销文案')).kind).toBe(
+      'pass',
+    );
     const cancelled = await fx.send('m-wang', '取消');
     expect(cancelled.kind).toBe('handled');
     if (cancelled.kind !== 'handled') throw new Error('expected handled');
@@ -943,7 +976,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
 
     // 3. 穿插后发新报单替代旧草稿，旧标记失效，新草稿允许直接回「对」入账
     await fx.send('m-wang', '12号测试A店\n250（王姐）');
-    expect((await fx.send('m-wang', '帮我写一条客户回访文案')).kind).toBe('pass');
+    expect((await fx.send('m-wang', '帮我写一条客户回访文案')).kind).toBe(
+      'pass',
+    );
     const replaced = await fx.send('m-wang', '12号测试A店\n720（王姐）');
     expect(replaced.kind).toBe('handled');
     fx.setNow(new Date('2026-11-12T02:00:05Z'));
@@ -952,7 +987,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     if (directConfirmAfterReplace.kind !== 'handled') {
       throw new Error('expected handled');
     }
-    expect(directConfirmAfterReplace.replies.join('\n')).toContain('已入账 1 笔');
+    expect(directConfirmAfterReplace.replies.join('\n')).toContain(
+      '已入账 1 笔',
+    );
     expect(directConfirmAfterReplace.replies.join('\n')).toContain('720');
     expect(await fx.store.listEntries()).toHaveLength(2);
 
@@ -1010,7 +1047,10 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     let capturedBody: Record<string, unknown> | undefined;
     const originalFetch = globalThis.fetch;
     const fetchSpy = vi.fn(async (_url: unknown, init?: RequestInit) => {
-      capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<
+        string,
+        unknown
+      >;
       return new Response(
         JSON.stringify({
           content: [
@@ -1111,8 +1151,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     const fx = await createBridgeFixture({ autoRoleGrant: '0' });
     cleanups.push(() => fx.bridge.close());
 
-    const authCheck: (req: WeComOutboundAuthRequest) => Promise<WeComOutboundAuthResult> =
-      fx.bridge.authorizeOutbound;
+    const authCheck: (
+      req: WeComOutboundAuthRequest,
+    ) => Promise<WeComOutboundAuthResult> = fx.bridge.authorizeOutbound;
     expect(typeof authCheck).toBe('function');
 
     // 1. 正常放行（默认 capability = 'marketing'）
@@ -1258,7 +1299,9 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     expect(errResult.allowed).toBe(false);
     expect(JSON.stringify(errResult)).not.toContain('postgres://');
     expect(JSON.stringify(errResult)).not.toContain('secret-pass');
-    expect('store' in (fx.bridge as unknown as Record<string, unknown>)).toBe(false);
+    expect('store' in (fx.bridge as unknown as Record<string, unknown>)).toBe(
+      false,
+    );
   });
 });
 
@@ -1287,14 +1330,18 @@ describe('Issue #11 企微按档位授权与软岗位路由', () => {
     expect(
       await fx.bridge.authorizeOutbound({ corpId: CORP_A, memberId: 'm-wang' }),
     ).toMatchObject({ allowed: true, policyVersion: 1 });
-    expect(await fx.store.getPersonByMember('m-lin')).toMatchObject({ roles: [] });
+    expect(await fx.store.getPersonByMember('m-lin')).toMatchObject({
+      roles: [],
+    });
     expect(await fx.store.getConfig(ACCESS_POLICY_HIGH_WATER_KEY)).toBe('1');
   });
 
   it('默认开通遇到暂时写入故障时，已授权的本人进度仍由店务处理', async () => {
     const fx = await createBridgeFixture();
     cleanups.push(() => fx.bridge.close());
-    vi.spyOn(fx.store, 'updateConfigLocked').mockRejectedValueOnce(new Error('grant-lock-unavailable'));
+    vi.spyOn(fx.store, 'updateConfigLocked').mockRejectedValueOnce(
+      new Error('grant-lock-unavailable'),
+    );
     expect(await fx.send('m-lin', '我的进度')).toMatchObject({
       kind: 'handled',
       replies: [expect.stringContaining('已做')],
@@ -1526,6 +1573,107 @@ describe('Issue #11 企微按档位授权与软岗位路由', () => {
     expect(classifyWeComSoftRole('怎么处理客诉和嫌贵')).toBe('reception_ads');
     expect(classifyWeComSoftRole('分析美团投流 roi')).toBe('reception_ads');
     expect(classifyWeComSoftRole(marketingQuery)).toBe('marketing');
+  });
+
+  it('Issue #18: 软岗位按主意图分级路由，美团投流复盘不误判店长经营，且带教/店长显式词仍优先', async () => {
+    // NR-V-E25a 原句/常见变体：主意图是美团投流复盘 -> reception_ads
+    expect(classifyWeComSoftRole('帮我做美团投流复盘和团单优化建议')).toBe(
+      'reception_ads',
+    );
+    expect(classifyWeComSoftRole('美团投流怎么复盘')).toBe('reception_ads');
+    // 显式店长经营语境即使带“美团”仍归 manager_ops
+    expect(classifyWeComSoftRole('店长复盘中提到美团活动怎么看')).toBe(
+      'manager_ops',
+    );
+    // 培训带教优先于投流与复盘
+    expect(classifyWeComSoftRole('培训新人如何做美团投流复盘')).toBe(
+      'training',
+    );
+    // 裸“复盘”保持 manager_ops 兼容
+    expect(classifyWeComSoftRole('帮我复盘一下')).toBe('manager_ops');
+
+    // 端到端验证：普通员工发美团投流复盘放行 reception_ads；发显式店长复盘仍被拒
+    const fx = await createBridgeFixture({
+      bridgeOptions: { modelClassify },
+    });
+    cleanups.push(() => fx.bridge.close());
+    expect(
+      await fx.send('m-wang', '帮我做美团投流复盘和团单优化建议'),
+    ).toMatchObject({
+      kind: 'pass',
+      targetRole: 'reception_ads',
+    });
+    expect(
+      await fx.send('m-wang', '店长复盘中提到美团活动怎么看'),
+    ).toMatchObject({
+      kind: 'failed',
+    });
+  });
+
+  it('Issue #18: 店长只读快照注入门店当地时间（Asia/Shanghai）且 onPrecheckAudit 覆盖 handled/failed/pass', async () => {
+    const audits: Array<{
+      messageId: string;
+      storeId?: string;
+      tier?: string;
+      targetRole?: string;
+    }> = [];
+    const policy = cleanPolicy(1);
+    policy.members['p-wang'].role = 'manager';
+    const fx = await createBridgeFixture({
+      initialPolicy: policy,
+      wangTier: 'manager',
+      now: () => new Date('2026-11-12T02:00:00.000Z'), // 10:00 Asia/Shanghai
+      bridgeOptions: {
+        modelClassify,
+        onPrecheckAudit: (record) => audits.push(record),
+      },
+    });
+    cleanups.push(() => fx.bridge.close());
+
+    // 1. pass (manager_ops) -> snapshot 应含门店当地时间 10:00 (+08:00, Asia/Shanghai) 与 业务日
+    const passRes = await fx.send('m-wang', reviewQuery);
+    expect(passRes).toMatchObject({ kind: 'pass', targetRole: 'manager_ops' });
+    if (passRes.kind !== 'pass') throw new Error('expected pass');
+    expect(passRes.readonlyContext).toContain(
+      '当前当地时间：2026-11-12 10:00 (+08:00, Asia/Shanghai)',
+    );
+    expect(passRes.readonlyContext).toContain('业务日：2026-11-12');
+
+    // 2. handled (快通道只读查询) -> 旁路回调应收到可信 tier & storeId
+    const handledRes = await fx.send('m-wang', '我的进度');
+    expect(handledRes).toMatchObject({ kind: 'handled' });
+
+    // 3. failed (普通员工越权店长复盘) -> 旁路回调同样收到可信 tier & storeId，且不污染 outcome 结构
+    const empAudits: typeof audits = [];
+    const empFx = await createBridgeFixture({
+      bridgeOptions: {
+        modelClassify,
+        onPrecheckAudit: (record) => empAudits.push(record),
+      },
+    });
+    cleanups.push(() => empFx.bridge.close());
+    const deniedRes = await empFx.send('m-wang', reviewQuery);
+    expect(deniedRes).toEqual(reviewDenied);
+
+    expect(
+      audits.some(
+        (a) =>
+          a.tier === 'manager' &&
+          a.storeId === 's-a' &&
+          a.targetRole === 'manager_ops',
+      ),
+    ).toBe(true);
+    expect(
+      audits.filter((a) => a.tier === 'manager' && a.storeId === 's-a').length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(
+      empAudits.some(
+        (a) =>
+          a.tier === 'employee' &&
+          a.storeId === 's-a' &&
+          a.targetRole === 'manager_ops',
+      ),
+    ).toBe(true);
   });
 
   it('把软岗位传给两个解析器，且仅培训传入培训只读块', async () => {

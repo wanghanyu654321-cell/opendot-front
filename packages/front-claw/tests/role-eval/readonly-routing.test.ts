@@ -1339,16 +1339,17 @@ describe('T-2 集中修复回归（P1-1..P1-4, P2-1, P2-2）', () => {
     const savedAskBefore = await w.base.getConfig(timeAskKey);
     expect(savedAskBefore).toBeTruthy();
 
-    for (const [q, expected] of [
-      ['我明天有几个预约？', /明天共有 1 条已登记的预约[\s\S]*王姐/],
-      ['不用登记，只查明天有几条预约', /明天共有 1 条已登记的预约[\s\S]*王姐/],
-      ['我今天有几个预约？', /今天共有 0 条已登记的预约/],
-      ['我明天有什么预约？', /你登记的预约[\s\S]*王姐/],
-      ['查测试A店明天有几个预约', /查不到，或你没有权限查看/],
+    for (const [q, expected, forbidCustomer] of [
+      ['我明天有几个预约？', /^Front Claw：你明天共有 1 条已登记的预约。$/, true],
+      ['不用登记，只查明天有几条预约', /^Front Claw：你明天共有 1 条已登记的预约。$/, true],
+      ['我今天有几个预约？', /^Front Claw：你今天共有 0 条已登记的预约。$/, true],
+      ['我明天有什么预约？', /你登记的预约[\s\S]*王姐/, false],
+      ['查测试A店明天有几个预约', /查不到，或你没有权限查看/, true],
     ] as const) {
       w.reset();
       const reply = await w.call('m-zhao', q);
       expect(reply, q).toMatch(expected);
+      if (forbidCustomer) expect(reply, q).not.toContain('王姐');
       expect(await w.base.getConfig(timeAskKey), q).toBe(savedAskBefore);
       expect(
         w.spy.reads.filter((r) =>
@@ -1449,5 +1450,368 @@ describe('T-2 集中修复回归（P1-1..P1-4, P2-1, P2-2）', () => {
     } finally {
       await boot.close();
     }
+  });
+});
+
+describe('Issue #18 统一只读查询边界、三轮确认防错与业务口径回归', () => {
+  it('否定报单（含无称谓与模型误判）零建草稿，且三轮带旧草稿时裸「对」严禁错确认旧单', async () => {
+    const maliciousReport = async () => ({
+      intent: 'report',
+      object: 'performance',
+      action: 'report',
+      slots: { amountText: '680' },
+      confidence: 0.99,
+      uncertain: false,
+    });
+    const w = await worldM05({
+      policy: policyM05(1, membersM05()),
+      router: { modelClassify: maliciousReport },
+    });
+    const beforeEntries = (await w.base.listEntries({})).length;
+
+    // 1. 空态：原句 NR-V-E05b 与无称谓合成反例均零草稿，且不落「请把客户和金额单独发一行」
+    for (const deniedText of [
+      '李姐没有做成单，别按680入账',
+      '这单没有做成，别按680入账',
+    ]) {
+      const reply = await w.call('m-zhao', deniedText);
+      expect(reply, deniedText).toContain('没有成交');
+      expect(reply, deniedText).not.toContain('客户和金额单独发一行');
+      expect((await w.base.listDrafts()).filter((d) => d.status === 'pending')).toHaveLength(0);
+      expect((await w.base.listEntries({})).length).toBe(beforeEntries);
+    }
+
+    // 2. 三轮确认防错：张姐 380 待确认 → 否定李姐 680 → 回「对」不得错确认张姐 380
+    expect(await w.call('m-zhao', '张姐 380')).toContain('还没入账');
+    const pendingBefore = (await w.base.listDrafts()).filter((d) => d.status === 'pending');
+    expect(pendingBefore).toHaveLength(1);
+
+    const denyReply = await w.call('m-zhao', '李姐没有做成单，别按680入账');
+    expect(denyReply).toContain('没有成交');
+    expect(denyReply).not.toContain('还在等你回「对」确认');
+    expect((await w.base.listDrafts()).filter((d) => d.status === 'pending')).toHaveLength(1);
+
+    const bareConfirm = await w.call('m-zhao', '对');
+    expect(bareConfirm).toContain('张姐');
+    expect(bareConfirm).toContain('380');
+    expect(bareConfirm).toContain('确认入账');
+    expect(bareConfirm).not.toContain('已入账 1 笔');
+    expect((await w.base.listEntries({})).length).toBe(beforeEntries);
+
+    // 明确「确认入账」才落账张姐 380
+    expect(await w.call('m-zhao', '确认入账')).toContain('已入账 1 笔');
+    expect((await w.base.listEntries({})).length).toBe(beforeEntries + 1);
+
+    // 3. NR-V-E08b 纠错：带活跃草稿时不报「请先确认或取消当前草稿」，不建预约追问，且裸「对」不误确认
+    expect(await w.call('m-zhao', '周姐 280')).toContain('还没入账');
+    const zhao = (await w.base.getPersonByMember('m-zhao'))!;
+    const timeAskKey = appointmentTimeAskKey(zhao, { sessionId: 'session-m-zhao' });
+    const clarify = await w.call('m-zhao', '我刚才问的是预约查询，不是要报业绩');
+    expect(clarify).toContain('不报业绩');
+    expect(clarify).not.toContain('请先确认或取消当前草稿');
+    expect(clarify).not.toContain('还在等你回「对」确认');
+    expect((await w.base.getConfig(timeAskKey)) ?? '').toBe('');
+
+    const blockedAfterClarify = await w.call('m-zhao', '对');
+    expect(blockedAfterClarify).toContain('确认入账');
+    expect((await w.base.listEntries({})).length).toBe(beforeEntries + 1);
+  });
+
+  it('预约非空纯数量（NR-V-E06a）与后天/不登记变体（合成 E07a/E08a）：不误拒全店、不泄明细、不变补报', async () => {
+    const w = await fixture();
+    // 预置今天、明天、后天（2026-11-12/13/14）各 1 条已登记预约
+    await w.base.saveAppointment({
+      appointmentId: 'appt-today-1',
+      storeId: 's-b',
+      employeePersonId: 'p-zhao',
+      customerName: '王姐',
+      whenText: '2026-11-12 15:00',
+      note: '补水',
+      status: 'registered',
+      createdAt: NOW.toISOString(),
+    });
+    await w.base.saveAppointment({
+      appointmentId: 'appt-day-after-1',
+      storeId: 's-b',
+      employeePersonId: 'p-zhao',
+      customerName: '李姐',
+      whenText: '2026-11-14 14:00',
+      note: '肩颈',
+      status: 'registered',
+      createdAt: NOW.toISOString(),
+    });
+    // 预置一条有效 appointment-time-ask，核验只读查询不消费它
+    await w.call('m-zhao', '明天周姐预约护理');
+    const zhao = (await w.base.getPersonByMember('m-zhao'))!;
+    const timeAskKey = appointmentTimeAskKey(zhao, { sessionId: 'session-m-zhao' });
+    const savedAsk = await w.base.getConfig(timeAskKey);
+    expect(savedAsk).toBeTruthy();
+
+    // NR-V-E06a：非空预约纯数量不误拒全店，不泄露客户名/预约号
+    const countToday = await w.call('m-zhao', '今天我名下预约总共几条？只问数量');
+    expect(countToday).toBe('Front Claw：你今天共有 1 条已登记的预约。');
+    expect(countToday).not.toContain('王姐');
+    expect(countToday).not.toContain('全店');
+
+    // 合成变体（对应 E07a/E08a）：后天预约查询不落「只能报今天的单」，不登记前置不吞掉查询
+    const listDayAfter = await w.call('m-zhao', '查我后天已经登记的预约');
+    expect(listDayAfter).toContain('李姐');
+    expect(listDayAfter).not.toContain('只能报今天的单');
+
+    const countDayAfter = await w.call('m-zhao', '不是新建预约，只查我后天有几条预约');
+    expect(countDayAfter).toBe('Front Claw：你后天共有 1 条已登记的预约。');
+    expect(countDayAfter).not.toContain('李姐');
+
+    expect(await w.base.getConfig(timeAskKey)).toBe(savedAsk);
+  });
+
+  it('经理未报名单（NR-V-M03a）、同名本人与同店重名（NR-K-A-M05）、老客+小计口径（NR-K-A-M02）', async () => {
+    const w = await fixture();
+    // 测试B店在 fixture 里有小赵（已报）和店长王伊君（未报）
+    const unreportedReply = await w.call(
+      'm-wang-yj',
+      '看一下测试B店今天还没报的人有哪些，只查本店',
+    );
+    expect(unreportedReply).toContain('今天还没报');
+    expect(unreportedReply).toContain('小王');
+    expect(unreportedReply).not.toContain('小赵');
+    expect(unreportedReply).not.toContain('汇总');
+
+    // 模型路径同样返回未报名单而非汇总
+    const wModel = await worldM05({
+      policy: policyM05(1, membersM05()),
+      router: {
+        modelClassify: async () => ({
+          intent: 'query',
+          object: 'unreported',
+          action: 'query',
+          slots: { store: '测试B店' },
+          confidence: 0.96,
+          uncertain: false,
+        }),
+      },
+    });
+    expect(await wModel.call('m-wang-yj', '麻烦拉下测试B店今儿未上报的同事')).toContain('今天还没报');
+
+    // 员工问未报名单仍被拒；店长问外店未报名单仍被拒且零读账本
+    expect(await w.call('m-zhao', '看一下测试B店今天还没报的人有哪些，只查本店')).toContain('全店的排名和汇总');
+    w.reset();
+    expect(await w.call('m-wang-yj', '看一下测试A店今天还没报的人有哪些')).toBe(
+      'Front Claw：查不到，或你没有权限查看。',
+    );
+    expect(w.entryStores()).toEqual([]);
+
+    // 店长查同名本人进度（worldM05 中 m-wang-yj 的合成显示名为苏晓禾）：返回本人进度（不再误报查不到）
+    const selfByName = await w.call('m-wang-yj', '查一下苏晓禾本月进度');
+    expect(selfByName).toContain('本月 已做');
+    expect(selfByName).not.toContain('查不到');
+
+    // 店长查同店同事小赵进度
+    const colleagueReply = await w.call('m-wang-yj', '查一下小赵本月进度');
+    expect(colleagueReply).toContain('小赵');
+    expect(colleagueReply).toContain('900');
+
+    // 同店重名员工先澄清
+    await w.base.savePerson({
+      personId: 'p-zhao-dup',
+      accountId: 'a-zhao-dup',
+      memberId: 'm-zhao-dup',
+      displayName: '小赵',
+      storeId: 's-b',
+      storeName: '测试B店',
+      tier: 'employee',
+      roles: ['reception'],
+      active: true,
+    });
+    expect(await w.call('m-wang-yj', '查一下小赵本月进度')).toBe(
+      'Front Claw：这个名字对上不止一位，请说全名。',
+    );
+
+    // 老客消费 + 全店业绩小计：店长拿到汇总 + 口径免责说明；员工按全店权限拒答
+    const returningMgr = await w.call('m-wang-yj', '查一下本店老客消费和全店业绩小计');
+    expect(returningMgr).toContain('测试B店 汇总');
+    expect(returningMgr).toContain('未记录老客/新客分类');
+    const returningEmp = await w.call('m-zhao', '查一下本店老客消费和全店业绩小计');
+    expect(returningEmp).toContain('全店的排名和汇总');
+  });
+
+  it('老板授权单店排名（NR-V-O01a）区分单店/多店排除/未授权店与无权店长对照', async () => {
+    // 1. 单店授权老板（仅授权 s-b）：不跨店误拒，也不机械报「1. 测试B店」
+    const membersSingle = membersM05();
+    membersSingle['p-boss'] = {
+      role: 'owner',
+      status: 'active',
+      storeIds: ['s-b'],
+      capabilities: ['progress_self', 'store_summary', 'stores_ranking', 'marketing'],
+    };
+    const wSingle = await worldM05({ policy: policyM05(1, membersSingle) });
+    const bossRow = (await wSingle.base.getPersonByMember('m-boss'))!;
+    await wSingle.base.savePerson({ ...bossRow, storeId: 's-b', storeName: '测试B店' });
+
+    const singleRank = await wSingle.call(
+      'm-boss',
+      '把已授权的测试B店门店排名给我看看，别的店不要',
+    );
+    expect(singleRank).toContain('仅获授权 1 家门店');
+    expect(singleRank).toContain('测试B店');
+    expect(singleRank).not.toContain('只能办本店');
+    expect(singleRank).not.toMatch(/^1\.\s*测试B店/m);
+
+    // 单店老板查未授权测试A店排名 → 拒绝且零读
+    wSingle.reset();
+    expect(
+      await wSingle.call('m-boss', '把已授权的测试A店门店排名给我看看'),
+    ).toBe('Front Claw：查不到，或你没有权限查看。');
+    expect(wSingle.entryStores()).toEqual([]);
+
+    // 2. 多店授权老板（s-a, s-b）：带「别的店不要」先短澄清，不丢限定；不带排除则给真实名次
+    const wMulti = await fixture();
+    const clarifyRank = await wMulti.call(
+      'm-boss',
+      '把已授权的测试B店门店排名给我看看，别的店不要',
+    );
+    expect(clarifyRank).toContain('跨门店对比');
+    expect(clarifyRank).toContain('测试B店');
+    expect(clarifyRank).not.toContain('测试A店');
+
+    const realRank = await wMulti.call('m-boss', '看看测试B店在已授权门店里的排名');
+    expect(realRank).toContain('测试B店');
+    expect(realRank).toContain('排第 1 名');
+    expect(realRank).toContain('2 家门店');
+
+    // 3. 经理无 stores_ranking 仍拒答
+    expect(await wMulti.call('m-wang-yj', '把已授权的测试B店门店排名给我看看，别的店不要')).toBe(
+      ACCESS_DENIED,
+    );
+  });
+
+  it('入账结果区分旧已确认与更新 pending（NR-V-E09a/E10a）+ 目标未设/零目标/双差额口径（NR-K-A-E04/E05）', async () => {
+    const w = await worldM05({
+      policy: policyM05(1, membersM05()),
+      router: {
+        modelClassify: async ({ text }) => {
+          if (text.includes('test-nonexistent-id')) {
+            return {
+              intent: 'query',
+              object: 'entry',
+              action: 'query',
+              slots: { ref: 'test-nonexistent-id', entryMode: 'by_ref' },
+              confidence: 0.97,
+              uncertain: false,
+            };
+          }
+          if (text.includes('最近一笔')) {
+            return {
+              intent: 'query',
+              object: 'entry',
+              action: 'query',
+              slots: { entryMode: 'latest_confirmed' },
+              confidence: 0.97,
+              uncertain: false,
+            };
+          }
+          return { intent: 'unknown', object: null, action: null, slots: {}, confidence: 0, uncertain: true };
+        },
+      },
+    });
+    // 1. 先确认一笔 520，再留一笔更新的 680 pending 草稿
+    await w.call('m-zhao', '王姐 520');
+    expect(await w.call('m-zhao', '对')).toContain('已入账 1 笔');
+    await w.call('m-zhao', '李姐 680');
+
+    // 最近一笔已入账 → 返回王姐 520（不混成 pending 的李姐 680）
+    const latestConfirmed = await w.call('m-zhao', '查一下我最近一笔已入账');
+    expect(latestConfirmed).toContain('王姐');
+    expect(latestConfirmed).toContain('520');
+    expect(latestConfirmed).not.toContain('680');
+
+    // 最近一次操作结果 / 入账结果 → 返回李姐 680 pending 草稿
+    const latestOp = await w.call('m-zhao', '查一下我最近一次操作结果');
+    expect(latestOp).toContain('680');
+    expect(latestOp).toContain('还没入账');
+
+    // 指定不存在单号（NR-V-E10a）：秒回未找到，不返回进度
+    const missingRef = await w.call(
+      'm-zhao',
+      '入账结果里有没有 test-nonexistent-id 这一笔，查不到就直接说',
+    );
+    expect(missingRef).toContain('没有查到操作号「test-nonexistent-id」');
+    expect(missingRef).not.toContain('本旬');
+
+    // 2. 目标口径：未设置目标 vs 目标设为 0 vs 正目标双差额
+    const noTarget = await w.call('m-zhao', '只查我本月目标、已完成金额和完成率，不报单');
+    expect(noTarget).toContain('本月尚未设置个人目标');
+    // 纯「我的进度」仍保持原有「未开始」契约
+    expect(await w.call('m-zhao', '我的进度')).not.toContain('目标口径说明');
+
+    await w.base.saveTarget({
+      storeId: 's-b',
+      personId: 'p-zhao',
+      periodMonth: '2026-11',
+      amount: 0,
+      updatedBy: 'p-wang-yj',
+      updatedAt: NOW.toISOString(),
+    });
+    const zeroTarget = await w.call('m-zhao', '只查我本月目标、已完成金额和完成率，不报单');
+    expect(zeroTarget).toContain('目标当前为 0');
+
+    await w.base.saveTarget({
+      storeId: 's-b',
+      personId: 'p-zhao',
+      periodMonth: '2026-11',
+      amount: 1000000,
+      updatedBy: 'p-wang-yj',
+      updatedAt: NOW.toISOString(),
+    });
+    const activeTarget = await w.call('m-zhao', '只查我本月目标、已完成金额和完成率，不报单');
+    expect(activeTarget).toContain('距全月目标还差');
+    expect(activeTarget).toContain('距今日应达进度');
+  });
+
+  it('切档（employee → manager → employee）后同一问题严格按最新策略执行', async () => {
+    const w = await fixture();
+    const { updateAccessPolicy } = await import('../../src/role-eval/access-policy.js');
+    // 初始员工无未报名单与双段权限
+    expect(await w.call('m-zhao', '看一下测试B店今天还没报的人有哪些，只查本店')).toContain('全店的排名和汇总');
+    expect(await w.call('m-zhao', '把我自己和测试B店本月的业绩都给我看看')).toBe(ACCESS_DENIED);
+
+    // 升为店长（policy v2）
+    const zhao = (await w.base.getPersonByMember('m-zhao'))!;
+    await w.base.savePerson({ ...zhao, tier: 'manager' });
+    const nextMembers = membersM05();
+    nextMembers['p-zhao'] = {
+      role: 'manager',
+      status: 'active',
+      storeIds: ['s-b'],
+      capabilities: ['progress_self', 'progress_other', 'store_summary', 'unreported', 'marketing'],
+    };
+    expect(
+      (await updateAccessPolicy(w.base, {
+        expectedVersion: 1,
+        next: policyM05(2, nextMembers),
+        actor: 'test-admin',
+        at: NOW.toISOString(),
+        reason: 'promote to manager',
+      })).ok,
+    ).toBe(true);
+
+    expect(await w.call('m-zhao', '看一下测试B店今天还没报的人有哪些，只查本店')).toContain('今天还没报');
+    const combo = await w.call('m-zhao', '把我自己和测试B店本月的业绩都给我看看');
+    expect(combo).toContain('本人业绩（小赵）');
+    expect(combo).toContain('本店汇总（测试B店）');
+
+    // 降回员工（policy v3）后立即再次拒答
+    await w.base.savePerson({ ...zhao, tier: 'employee' });
+    expect(
+      (await updateAccessPolicy(w.base, {
+        expectedVersion: 2,
+        next: policyM05(3, membersM05()),
+        actor: 'test-admin',
+        at: NOW.toISOString(),
+        reason: 'restore employee',
+      })).ok,
+    ).toBe(true);
+    expect(await w.call('m-zhao', '看一下测试B店今天还没报的人有哪些，只查本店')).toContain('全店的排名和汇总');
+    expect(await w.call('m-zhao', '把我自己和测试B店本月的业绩都给我看看')).toBe(ACCESS_DENIED);
   });
 });

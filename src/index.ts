@@ -16,6 +16,7 @@ import { getProductRuntime } from './personal-agent/product-runtime-store.js';
 import { startStoredHostObservability } from './personal-agent/host-observability-config.js';
 import {
   getHostObservability,
+  hashWeComAuditRef,
   observeWeComAgentTurn,
 } from './personal-agent/host-observability.js';
 import { CodingToolObservationTracker } from './personal-agent/coding-tool-observation.js';
@@ -9939,22 +9940,35 @@ async function runAgent(
     return { status: 'error', error: errorMsg };
   } finally {
     if (isWeComRestrictedTurn) {
+      const turnCorrelationId =
+        turnId || `${group.folder}:${wecomTurnStartedAt}`;
+      const configuredSkillIds =
+        resolvedAgentProfile?.runtime_policy?.skills?.mode === 'custom'
+          ? resolvedAgentProfile.runtime_policy.skills.ids
+          : undefined;
+      const durationMs = Math.max(0, Date.now() - wecomTurnStartedAt);
       observeWeComAgentTurn({
-        correlationId: turnId || `${group.folder}:${wecomTurnStartedAt}`,
+        correlationId: turnCorrelationId,
         ...(wecomTelemetry?.coveredMessageIds.length
           ? { coveredCorrelationIds: wecomTelemetry.coveredMessageIds }
           : {}),
         workspaceFolder: group.folder,
         profileId: resolvedAgentProfile?.id,
-        skillIds:
-          resolvedAgentProfile?.runtime_policy?.skills?.mode === 'custom'
-            ? resolvedAgentProfile.runtime_policy.skills.ids
-            : undefined,
-        ...(wecomLoadedSkillIds ? { loadedSkillIds: wecomLoadedSkillIds } : {}),
-        ...(wecomTelemetry !== undefined
-          ? { readonlyContextInjected: wecomTelemetry.readonlyContextInjected }
+        skillIds: configuredSkillIds,
+        ...(wecomLoadedSkillIds
+          ? {
+              selectedSkillIds: wecomLoadedSkillIds,
+              loadedSkillIds: wecomLoadedSkillIds,
+            }
           : {}),
-        durationMs: Math.max(0, Date.now() - wecomTurnStartedAt),
+        ...(wecomTelemetry !== undefined
+          ? {
+              batchReadonlyContextMarked:
+                wecomTelemetry.readonlyContextInjected,
+              readonlyContextInjected: wecomTelemetry.readonlyContextInjected,
+            }
+          : {}),
+        durationMs,
         status: wecomTurnStatus,
         ...(wecomInputTokens !== undefined
           ? { inputTokens: wecomInputTokens }
@@ -9963,6 +9977,54 @@ async function runAgent(
           ? { outputTokens: wecomOutputTokens }
           : {}),
       });
+      try {
+        const coveredRefs = wecomTelemetry?.coveredMessageIds.length
+          ? [
+              ...new Set(
+                wecomTelemetry.coveredMessageIds
+                  .slice(0, 20)
+                  .map((id) => hashWeComAuditRef(id)),
+              ),
+            ]
+          : undefined;
+        logger.info(
+          {
+            event: 'wecom_agent_turn_audit',
+            correlationRef: hashWeComAuditRef(turnCorrelationId),
+            ...(coveredRefs?.length
+              ? { coveredCorrelationRefs: coveredRefs }
+              : {}),
+            workspaceRef: hashWeComAuditRef(group.folder),
+            ...(resolvedAgentProfile?.id
+              ? { profileRef: hashWeComAuditRef(resolvedAgentProfile.id) }
+              : {}),
+            ...(configuredSkillIds ? { configuredSkillIds } : {}),
+            ...(wecomLoadedSkillIds
+              ? {
+                  selectedSkillIds: wecomLoadedSkillIds,
+                  skillEvidenceLevel: 'workspace_manifest_selection',
+                }
+              : {}),
+            ...(wecomTelemetry !== undefined
+              ? {
+                  batchReadonlyContextMarked:
+                    wecomTelemetry.readonlyContextInjected,
+                }
+              : {}),
+            durationMs,
+            status: wecomTurnStatus,
+            ...(wecomInputTokens !== undefined
+              ? { inputTokens: wecomInputTokens }
+              : {}),
+            ...(wecomOutputTokens !== undefined
+              ? { outputTokens: wecomOutputTokens }
+              : {}),
+          },
+          'WeCom Front Claw agent turn audit',
+        );
+      } catch {
+        /* 审计日志失败不得阻塞主循环 */
+      }
     }
     ipcWatcherManager?.unwatchGroup(group.folder);
   }
