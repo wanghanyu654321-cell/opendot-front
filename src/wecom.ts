@@ -257,6 +257,9 @@ export interface BotSendOutcome {
   ackReqId?: string;
 }
 
+export const WECOM_READONLY_CONTEXT_MARKER =
+  '[系统受控只读参考资料（已通过 M03 权限校验，严禁声称已写库或修改账目）]';
+
 const MAX_BOT_CONTENT_BYTES = 16384;
 const claimedClients = new WeakSet<object>();
 const notStarted = new WeakSet<object>();
@@ -1483,7 +1486,7 @@ export function createWeComConnection(
 
     const readonlyContext = outcome.readonlyContext?.trim();
     const effectivePassContent = readonlyContext
-      ? `[系统受控只读参考资料（已通过 M03 权限校验，严禁声称已写库或修改账目）]\n${readonlyContext}\n\n[员工本轮提问]\n${inboundEvent.text}`
+      ? `${WECOM_READONLY_CONTEXT_MARKER}\n${readonlyContext}\n\n[员工本轮提问]\n${inboundEvent.text}`
       : inboundEvent.text;
 
     storeMessageDirect(

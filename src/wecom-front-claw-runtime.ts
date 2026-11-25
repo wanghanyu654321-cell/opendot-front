@@ -97,8 +97,12 @@ const WECOM_SAFE_ROLE_IDENTITY_PROMPTS: Readonly<
 const SYSTEM_WECOM_OWNER_ID = 'front-claw-system';
 const DEFAULT_LEASE_CHECK_INTERVAL_MS = 1000;
 
-function isKnownWeComSoftRole(value: string | undefined): value is WeComSoftRole {
-  return Boolean(value && (WECOM_SOFT_ROLES as readonly string[]).includes(value));
+function isKnownWeComSoftRole(
+  value: string | undefined,
+): value is WeComSoftRole {
+  return Boolean(
+    value && (WECOM_SOFT_ROLES as readonly string[]).includes(value),
+  );
 }
 
 export function parseEnabledWeComSoftRoles(
@@ -112,9 +116,7 @@ export function parseEnabledWeComSoftRoles(
     .split(',')
     .map((item) => item.trim())
     .filter(isKnownWeComSoftRole);
-  return new Set<WeComSoftRole>(
-    parsed.length > 0 ? parsed : ['marketing'],
-  );
+  return new Set<WeComSoftRole>(parsed.length > 0 ? parsed : ['marketing']);
 }
 
 export function deriveWeComEmployeeWorkspace(ctx: {
@@ -175,9 +177,9 @@ export function isWeComManagedWorkspaceFolder(
     folder === WECOM_MANAGED_WORKSPACE_FOLDER ||
     Boolean(
       folder &&
-        /^wecom-front-claw-(?:(?:marketing|training|manager_ops|reception_ads)-)?[a-z0-9][a-z0-9_-]*$/i.test(
-          folder,
-        ),
+      /^wecom-front-claw-(?:(?:marketing|training|manager_ops|reception_ads)-)?[a-z0-9][a-z0-9_-]*$/i.test(
+        folder,
+      ),
     )
   );
 }
@@ -187,9 +189,9 @@ export function isWeComManagedWorkspaceJid(jid: string | undefined): boolean {
     jid === WECOM_MANAGED_WORKSPACE_JID ||
     Boolean(
       jid &&
-        /^web:wecom-front-claw:(?:(?:marketing|training|manager_ops|reception_ads):)?[a-z0-9][a-z0-9_-]*$/i.test(
-          jid,
-        ),
+      /^web:wecom-front-claw:(?:(?:marketing|training|manager_ops|reception_ads):)?[a-z0-9][a-z0-9_-]*$/i.test(
+        jid,
+      ),
     )
   );
 }
@@ -315,9 +317,7 @@ export function resolveWeComOutboxReceipt(
         `wecom_partial_blocked:${outcome.reason}:sent_chunks=${sentChunkCount}`,
       );
     }
-    throw new DefinitiveChannelDeliveryError(
-      `wecom_blocked:${outcome.reason}`,
-    );
+    throw new DefinitiveChannelDeliveryError(`wecom_blocked:${outcome.reason}`);
   }
   if (outcome.state === 'rejected' && outcome.sentChunkCount === 0) {
     const codeSuffix =
@@ -625,7 +625,9 @@ function defaultManagedFolderForWorkspaceJid(
   const suffix = workspaceJid
     .slice(WECOM_MANAGED_WORKSPACE_JID_PREFIX.length)
     .replace(/:/g, '-');
-  return suffix ? `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${suffix}` : undefined;
+  return suffix
+    ? `${WECOM_MANAGED_WORKSPACE_FOLDER_PREFIX}${suffix}`
+    : undefined;
 }
 
 function ensureManagedWeComWorkspace(params: {
@@ -780,10 +782,11 @@ export async function startWeComFrontClawRuntime(
   );
   const enabledRoles = [...enabledRolesSet] as const;
 
-  const hasExplicitMarketingSkillOverride = Object.prototype.hasOwnProperty.call(
-    env,
-    'FRONT_CLAW_WECOM_MARKETING_SKILL_ID',
-  );
+  const hasExplicitMarketingSkillOverride =
+    Object.prototype.hasOwnProperty.call(
+      env,
+      'FRONT_CLAW_WECOM_MARKETING_SKILL_ID',
+    );
   const requestedMarketingSkillId = (
     env.FRONT_CLAW_WECOM_MARKETING_SKILL_ID ?? ''
   ).trim();
@@ -1080,7 +1083,16 @@ export async function startWeComFrontClawRuntime(
         correlationId,
         botId: event.botId,
         memberId: event.memberId,
-        ...(outcome.kind === 'pass' ? { storeId: outcome.storeId } : {}),
+        ...(outcome.kind === 'pass'
+          ? {
+              storeId: outcome.storeId,
+              ...(outcome.targetRole ? { targetRole: outcome.targetRole } : {}),
+              ...(outcome.principal?.tier
+                ? { tier: outcome.principal.tier }
+                : {}),
+              readonlyContextInjected: Boolean(outcome.readonlyContext?.trim()),
+            }
+          : {}),
         route,
         gateReason,
         modelMs,
@@ -1257,12 +1269,14 @@ export async function startWeComFrontClawRuntime(
       { botId, driver: bridge.driver, leaseHeld: bridge.leaseHeld() },
       'WeCom channel failed to connect; closing Front Claw bridge',
     );
-    await bridge.close().catch((err) =>
-      logger.warn(
-        { err, botId },
-        'Error closing Front Claw bridge after failed WeCom connect',
-      ),
-    );
+    await bridge
+      .close()
+      .catch((err) =>
+        logger.warn(
+          { err, botId },
+          'Error closing Front Claw bridge after failed WeCom connect',
+        ),
+      );
     return null;
   }
 

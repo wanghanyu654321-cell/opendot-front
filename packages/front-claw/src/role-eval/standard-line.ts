@@ -43,7 +43,7 @@ export const CUSTOMER_HONORIFIC = new RegExp(`^[\\u4e00-\\u9fa5](?:${HONORIFIC})
  */
 const CUSTOMER_NOT_NAME_CONFIG = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../config/customer-not-name.json'), 'utf8')) as { frozen: boolean; words: string[] };
 export const CUSTOMER_NOT_NAME_WORDS: readonly string[] = Object.freeze([...CUSTOMER_NOT_NAME_CONFIG.words]);
-const NON_SUMMARY_CUSTOMER_WORDS = /整单|储值卡|目标|本月|本周|这周|刚才|全部|今天|今日|昨天|昨晚|昨日|前天|明天|明日|后天|今晚|今早|上周|下周|这个月|上个月|上月|当月|查询|查一下|查下|汇总|排名|多少|来做|过来|到店|开始|退款|改成|改到|改为|改账|大概|大约|左右|出头|撤回|撤销|更正|亏了|赔了|退了|减了|少了|多了|付了|收了|将近|不到|几乎|差不多|写成|订正|瞅一|列一|约一|记成|当成|算成|重新/;
+const NON_SUMMARY_CUSTOMER_WORDS = /整单|储值卡|目标|本月|本周|这周|刚才|全部|今天|今日|昨天|昨晚|昨日|前天|明天|明日|后天|今晚|今早|上周|下周|这个月|上个月|上月|当月|查询|查一下|查下|汇总|排名|多少|来做|过来|到店|开始|退款|改成|改到|改为|改账|大概|大约|左右|出头|撤回|撤销|更正|亏了|赔了|退了|减了|少了|多了|付了|收了|成交|将近|不到|几乎|差不多|写成|订正|瞅一|列一|约一|记成|当成|算成|重新/;
 export const NOT_CUSTOMER_NAME = new RegExp([NON_SUMMARY_CUSTOMER_WORDS.source, ...CUSTOMER_NOT_NAME_WORDS.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))].join('|'));
 const HONORIFIC_SUFFIX = new RegExp(String.raw`[\u4e00-\u9fa5](?:${HONORIFIC})$`);
 

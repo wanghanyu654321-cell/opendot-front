@@ -40,13 +40,23 @@ export interface WeComPrecheckTelemetry {
   readonly modelMs: number;
   readonly errorCategory: string;
   readonly outcomeKind: 'handled' | 'pass' | 'failed';
+  readonly targetRole?:
+    | 'marketing'
+    | 'training'
+    | 'manager_ops'
+    | 'reception_ads';
+  readonly tier?: 'employee' | 'manager' | 'owner';
+  readonly readonlyContextInjected?: boolean;
 }
 
 export interface WeComAgentTurnTelemetry {
   readonly correlationId: string;
+  readonly coveredCorrelationIds?: readonly string[];
   readonly workspaceFolder: string;
   readonly profileId?: string;
   readonly skillIds?: readonly string[];
+  readonly loadedSkillIds?: readonly string[];
+  readonly readonlyContextInjected?: boolean;
   readonly durationMs: number;
   readonly status: 'success' | 'error' | 'aborted';
   readonly inputTokens?: number;
@@ -93,6 +103,14 @@ const WECOM_OUTCOME_KINDS = new Set<WeComPrecheckTelemetry['outcomeKind']>([
   'handled',
   'pass',
   'failed',
+]);
+const WECOM_TARGET_ROLES = new Set<
+  NonNullable<WeComPrecheckTelemetry['targetRole']>
+>(['marketing', 'training', 'manager_ops', 'reception_ads']);
+const WECOM_TIERS = new Set<NonNullable<WeComPrecheckTelemetry['tier']>>([
+  'employee',
+  'manager',
+  'owner',
 ]);
 const WECOM_AGENT_STATUSES = new Set<WeComAgentTurnTelemetry['status']>([
   'success',
@@ -870,6 +888,19 @@ export class HostObservability {
           outcome_kind: WECOM_OUTCOME_KINDS.has(input.outcomeKind)
             ? input.outcomeKind
             : 'failed',
+          ...(input.targetRole && WECOM_TARGET_ROLES.has(input.targetRole)
+            ? { target_role: input.targetRole }
+            : {}),
+          ...(input.tier && WECOM_TIERS.has(input.tier)
+            ? { tier: input.tier }
+            : {}),
+          ...(input.readonlyContextInjected === undefined
+            ? {}
+            : {
+                readonly_context_injected: Boolean(
+                  input.readonlyContextInjected,
+                ),
+              }),
         };
       },
       input.modelMs,
@@ -886,14 +917,39 @@ export class HostObservability {
             ? hashRef(input.profileId.trim())
             : undefined;
         const skillIds = sanitizeSkillIds(input.skillIds);
+        const loadedSkillIds = sanitizeSkillIds(input.loadedSkillIds);
+        const coveredRefs = Array.isArray(input.coveredCorrelationIds)
+          ? [
+              ...new Set(
+                input.coveredCorrelationIds
+                  .filter(
+                    (id): id is string =>
+                      typeof id === 'string' && id.trim().length > 0,
+                  )
+                  .slice(0, 20)
+                  .map((id) => hashRef(id.trim())),
+              ),
+            ]
+          : undefined;
         const inputTokens = normalizeOptionalInt(input.inputTokens);
         const outputTokens = normalizeOptionalInt(input.outputTokens);
         return {
           channel: 'wecom',
           correlation_ref: hashRef(input.correlationId),
+          ...(coveredRefs && coveredRefs.length > 0
+            ? { covered_correlation_refs: coveredRefs }
+            : {}),
           workspace_ref: hashRef(input.workspaceFolder),
           ...(profileRef ? { profile_ref: profileRef } : {}),
           ...(skillIds ? { skill_ids: skillIds } : {}),
+          ...(loadedSkillIds ? { loaded_skill_ids: loadedSkillIds } : {}),
+          ...(input.readonlyContextInjected === undefined
+            ? {}
+            : {
+                readonly_context_injected: Boolean(
+                  input.readonlyContextInjected,
+                ),
+              }),
           duration_ms: normalizeDurationMs(input.durationMs),
           status: WECOM_AGENT_STATUSES.has(input.status)
             ? input.status

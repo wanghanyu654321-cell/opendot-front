@@ -489,6 +489,8 @@ export interface ContainerOutput {
   inputTurnCompleted?: boolean;
   /** The streaming SDK query has no accepted user turn left to process. */
   queryIdle?: boolean;
+  /** Canonical effective Skill IDs materialized for this runner turn (observability only). */
+  readonly loadedSkillIds?: readonly string[];
   ipcReceipts?: Array<{
     deliveryId: string;
     chatJid: string;
@@ -801,7 +803,9 @@ const RESTRICTED_SECRET_ENV_PATTERNS: readonly RegExp[] = [
   /^WECOM_BOT_SECRET$/i,
 ];
 
-export function scrubFrontClawSecretsFromEnv(env: Record<string, string>): void {
+export function scrubFrontClawSecretsFromEnv(
+  env: Record<string, string>,
+): void {
   for (const key of Object.keys(env)) {
     if (RESTRICTED_SECRET_ENV_PATTERNS.some((pattern) => pattern.test(key))) {
       delete env[key];
@@ -1858,6 +1862,7 @@ export async function runContainerAgent(
     const logsDir = path.join(GROUPS_DIR, group.folder, 'logs');
     fs.mkdirSync(logsDir, { recursive: true });
 
+    let resolvedSkillIds: readonly string[] | undefined;
     const result = await new Promise<ContainerOutput>((resolve) => {
       const container = spawn('docker', containerArgs, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -1980,6 +1985,7 @@ export async function runContainerAgent(
           };
         })(),
       };
+      resolvedSkillIds = dockerInput.skillManifest?.selectedSkillIds;
       container.stdin.write(JSON.stringify(dockerInput));
       container.stdin.end();
 
@@ -2246,7 +2252,9 @@ export async function runContainerAgent(
       }
     }
 
-    return result;
+    return resolvedSkillIds
+      ? { ...result, loadedSkillIds: [...resolvedSkillIds] }
+      : result;
   } finally {
     revokeWorkspaceMemoryWriteCapability(
       workspaceMemoryCapabilityScope,
@@ -3169,7 +3177,9 @@ export async function runHostAgent(
       }
     }
 
-    return hostResult;
+    const hostLoadedSkillIds =
+      hostClaudeContextPlan.effectiveSkills.selected.map((skill) => skill.id);
+    return { ...hostResult, loadedSkillIds: hostLoadedSkillIds };
   } finally {
     revokeWorkspaceMemoryWriteCapability(
       workspaceMemoryCapabilityScope,

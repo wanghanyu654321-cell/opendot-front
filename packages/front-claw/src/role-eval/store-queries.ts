@@ -1,8 +1,8 @@
 import type { PerformanceStore, Person } from './performance-store.js';
-import { formatAmount } from './reply.js';
+import { formatAmount, formatScore } from './reply.js';
 import { sumCents } from './money.js';
 import { consultantEntries } from './perf-rules.js';
-import { monthPeriod } from './metrics.js';
+import { monthKey, monthPeriod, scoreDay, scoreMonth } from './metrics.js';
 
 /**
  * M03 管理查询：调用方必须先按策略算出允许的门店，再把门店显式传进来。
@@ -22,6 +22,23 @@ export async function storeSummary(store: PerformanceStore, scope: { storeId: st
   return [`${F} ${scope.storeName} 汇总（${businessDay}）`, `今天 ${formatAmount(today.reduce((sum, row) => { const next = sumCents([sum, row.amount]); if (next === null) throw Error('money_overflow'); return next; }, 0))}`,
     ...[...byPerson.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh')).map(([name, amount]) => `${name} ${formatAmount(amount)}`),
     `本月 ${formatAmount(monthTotal)}`].join('\n');
+}
+export async function storeTargetSummary(store: PerformanceStore, scope: { storeId: string; storeName: string }, businessDay: string): Promise<string> {
+  const entries = await recorded(store, scope.storeId);
+  const month = monthPeriod(businessDay);
+  const storeTarget = await store.getStoreTarget(scope.storeId, monthKey(businessDay));
+  const monthTarget = storeTarget?.amount ?? 0;
+  const today = entries.filter(row => row.businessDay === businessDay);
+  const todayTotal = today.reduce((sum, row) => { const next = sumCents([sum, row.amount]); if (next === null) throw Error('money_overflow'); return next; }, 0);
+  const monthTotal = entries.filter(row => row.businessDay >= month.start && row.businessDay <= businessDay).reduce((sum, row) => { const next = sumCents([sum, row.amount]); if (next === null) throw Error('money_overflow'); return next; }, 0);
+  const byPerson = new Map<string, number>();
+  for (const row of today) byPerson.set(row.ownerName, (sumCents([byPerson.get(row.ownerName) ?? 0, row.amount]) ?? 0));
+  return [
+    `${F} ${scope.storeName} 汇总（${businessDay}）`,
+    formatScore('今天', '日完成率', scoreDay(todayTotal, monthTarget, businessDay)),
+    ...[...byPerson.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh')).map(([name, amount]) => `${name} ${formatAmount(amount)}`),
+    formatScore('本月', '月完成率', scoreMonth(monthTotal, monthTarget, businessDay)),
+  ].join('\n');
 }
 export async function unreported(store: PerformanceStore, scope: { storeId: string; storeName: string }, businessDay: string): Promise<string> {
   const people = (await store.listPeople()).filter(row => row.active && row.storeId === scope.storeId && (row.tier === 'employee' || row.tier === 'manager'));

@@ -11,7 +11,7 @@ import { checkGateNow } from './commit-gate.js';
 import { ACCESS_DENIED, REPORT_HINT, appointmentAskKey, appointmentTimeAskKey, isExplicitConfirmCommand } from './employee-loop.js';
 import { parseAddNewChoice, parseAskManagerChoice, parseCorrectionPick, parseCorrectionCommand, parseTargetCommand } from './ledger-commands.js';
 import { parseAppointmentRequest, parseStandaloneAppointmentTime } from './appointments.js';
-import { extractReport } from './report-extract.js';
+import { extractReport, nonClosingReportReason } from './report-extract.js';
 import { isStandardAmountLine } from './amount-guard.js';
 import { parseLooseReport, parseReportText } from './report-parse.js';
 import type { Person } from './performance-store.js';
@@ -171,7 +171,8 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline }, { text: reply, kind });
         return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
       };
-      if (businessRead(input.text)) {
+      const today = businessDate(options.now(), cutoff, timeZone);
+      if (businessRead(input.text, today)) {
         decision = { target: 'store', label: 'progress', intents: ['progress'] };
         const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline });
         return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
@@ -182,7 +183,8 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       const classified: Classification = askedTime
         ? { label: 'followup', intents: ['followup'], source: 'rule', reason: 'single' }
         : await classifyWithSemantic(input.text, {
-          businessDay: businessDate(options.now(), cutoff, timeZone), semantic: router.semantic, signal: child.signal, deadline: child.deadline,
+          businessDay: today, semantic: router.semantic, signal: child.signal, deadline: child.deadline,
+          preserveCrossDomainMultiIntent: true,
         });
       if ((classified.source === 'semantic' || classified.reason === 'semantic-rejected' || classified.reason === 'semantic-timeout') && !isDeterministicStub(router.semantic)) modelCalled = true;
       const marketing = router.marketing;
@@ -191,7 +193,6 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       decision = decideRoute(classified, { marketingEnabled, marketingGranted: !!grantedActor });
       log.classify(requestId, { label: decision.label, target: decision.target, source: classified.source, reason: classified.reason });
       // R3（D81 已定口径）：非今天的报数说法 → 固定一句，不追问、不写。
-      const today = businessDate(options.now(), cutoff, timeZone);
       // R15 / D146：没见过的否定补报（含带时间词前缀）先问，不走「只能报今天的单」，不出可确认草稿。
       {
         // 先认形状，不读账本；只有确定走模型追问时才取本店已确认名单（D146 收紧，D139「对」入账）。
@@ -244,7 +245,14 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         }
       }
       let modelClassification: ModelClassification | undefined;
-      if (decision.target === 'clarify') {
+      const crossDomainMultiIntent = classified.reason === 'multi-intent'
+        && classified.intents.some(isStoreIntent)
+        && classified.intents.includes('marketing');
+      const nonClosingReport = classified.unclear === 'not_closed'
+        || classified.unclear === 'negation'
+        || nonClosingReportReason(input.text) !== null;
+      // 规则层已判定未成交/否定报单或明确跨类多意图时，不交模型分类器覆盖原判。
+      if (decision.target === 'clarify' && !nonClosingReport && !crossDomainMultiIntent) {
         const classifier = modelClassifier;
         modelAttempted = true;
         const output = await runModelClassifier(input.text, classifier, child.signal, child.deadline, modelClassifyTimeoutMs, diagnostic => {

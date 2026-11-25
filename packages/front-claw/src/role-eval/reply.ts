@@ -28,12 +28,12 @@ export function scrubReply(text: string, forbidden: readonly string[] = []): str
 export function formatScore(label: string, completionLabel: string, score: PeriodScore): string {
   const done = formatAmount(score.done);
   if (score.status === '未开始') return `${label} 已做 ${done}，未开始`;
-  const pace = formatAmount(score.toDateTarget ?? 0);
+  const pace = formatAmount(Math.round(score.toDateTarget ?? 0));
   const full = formatAmount(score.fullMonthTarget);
   const completion = Math.round((score.completionRate ?? 0) * 100);
   const pacePercent = Math.round((score.paceRate ?? 0) * 100);
   const tier = score.tier ? TIER_LABEL[score.tier] : '';
-  const gap = formatAmount(score.gap ?? 0);
+  const gap = formatAmount(Math.round(score.gap ?? 0));
   return `${label} 已做 ${done}，至今 ${pace}（全月 ${full}），${completionLabel} ${completion}%，进度达成率 ${pacePercent}%，${tier}，差额 ${gap}`;
 }
 

@@ -450,4 +450,70 @@ describe('HostObservability WeCom four-stage telemetry', () => {
       expect([0, 4]).toContain(matching.length);
     }
   });
+
+  test('emits redacted precheck role/context and agent loaded skills + covered message refs', async () => {
+    const memory = new InMemorySpanExporter();
+    const observer = createObserver(1, memory);
+    const msg1 = 'wecom-msg-raw-101';
+    const msg2 = 'wecom-msg-raw-102';
+
+    observer.wecomPrecheck({
+      correlationId: msg2,
+      botId: 'bot-01',
+      memberId: 'member-01',
+      storeId: 'mvp-store-b',
+      route: '快通道',
+      gateReason: 'not_applicable',
+      modelMs: 12,
+      errorCategory: 'none',
+      outcomeKind: 'pass',
+      targetRole: 'manager_ops',
+      tier: 'manager',
+      readonlyContextInjected: true,
+    });
+    observer.wecomAgentTurn({
+      correlationId: msg2,
+      coveredCorrelationIds: [msg1, msg2],
+      workspaceFolder: 'wecom-front-claw-mgr-01',
+      profileId: 'profile-manager-ops',
+      skillIds: ['beauty-manager-daily'],
+      loadedSkillIds: ['beauty-manager-daily', 'invalid skill!'],
+      readonlyContextInjected: true,
+      durationMs: 420,
+      status: 'success',
+    });
+    await observer.flush();
+
+    const spans = memory.getFinishedSpans();
+    expect(spans.map((s) => s.name)).toEqual([
+      'dot.wecom.precheck',
+      'dot.wecom.agent_turn',
+    ]);
+    const precheckAttrs = spans[0]!.attributes;
+    expect(precheckAttrs['langfuse.observation.metadata.target_role']).toBe(
+      '"manager_ops"',
+    );
+    expect(precheckAttrs['langfuse.observation.metadata.tier']).toBe(
+      '"manager"',
+    );
+    expect(
+      precheckAttrs['langfuse.observation.metadata.readonly_context_injected'],
+    ).toBe('true');
+    expect(JSON.stringify(precheckAttrs)).not.toContain(msg2);
+
+    const turnAttrs = spans[1]!.attributes;
+    expect(
+      turnAttrs['langfuse.observation.metadata.covered_correlation_refs'],
+    ).toBe(JSON.stringify([sha256Ref(msg1), sha256Ref(msg2)]));
+    expect(turnAttrs['langfuse.observation.metadata.loaded_skill_ids']).toBe(
+      JSON.stringify(['beauty-manager-daily', 'invalid_skill_id']),
+    );
+    expect(
+      turnAttrs['langfuse.observation.metadata.readonly_context_injected'],
+    ).toBe('true');
+    const turnSerialized = JSON.stringify(turnAttrs);
+    expect(turnSerialized).not.toContain(msg1);
+    expect(turnSerialized).not.toContain(msg2);
+    expect(turnSerialized).not.toContain('invalid skill!');
+  });
 });

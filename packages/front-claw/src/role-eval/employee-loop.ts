@@ -7,7 +7,7 @@ import { createAssistantTools } from './assistant-tools.js';
 import { businessDate, DEFAULT_BUSINESS_CUTOFF, DEFAULT_TIME_ZONE, zonedDateTime } from './metrics.js';
 import { matchPerson } from './people-match.js';
 import { parseLooseReport, parseReportText, type ParsedEntry } from './report-parse.js';
-import { ambiguityOf, extractReport, HONORIFIC, moneyIssueOf, splitStore } from './report-extract.js';
+import { ambiguityOf, extractReport, HONORIFIC, moneyIssueOf, nonClosingReportReason, splitStore } from './report-extract.js';
 import { clarifyQuestion } from './clarify.js';
 import {
   confirmEntryId, correctionNoticeId, entryVersion, revisionIdFor, type CommitGuard, type CorrectionChange, type CorrectionPayload, type Draft,
@@ -23,11 +23,11 @@ import type { HandleResult, WecomBotHandlerOptions } from './wecom-bot-unified-h
 import { ACCESS_POLICY_KEY, parseAccessPolicy, authorize, authorizedStores, decideAccess, policyFrom, readPolicy, standing, type Capability } from './access-policy.js';
 import { checkGateNow, commitGuard, policyVersionOf, type GateSpec, type GateTarget } from './commit-gate.js';
 import type { Fence } from './fencing.js';
-import { businessRead, existingReadCommand, labelledStoreTargets, otherProgressCommand, missingReportsCommand, storeRankingCommand, otherStoreShortNames, otherStoresNamed, parseAppointmentReadQuery, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
+import { businessRead, existingReadCommand, labelledStoreTargets, otherProgressCommand, missingReportsCommand, storeRankingCommand, otherStoreShortNames, otherStoresNamed, parseAppointmentReadQuery, appointmentClause, clauseKind, compoundHead, compoundTail, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, leftoverNote, NOT_TODAY_REPLY, HISTORICAL_PERIOD_UNSUPPORTED, hasUnsupportedHistoricalPeriod, isUnsupportedHistoricalPeriodSlot, selfProgressPhrase, type ClauseKind } from './scope-refusal.js';
 import { consumerWrites } from './consumer-writes.js';
 import { CommitContentionRejected, FencedWriteRejected } from './performance-store.js';
 import { resolveStoreHours } from './store-hours.js';
-import { ranking, storeById, storeByName, storeSummary, unreported } from './store-queries.js';
+import { ranking, storeById, storeByName, storeSummary, storeTargetSummary, unreported } from './store-queries.js';
 import { formatYuan } from './money.js';
 import { cannot } from './scope-refusal.js';
 import { guardUtteranceAmounts, guardIssueToReason, sealDraftAmounts, UnvalidatedAmountError, isStandardAmountLine } from './amount-guard.js';
@@ -624,7 +624,14 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const who = wantStore ? `${people.find(p => p.personId === row.employeePersonId)?.displayName ?? '同事'}登记，` : '';
       return `${describeWhen({ date: date!, time: time! })} ${row.customerName}${row.note ? ` ${row.note}` : ''}（${who}预约号 ${shortAppointmentNo(row.appointmentId)}；提醒：${notice ? reminderState(notice) : '待配置/未排队'}）`;
     });
-    const reply = rows.length ? `Front Claw ${wantStore ? `${actor.storeName}预约` : '你登记的预约'}（登记即成立，店长无需回复）：\n${lines.join('\n')}` : `Front Claw：${wantStore ? '本店' : '你'}${day ? '这天' : '今天及以后'}没有登记的预约。`;
+    const dayLabel = readSpec.day === 'tomorrow' ? '明天' : readSpec.day === 'today' ? '今天' : '今天及以后';
+    const reply = readSpec.countOnly
+      ? rows.length
+        ? `Front Claw：${wantStore ? actor.storeName : '你'}${dayLabel}共有 ${rows.length} 条已登记的预约（登记即成立，店长无需回复）：\n${lines.join('\n')}`
+        : `Front Claw：${wantStore ? '本店' : '你'}${dayLabel}共有 0 条已登记的预约。`
+      : rows.length
+        ? `Front Claw ${wantStore ? `${actor.storeName}预约` : '你登记的预约'}（登记即成立，店长无需回复）：\n${lines.join('\n')}`
+        : `Front Claw：${wantStore ? '本店' : '你'}${day ? '这天' : '今天及以后'}没有登记的预约。`;
     // 发送前再验身份与授权。
     const current = await actorFor(memberId);
     if (!current || current.personId !== actor.personId) return DENIED;
@@ -690,7 +697,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
    * M03 管理查询（仅策略模式）。门店范围由策略逐店判定后显式传入查询；
    * 拒绝与查无此人同一句话，不泄露对象是否存在；发送前再验身份与授权。
    */
-  async function managementQuery(actor: Person, text: string, memberId: string, tag: Tag): Promise<string | undefined> {
+  async function managementQuery(actor: Person, text: string, memberId: string, tag: Tag, opts?: { withTarget?: boolean }): Promise<string | undefined> {
     const day = businessDate(now(), cutoff, timeZone);
     const finalCheck = async (capability: Capability, storeIds: readonly string[], reply: string): Promise<string> => {
       const current = await actorFor(memberId);
@@ -715,12 +722,13 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       const reply = (await tools.myProgress(target.accountId)).reply.replace(/^Front Claw/, `Front Claw ${target.displayName}`);
       return finalCheck('progress_other', [target.storeId], reply);
     }
+    const wantsTarget = opts?.withTarget === true || /目标|完成率|差额|还差/.test(text);
     if (!/^(?:经营汇总|门店汇总|本店汇总|本月汇总)/.test(text) && isStorePerfQuery(text)) {
       const capability: Capability = 'store_summary';
       const people = await store.listPeople();
       const scope = storeById(people, actor.storeId);
       if (!scope || !await can(actor, capability, scope.storeId)) return ACCESS_DENIED;
-      const reply = await storeSummary(store, scope, day);
+      const reply = wantsTarget ? await storeTargetSummary(store, scope, day) : await storeSummary(store, scope, day);
       return finalCheck(capability, [scope.storeId], reply);
     }
     const summary = /^(?:经营汇总|门店汇总|本店汇总|本月汇总)(?:\s+(\S+))?$/.exec(text);
@@ -738,7 +746,9 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         }
         return !scope || (named && scope.storeId !== actor.storeId) ? NOT_FOUND_OR_DENIED : ACCESS_DENIED;
       }
-      const reply = summary ? await storeSummary(store, scope, day) : await unreported(store, scope, day);
+      const reply = summary
+        ? (wantsTarget ? await storeTargetSummary(store, scope, day) : await storeSummary(store, scope, day))
+        : await unreported(store, scope, day);
       return finalCheck(capability, [scope.storeId], reply);
     }
     if (storeRankingCommand.test(text)) {
@@ -955,9 +965,14 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
   }
   async function dispatchClassifiedQuery(actor: Person, c: ModelClassification, text: string, memberId: string, tag: Tag): Promise<string> {
     const object = c.object;
+    const day = businessDate(now(), cutoff, timeZone);
+    if (object !== 'appointment' && (isUnsupportedHistoricalPeriodSlot(c.slots.period, day) || hasUnsupportedHistoricalPeriod(text, day))) {
+      return HISTORICAL_PERIOD_UNSUPPORTED;
+    }
     const explicit = labelledStoreTargets(text);
     if (!explicit || explicit.length > 1 || (explicit[0] && c.slots.store && explicit[0] !== c.slots.store)) return NOT_FOUND_OR_DENIED;
     const named = explicit[0] ?? c.slots.store;
+    const wantsTarget = object === 'target' || object === 'completion' || /目标|完成率|差额|还差/.test(text);
     if (named !== undefined) {
       if (!policyMode) return ACCESS_DENIED;
       const people = await store.listPeople();
@@ -965,19 +980,21 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
       auditTarget(named, scope?.storeId);
       if (!scope) return NOT_FOUND_OR_DENIED;
       if (['performance', 'summary', 'completion', 'target'].includes(object ?? '')) {
-        return (await managementQuery(actor, '经营汇总 ' + scope.storeId, memberId, tag)) ?? NOT_FOUND_OR_DENIED;
+        return (await managementQuery(actor, '经营汇总 ' + scope.storeId, memberId, tag, { withTarget: wantsTarget })) ?? NOT_FOUND_OR_DENIED;
       }
       if (scope.storeId !== actor.storeId || object === 'ranking') return NOT_FOUND_OR_DENIED;
     }
-    if (object === 'progress' || object === 'entry') return selfProgress(actor, memberId, tag);
+    const wantsSelfScope = named === undefined && /(?:我|本人|自己)/.test(text) && !/(?:本店|全店|门店|店里|我们店)/.test(text);
+    if (object === 'progress' || object === 'entry' || (wantsSelfScope && (object === 'target' || object === 'completion' || object === 'performance'))) {
+      return selfProgress(actor, memberId, tag);
+    }
     if (object === 'performance' || object === 'summary' || object === 'completion' || object === 'target') {
       if (!policyMode) return ACCESS_DENIED;
       const capability: Capability = 'store_summary';
       const people = await store.listPeople();
       const scope = storeById(people, actor.storeId);
       if (!scope || !await can(actor, capability, scope.storeId)) return ACCESS_DENIED;
-      const day = businessDate(now(), cutoff, timeZone);
-      const reply = await storeSummary(store, scope, day);
+      const reply = wantsTarget ? await storeTargetSummary(store, scope, day) : await storeSummary(store, scope, day);
       const current = await actorFor(memberId);
       if (!current || current.personId !== actor.personId) return DENIED;
       if (!await can(current, capability, scope.storeId)) return ACCESS_DENIED;
@@ -1124,8 +1141,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         auditAuthorization(actor, gate);
         if (!gate.allowed) return ACCESS_DENIED;
       }
-      const requested = businessRead(text);
+      const businessDayNow = businessDate(now(), cutoff, timeZone);
+      const requested = businessRead(text, businessDayNow);
       if (onlyNegatedAppointment(text)) return 'Front Claw：没有登记预约。';
+      if (requested?.kind === 'historical') return HISTORICAL_PERIOD_UNSUPPORTED;
       if (requested?.kind === 'existing') {
         text = requested.command;
         // Reject unsupported explicit appointment scope before reading pending state.
@@ -1152,9 +1171,43 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         tag.access = { capability: null, storeIds: scopes, identity: { personId: current.personId, policyVersion: gate.version } };
         return `Front Claw：当前业务身份为${{ employee: '员工', manager: '店长', owner: '老板' }[gate.role]}，获授权门店：${scopes.join('、') || '无'}。`;
       }
+      if (requested?.kind === 'self_and_summary') {
+        if (!policyMode) return ACCESS_DENIED;
+        const people = await store.listPeople();
+        const scope = requested.store ? resolveStoreTarget(people, actor, requested.store) : storeById(people, actor.storeId);
+        auditTarget(requested.store ?? actor.storeId, scope?.storeId);
+        if (!scope) {
+          auditDecision('denied');
+          if (requested.store && otherStoreShortNames(requested.store, actor.storeName).length) {
+            return cannot(`只能办本店（${actor.storeName}）的事，${otherStoresNamed(requested.store, people, actor).join('、')}的报数和查询都不行（跨店不能代报，也不能查）`);
+          }
+          return NOT_FOUND_OR_DENIED;
+        }
+        if (scope.storeId !== actor.storeId) {
+          auditDecision('denied');
+          return NOT_FOUND_OR_DENIED;
+        }
+        if (!await can(actor, 'progress_self', actor.storeId) || !await can(actor, 'store_summary', scope.storeId)) {
+          auditDecision('denied');
+          return ACCESS_DENIED;
+        }
+        const own = await tools.myProgress(actor.accountId);
+        if (!own.ok) return own.reply;
+        const summaryReply = await storeSummary(store, scope, businessDayNow);
+        const current = await actorFor(input.memberId);
+        if (!current || current.personId !== actor.personId || current.accountId !== actor.accountId || current.storeId !== actor.storeId) return DENIED;
+        if (!await can(current, 'progress_self', actor.storeId) || !await can(current, 'store_summary', scope.storeId)) {
+          auditDecision('denied');
+          return ACCESS_DENIED;
+        }
+        tag.access = { capability: 'progress_self', additionalCapability: 'store_summary', storeIds: [actor.storeId] };
+        const ownBody = own.reply.replace(/^Front Claw\n?/, '');
+        const summaryBody = summaryReply.replace(/^Front Claw\s*/, '');
+        return `Front Claw 本人业绩（${actor.displayName}）：\n${ownBody}\n\n本店汇总（${scope.storeName}）：\n${summaryBody}`;
+      }
       if (requested?.kind === 'summary') {
         if (!policyMode) return ACCESS_DENIED;
-        return (await managementQuery(actor, requested.store ? '经营汇总 ' + requested.store : '经营汇总', input.memberId, tag)) ?? NOT_FOUND_OR_DENIED;
+        return (await managementQuery(actor, requested.store ? '经营汇总 ' + requested.store : '经营汇总', input.memberId, tag, requested.withTarget ? { withTarget: true } : undefined)) ?? NOT_FOUND_OR_DENIED;
       }
       if (requested?.kind === 'self') {
         auditTarget(actor.storeId, actor.storeId);
@@ -1613,8 +1666,14 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         return done.reply;
       }
       const today = businessDate(now(), cutoff, timeZone);
+      const rawText = text;
       if (input.modelClassification?.intent === 'report') {
-        const candidate = modelReportCandidate(text, input.modelClassification, actor, today);
+        const deniedReason = nonClosingReportReason(rawText);
+        if (deniedReason) {
+          input.onGate?.('model_candidate_rejected');
+          return askReply(clarifyQuestion(deniedReason));
+        }
+        const candidate = modelReportCandidate(rawText, input.modelClassification, actor, today);
         if (!candidate) {
           input.onGate?.('model_candidate_rejected');
           return askReply(REPORT_HINT);

@@ -507,6 +507,7 @@ import {
   isWeComManagedWorkspaceFolder,
   startWeComFrontClawRuntime,
 } from './wecom-front-claw-runtime.js';
+import { WECOM_READONLY_CONTEXT_MARKER } from './wecom.js';
 import { SAFE_MARKETING_DISALLOWED_TOOLS } from './wecom-front-claw-bridge.js';
 import {
   getScriptTaskHostExecutionError,
@@ -8740,6 +8741,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       currentSourceJid,
       currentChannelContext,
       agentProfile,
+      {
+        coveredMessageIds: missedMessages.map((message) => message.id),
+        readonlyContextInjected: missedMessages.some((message) =>
+          message.content.includes(WECOM_READONLY_CONTEXT_MARKER),
+        ),
+      },
     );
   } finally {
     runEnded = true;
@@ -9629,6 +9636,10 @@ async function runAgent(
   currentSourceJid?: string,
   channelContext?: ChannelTurnContext,
   agentProfile?: AgentProfile,
+  wecomTelemetry?: {
+    readonly coveredMessageIds: readonly string[];
+    readonly readonlyContextInjected: boolean;
+  },
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   const owner = group.created_by ? getUserById(group.created_by) : undefined;
@@ -9741,6 +9752,7 @@ async function runAgent(
   let wecomTurnStatus: 'success' | 'error' | 'aborted' = 'error';
   let wecomInputTokens: number | undefined;
   let wecomOutputTokens: number | undefined;
+  let wecomLoadedSkillIds: readonly string[] | undefined;
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
@@ -9878,6 +9890,9 @@ async function runAgent(
       wrappedOnOutput,
       ownerHomeFolder,
     );
+    if (output.loadedSkillIds) {
+      wecomLoadedSkillIds = output.loadedSkillIds;
+    }
 
     // 仅从成功的最终输出中更新 session ID；
     // error 状态的输出可能携带 stale ID，覆盖流式阶段已写入的有效 session
@@ -9926,12 +9941,19 @@ async function runAgent(
     if (isWeComRestrictedTurn) {
       observeWeComAgentTurn({
         correlationId: turnId || `${group.folder}:${wecomTurnStartedAt}`,
+        ...(wecomTelemetry?.coveredMessageIds.length
+          ? { coveredCorrelationIds: wecomTelemetry.coveredMessageIds }
+          : {}),
         workspaceFolder: group.folder,
         profileId: resolvedAgentProfile?.id,
         skillIds:
           resolvedAgentProfile?.runtime_policy?.skills?.mode === 'custom'
             ? resolvedAgentProfile.runtime_policy.skills.ids
             : undefined,
+        ...(wecomLoadedSkillIds ? { loadedSkillIds: wecomLoadedSkillIds } : {}),
+        ...(wecomTelemetry !== undefined
+          ? { readonlyContextInjected: wecomTelemetry.readonlyContextInjected }
+          : {}),
         durationMs: Math.max(0, Date.now() - wecomTurnStartedAt),
         status: wecomTurnStatus,
         ...(wecomInputTokens !== undefined
@@ -17040,7 +17062,7 @@ async function processAgentConversation(
               chatId: agentStreamingAddress.externalChatId,
               rootId: agentStreamingAddress.rootMessageId,
               threadId: agentStreamingAddress.threadId,
-            logicalBaseChatJid: chatJid,
+              logicalBaseChatJid: chatJid,
             },
           )
         : undefined;
@@ -20773,7 +20795,10 @@ async function main(): Promise<void> {
         ? wecomFrontClawRuntime
             .close()
             .catch((err) =>
-              logger.warn({ err }, 'Error shutting down WeCom Front Claw runtime'),
+              logger.warn(
+                { err },
+                'Error shutting down WeCom Front Claw runtime',
+              ),
             )
         : Promise.resolve(),
       botHandoffs.close().then(() => productRuntime.close()),

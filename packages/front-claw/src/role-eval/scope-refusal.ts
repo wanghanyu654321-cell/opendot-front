@@ -12,6 +12,7 @@ import { looksLikeAppointment, withoutAppointmentCoaching } from './appointments
 const F = 'Front Claw';
 export const cannot = (reason: string): string => `${F}：不能做——${reason}。没有读取或写入任何账目。`;
 export const NOT_TODAY_REPLY = `${F}：目前只能报今天的单，补报请找店长。`;
+export const HISTORICAL_PERIOD_UNSUPPORTED = `${F}：当前仅支持查询今天、本旬和本月的业绩与汇总，暂不支持查询历史月份。没有读取或写入任何账目。`;
 export const COURTESY_THANKS = `${F}：不客气，有事随时找我。`;
 export const COURTESY_MORNING = `${F}：早～有事随时找我。`;
 export const COURTESY_BYE = `${F}：辛苦了，明天见～`;
@@ -67,22 +68,85 @@ export function colleaguesNamed(text: string, people: readonly Person[], actor: 
  * 顺序：跨店（任何店务说法）→ 查别人的业绩 → 全店排名/汇总。
  */
 /** 已由管理查询入口回答的固定说法（「查不到」/无权），这里不抢先改口，也不提前读花名册。 */
+/** 识别历史月份/年份查询（已先排除「不是补上个月」类否定补报）。 */
+export function hasUnsupportedHistoricalPeriod(text: string, businessDay?: string): boolean {
+  const masked = maskNegatedPastDay(flatOf(text));
+  if (/上个?月|去年|前年|上季度|上半年|往月|历史月(?:份)?/.test(masked)) return true;
+  if (businessDay && /^\d{4}-\d{2}-\d{2}$/.test(businessDay)) {
+    const curYear = Number(businessDay.slice(0, 4));
+    const curMonth = Number(businessDay.slice(5, 7));
+    const ym = /(20\d{2})(?:年|[-/])(\d{1,2})月?/.exec(masked);
+    if (ym) {
+      const y = Number(ym[1]), m = Number(ym[2]);
+      if (m >= 1 && m <= 12 && (y < curYear || (y === curYear && m < curMonth))) return true;
+    }
+    const mOnly = /(?<![\d年])(\d{1,2})月(?:份)?(?:的)?(?:个人|全店|本店|门店)?(?:业绩|进度|汇总|目标|完成|数据|经营)/.exec(masked);
+    if (mOnly) {
+      const m = Number(mOnly[1]);
+      if (m >= 1 && m <= 12 && m !== curMonth) return true;
+    }
+  }
+  return false;
+}
+
+/** 校验模型抽出的 period 槽位是否指向不支持的历史期间。 */
+export function isUnsupportedHistoricalPeriodSlot(period: string | undefined, businessDay: string): boolean {
+  if (!period?.trim()) return false;
+  const flat = flatOf(period);
+  if (/上个?月|去年|前年|上季度|上半年|往月|历史/.test(flat)) return true;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDay)) return false;
+  const curYm = businessDay.slice(0, 7);
+  const curMonth = Number(businessDay.slice(5, 7));
+  const ym = /^(20\d{2})[-/年](\d{1,2})月?$/.exec(flat);
+  if (ym) {
+    const target = `${ym[1]}-${String(Number(ym[2])).padStart(2, '0')}`;
+    if (target < curYm) return true;
+  }
+  const mOnly = /^(\d{1,2})月(?:份)?$/.exec(flat);
+  if (mOnly) {
+    const m = Number(mOnly[1]);
+    if (m >= 1 && m <= 12 && m !== curMonth) return true;
+  }
+  return false;
+}
+
+const NON_COLLEAGUE_SMALL_OLD = /老客户|老顾客|老会员|老客|老板|老化|老店|老带新|小红书|小计|小程序|小单|小额|小票|小组|小时|小样|小项|小项目|小卡|小本|小姐姐|小姐|老师|小费|小包|小瓶|小盒|小支|小份|小图|小视频|小号|小店/g;
+const COLLEAGUE_NICK_QUERY_CONTEXT = /(?:查|看|瞧|问|了解|关于|看看|查一下|看一下)(?:一下|下)?((?:小|老)[\u4e00-\u9fa5])|((?:小|老)[\u4e00-\u9fa5])(?=(?:的|今天|今日|本月|这个月|这月|这周|本周|业绩|进度|干了|做了|报了|完成|入账|多少|几单|明细|目标|还差|排名))/g;
+
+/** 仅从业绩查询分句里识别未入花名册的同事昵称（如「小王/老周」），排除老客/小计/小红书等业务词。 */
+function unlistedColleagueNicknames(text: string, actor: Person): string[] {
+  const tail = compoundTail(text);
+  const head = compoundHead(text);
+  const scopeText = tail && clauseKind(tail) === 'marketing' && head !== text ? head : text;
+  const cleaned = flatOf(scopeText).replace(NON_COLLEAGUE_SMALL_OLD, '　');
+  const found = new Set<string>();
+  for (const m of cleaned.matchAll(COLLEAGUE_NICK_QUERY_CONTEXT)) {
+    const nick = m[1] ?? m[2];
+    if (nick && nick !== actor.displayName) found.add(nick);
+  }
+  return [...found];
+}
+
 /** R6：格式明确、在权限内的查询应直接办。覆盖「查一下我今天的进度」「查本店业绩」「看今天的单」等自然说法。 */
 export function isSelfProgressQuery(text: string): boolean {
   const flat = flatOf(text);
   if (/^(?:我的进度|今天进度|进度)$/.test(flat)) return true;
+  if (hasUnsupportedHistoricalPeriod(flat)) return false;
   if (/金额|元|块|报一笔|记一笔|改成|改账/.test(flat) && /\d/.test(flat)) return false;
   if (/\d/.test(flat)) return false;
-  return /^(?:请?帮?(?:我)?)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查|看|问|列)(?:一?下|查|看)?(?:我|本人)(?:的)?(?:今天|今日|本月|这个月|这月)?(?:的)?(?:个人)?(?:业绩(?:进度)?|进度|已入账|入账结果?|(?:做了|完成了?|报了)(?:多少|几单|什么)?(?:业绩|单|钱)?|完成)(?:是?(?:多少|怎样|怎么样))?(?:吧|啊|呢|吗)?[?？。！!]*$/.test(flat)
-    || /^(?:请)?(?:帮我|给我)(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查|看|问|列)(?:一?下)?(?:的)?(?:今天|今日|本月|这个月|这月)(?:的)?(?:个人)?(?:业绩(?:进度)?|进度|已入账|入账结果?|(?:做了|完成了?|报了)(?:多少|几单|什么)(?:业绩|单|钱)?|完成(?:情况|度)?)(?:是?(?:多少|怎样|怎么样))?(?:吧|啊|呢|吗)?[?？。！!]*$/.test(flat)
-    || /^(?:我|本人)(?:的)?(?:今天|今日|本月|这个月|这月)?(?:的)?(?:个人)?(?:业绩(?:进度)?|进度|已入账)(?:是?(?:多少|怎样|怎么样))?(?:吧|啊|呢|吗)?[?？。！!]*$/.test(flat)
+  const selfMetric = '(?:个人)?(?:业绩(?:进度)?|进度|已入账|入账结果?|(?:做了|完成了?|报了)(?:多少|几单|什么)?(?:业绩|单|钱)?|完成(?:情况|度|率)?|目标|(?:已完成)?金额|(?:目标|业绩|已完成金额|金额|完成率|进度|差额)(?:[、，,和与及](?:目标|业绩|已完成金额|金额|完成率|进度|差额))+)';
+  return new RegExp(`^(?:请?帮?(?:我)?)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查|看|问|列)(?:一?下|查|看)?(?:我|本人)(?:的)?(?:今天|今日|本月|这个月|这月)?(?:的)?${selfMetric}(?:是?(?:多少|怎样|怎么样))?(?:吧|啊|呢|吗)?[?？。！!]*$`).test(flat)
+    || new RegExp(`^(?:请)?(?:帮我|给我)(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查|看|问|列)(?:一?下)?(?:的)?(?:今天|今日|本月|这个月|这月)(?:的)?${selfMetric}(?:是?(?:多少|怎样|怎么样))?(?:吧|啊|呢|吗)?[?？。！!]*$`).test(flat)
+    || new RegExp(`^(?:我|本人)(?:的)?(?:今天|今日|本月|这个月|这月)?(?:的)?(?:(?:个人)?(?:业绩(?:进度)?|进度|已入账|完成率|目标|(?:目标|业绩|已完成金额|金额|完成率|进度|差额)(?:[、，,和与及](?:目标|业绩|已完成金额|金额|完成率|进度|差额))+)|离(?:本月|这个月|这月|今天|今日)?目标还差多少|目标(?:还差|差额|完成率)(?:多少)?)(?:是?(?:多少|怎样|怎么样))?(?:吧|啊|呢|吗)?[?？。！!]*$`).test(flat)
     || /^(?:请?帮?(?:我)?)?(?:只(?:想|是|要)?)?(?:查询|查看|查|看|列)(?:一?下)?(?:我|本人)?(?:的)?今天(?:的)?(?:单|报数|入账|已入账|已报)(?:吧|啊|呢|吗)?[?？。！!]*$/.test(flat);
 }
 export function isStorePerfQuery(text: string): boolean {
   const flat = flatOf(text);
+  if (hasUnsupportedHistoricalPeriod(flat)) return false;
   if (/金额|报一笔|记一笔|改成/.test(flat) && /\d/.test(flat)) return false;
-  return /^(?:请?帮?(?:我)?)?(?:查|看)(?:一?下)?(?:本店|我们店|门店|本店今天|本店本月)(?:的)?(?:今天|今日|本月)?(?:的)?(?:业绩|汇总|完成|进度|完成率)(?:吧|啊|呢)?$/.test(flat)
-    || /^(?:本店|我们店)(?:今天|今日|本月)?(?:的)?(?:业绩|汇总)(?:是?(?:多少))?(?:吧|啊|呢)?$/.test(flat)
+  const storeMetric = '(?:业绩(?:汇总|小计)?|汇总|小计|完成|进度|完成率|目标|目标差额|(?:目标|业绩|已完成金额|金额|完成率|进度|差额)(?:[、，,和与及](?:目标|业绩|已完成金额|金额|完成率|进度|差额))+)';
+  return new RegExp(`^(?:请?帮?(?:我)?)?(?:只(?:想|是|要)?)?(?:查询|查看|查|看)(?:一?下)?(?:本店|我们店|门店|全店|本店今天|本店本月)(?:的)?(?:今天|今日|本月|这个月|这月)?(?:的)?(?:全店的?)?${storeMetric}(?:是?(?:多少|怎样|怎么样))?(?:吧|啊|呢|吗)?[?？。！!]*$`).test(flat)
+    || new RegExp(`^(?:本店|我们店|全店)(?:今天|今日|本月|这个月|这月)?(?:的)?(?:${storeMetric}|离(?:本月|这个月|这月|今天|今日)?目标还差多少)(?:是?(?:多少))?(?:吧|啊|呢|吗)?[?？。！!]*$`).test(flat)
     || /^(?:经营汇总|门店汇总|本店汇总|本月汇总)(?:\s+\S+)?$/.test(flat);
 }
 export const otherProgressCommand = /^(\S{1,12}?)的(?:今天|本月)?进度$/;
@@ -143,10 +207,10 @@ export async function scopeRefusal(text: string, ctx: RefusalContext): Promise<s
   if (named.length && METRIC.test(flat) && !await ctx.allowed('progress_other', actor.storeId)) {
     return cannot(`你没有权限查同事（${named.map(p => p.displayName).join('、')}）的业绩，这个需要店长来查；查自己的请发「我的进度」`);
   }
-  // 目录未收录的「小X/老X」问法，同样不能查别人（不要求名字已在花名册里）。
-  if (!namedAll.length && METRIC.test(flat)) {
-    const nicks = [...flat.matchAll(/(?:小|老)[\u4e00-\u9fa5]{1,2}/g)].map(m => m[0]).filter(n => n !== actor.displayName && !/^(?:小姐|老师|小姐姐)$/.test(n));
-    if (nicks.length) return cannot(`你没有权限查同事（${[...new Set(nicks)].join('、')}）的业绩，这个需要店长来查；查自己的请发「我的进度」`);
+  // 目录未收录的「小X/老X」问法，同样不能查别人（先校验 progress_other 权限，并排除老客/小计/小红书等非人名词）。
+  if (!namedAll.length && METRIC.test(flat) && !await ctx.allowed('progress_other', actor.storeId)) {
+    const nicks = unlistedColleagueNicknames(text, actor);
+    if (nicks.length) return cannot(`你没有权限查同事（${nicks.join('、')}）的业绩，这个需要店长来查；查自己的请发「我的进度」`);
   }
   if (STORE_WIDE.test(flat) && !await ctx.allowed('store_summary', actor.storeId) && !await ctx.allowed('stores_ranking', actor.storeId)) {
     return cannot('你没有权限看全店的排名和汇总，这个需要店长来；查自己的请发「我的进度」');
@@ -380,70 +444,133 @@ export interface AppointmentReadSpec {
   scope: 'own' | 'store' | 'other';
   day?: 'today' | 'tomorrow';
   target?: string;
+  countOnly?: boolean;
 }
+
+const IDENTITY_ROLE_CLAUSE = /^(?:我|本人)?(?:当前|目前|现在)?(?:实际)?(?:在系统里|在店里|在本店|系统里)?(?:的)?(?:(?:是什么|属于什么)(?:业务身份|身份|岗位|角色|职级)|(?:业务身份|身份|岗位|角色|职级)(?:是什么|是啥))$/;
+const IDENTITY_STORE_CLAUSE = /^(?:我|本人)?(?:当前|目前|现在)?(?:实际)?(?:在系统里|在店里|在本店|系统里)?(?:的)?(?:(?:(?:获|被)?授权|有权限|能|可以)(?:访问|查看|管理|看|查)?(?:的)?(?:哪些门店|什么门店|门店(?:有哪些|是什么|是哪些))|(?:获|被)?授权(?:访问|查看|管理)?的?门店(?:是什么|有哪些|是哪些))$/;
 
 export function isIdentityScopeQuery(text: string): boolean {
   const flat = flatOf(text).replace(/[?？。！!;；]+$/g, '');
   const stripped = flat.replace(/^(?:请)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查一下|查询|查看|核对一下|核对|看看|查|看)/, '');
-  return /^(?:我|本人)(?:当前|目前|现在)?(?:实际)?(?:在系统里|在店里|在本店|系统里)?(?:的)?(?:(?:是什么|属于什么)(?:业务身份|身份|岗位|角色|职级)|(?:业务身份|身份|岗位|角色|职级)(?:是什么|是啥))(?:和(?:获|被)?授权(?:访问|查看|管理)?的?门店(?:是什么|有哪些|是哪些)?)?$/.test(stripped)
-    || /^(?:我|本人)(?:当前|目前|现在)?(?:实际)?(?:业务身份和)?(?:的)?(?:(?:(?:获|被)?授权|有权限|能|可以)(?:访问|查看|管理|看|查)?(?:的)?(?:哪些门店|什么门店|门店(?:有哪些|是什么|是哪些))|(?:获|被)?授权门店(?:是什么|有哪些|是哪些))$/.test(stripped);
+  if (/^(?:我|本人)(?:当前|目前|现在)?(?:实际)?(?:在系统里|在店里|在本店|系统里)?(?:的)?(?:(?:是什么|属于什么)(?:业务身份|身份|岗位|角色|职级)|(?:业务身份|身份|岗位|角色|职级)(?:是什么|是啥))(?:(?:和|以及|还有|并|并且)?(?:我|本人)?(?:当前|目前|现在)?(?:实际)?(?:(?:获|被)?授权(?:访问|查看|管理)?(?:的)?(?:哪些门店|什么门店|门店(?:是什么|有哪些|是哪些))))?$/.test(stripped)) {
+    return true;
+  }
+  if (/^(?:我|本人)(?:当前|目前|现在)?(?:实际)?(?:业务身份和)?(?:的)?(?:(?:(?:获|被)?授权|有权限|能|可以)(?:访问|查看|管理|看|查)?(?:的)?(?:哪些门店|什么门店|门店(?:有哪些|是什么|是哪些))|(?:获|被)?授权门店(?:是什么|有哪些|是哪些))$/.test(stripped)) {
+    return true;
+  }
+  const parts = stripped
+    .split(/[?？，,；;。、]+/)
+    .map(part => part.replace(/^(?:以及|还有|并且|并|和)/, '').trim())
+    .filter(Boolean);
+  if (parts.length === 2 && /(?:我|本人)/.test(stripped)) {
+    const [a, b] = parts as [string, string];
+    return (IDENTITY_ROLE_CLAUSE.test(a) && IDENTITY_STORE_CLAUSE.test(b))
+      || (IDENTITY_STORE_CLAUSE.test(a) && IDENTITY_ROLE_CLAUSE.test(b));
+  }
+  return false;
 }
 
 export function parseAppointmentReadQuery(text: string): AppointmentReadSpec | null {
-  const flat = flatOf(text).replace(/[?？。！!;；]+$/g, '');
+  const cleaned = text.normalize('NFKC').trim()
+    .replace(/^只读(?:查询|核对)\s*:?\s*/, '')
+    .replace(/^(?:我)?(?:先|暂)?不(?:要|用|想)?(?:登记|改单|预约|报单|报数|改账)(?:[、，,]\s*(?:我)?(?:先|暂)?不(?:要|用|想)?(?:登记|改单|预约|报单|报数|改账))*[，,。；;\s]+(?=\S)/, '')
+    .replace(/[?？。;；，,]\s*(?:我)?(?:先|暂)?不(?:要|用|想)?(?:登记|改单|预约|报单|报数|改账)(?:[、，,]\s*(?:我)?(?:先|暂)?不(?:要|用|想)?(?:登记|改单|预约|报单|报数|改账))*[。.!！]?$/, '');
+  const flat = flatOf(cleaned).replace(/[?？。！!;；]+$/g, '');
   if (!flat.includes('预约')) return null;
   if (/\d{1,2}[:：点时号日月]|\d{2,}/.test(flat)) return null;
   if (/(?:帮我约|帮.{0,4}约|给我约|替.{0,4}约|安排预约|取消|改|确认预约|话术|带教|演练|课件)/.test(flat)) return null;
   const day: 'today' | 'tomorrow' | undefined = /明天|明日/.test(flat)
     ? 'tomorrow'
     : (/今天|今日/.test(flat) && !/今天及以后/.test(flat) ? 'today' : undefined);
-  const withDay = (base: AppointmentReadSpec): AppointmentReadSpec => (day ? { ...base, day } : base);
-  if (/^(?:我的预约|本人预约|预约结果|我登记的预约)$/.test(flat)) return { scope: 'own' };
+  const countOnly = /(?:有几[个条笔]|一共几[个条笔]|共有?几[个条笔]|多少[个条笔]?|几[个条笔]|数量|条数|个数|数一?下|统计)/.test(flat);
+  const finish = (base: AppointmentReadSpec): AppointmentReadSpec => ({
+    ...base,
+    ...(day ? { day } : {}),
+    ...(countOnly ? { countOnly: true } : {}),
+  });
+  if (/^(?:我的预约|本人预约|预约结果|我登记的预约)$/.test(flat)) return finish({ scope: 'own' });
   if (/^(?:预约列表|(?:今天|今日|明天|明日|本店)的?预约|本店(?:今天|今日|明天|明日)的?预约)$/.test(flat)) {
-    return withDay({ scope: 'store' });
+    return finish({ scope: 'store' });
   }
-  const ownQual = /^(?:(?:我|本人)(?:的)?(?:今天|今日|明天|明日|接下来|后续|之后|近期)?(?:的)?(?:(?:已(?:经)?)?(?:登记|有)的?|已约的?)?|(?:今天|今日|明天|明日|接下来|后续|之后|近期)(?:我|本人)(?:的)?(?:(?:已(?:经)?)?(?:登记|有)的?|已约的?)?)$/;
+  const ownQual = /^(?:(?:我|本人)(?:的)?(?:今天|今日|明天|明日|接下来|后续|之后|近期)?(?:的)?(?:(?:已(?:经)?)?(?:登记|有)的?|已约的?)?|(?:今天|今日|明天|明日|接下来|后续|之后|近期)(?:我|本人)(?:的)?(?:(?:已(?:经)?)?(?:登记|有)的?|已约的?)?|(?:接下来|后续|之后|近期)(?:的)?(?:(?:已(?:经)?)?(?:登记|有)的?|已约的?)?)$/;
   const storeQual = /^(?:本店(?:的)?(?:今天|今日|明天|明日|接下来|后续)?(?:的)?(?:(?:已(?:经)?)?(?:登记|有)的?)?|(?:今天|今日|明天|明日)的?)$/;
   const cleanTarget = (qual: string) =>
     qual.replace(/(?:今天|今日|明天|明日|接下来|后续|之后|近期)?(?:的)?(?:(?:已(?:经)?)?(?:登记|有)的?|已约的?)?$/, '').replace(/的$/, '') || qual;
-  const prefixed = /^(?:请)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查一下|看一下|看下|查|看|列一下|列出)(?:一?下)?(.+)$/u.exec(flat);
+  const resolveQual = (qual: string, defaultScope: 'own' | 'store'): AppointmentReadSpec => {
+    if (!qual) return finish({ scope: defaultScope });
+    if (ownQual.test(qual)) return finish({ scope: 'own' });
+    if (storeQual.test(qual)) return finish({ scope: 'store' });
+    return finish({ scope: 'other', target: cleanTarget(qual) });
+  };
+  const matchClause = (body: string, allowBareSuffix: boolean): { qual: string } | null => {
+    const pre = /^(.*?)(?:一共|总共|共)?(?:有哪些|有什么|是哪些|有几[个条笔]|多少[个条笔]?|几[个条笔])(?:已(?:经)?(?:登记|有|约)的?)?预约(?:记录|列表|结果|明细)?$/u.exec(body);
+    if (pre) return { qual: pre[1]! };
+    const suf = allowBareSuffix
+      ? /^(.*)预约(?:记录|列表|结果|明细)?(?:的)?(?:(?:数量|条数|个数)(?:是多少|多少)?|(?:一共|总共|共)?(?:有哪些|有什么|是哪些|有几[个条笔]|多少[个条笔]?|几[个条笔]))?$/u.exec(body)
+      : /^(.*)预约(?:记录|列表|结果|明细)?(?:的)?(?:(?:数量|条数|个数)(?:是多少|多少)?|(?:一共|总共|共)?(?:有哪些|有什么|是哪些|有几[个条笔]|多少[个条笔]?|几[个条笔]))$/u.exec(body);
+    if (suf) return { qual: suf[1]! };
+    return null;
+  };
+  const prefixed = /^(?:请)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查一下|看一下|看下|查|看|列一下|列出|数一下|数下|统计)(?:一?下)?(.+)$/u.exec(flat);
   if (prefixed) {
-    const tail = /^(.*)预约(?:记录|列表|结果|明细)?(?:有哪些|有什么|是哪些)?$/u.exec(prefixed[1]!);
-    if (!tail) return null;
-    const qual = tail[1]!;
-    if (!qual || ownQual.test(qual)) return withDay({ scope: 'own' });
-    if (storeQual.test(qual)) return withDay({ scope: 'store' });
-    return withDay({ scope: 'other', target: cleanTarget(qual) });
+    const hit = matchClause(prefixed[1]!, true);
+    if (!hit) return null;
+    return resolveQual(hit.qual, 'own');
   }
-  const askList = /^(.*)预约(?:记录|列表|结果|明细)?(?:有哪些|有什么|是哪些)$/u.exec(flat);
-  if (askList) {
-    const qual = askList[1]!;
-    if (ownQual.test(qual)) return withDay({ scope: 'own' });
-    if (!qual || storeQual.test(qual)) return withDay({ scope: 'store' });
-    return withDay({ scope: 'other', target: cleanTarget(qual) });
-  }
+  const ask = matchClause(flat, false);
+  if (ask) return resolveQual(ask.qual, 'store');
   return null;
 }
 
+function parseSelfAndStoreQuery(request: string): { store?: string } | null {
+  const flat = flatOf(request);
+  if (/(?:报单|报数|记账|改账|预约|设目标|撤回|确认入账|文案|小红书|朋友圈|海报|话术|复盘)/.test(flat)) return null;
+  const hasSelf = /(?:我|本人)(?:的)?(?:今天|今日|本月|这个月|这月)?(?:的)?(?:个人)?(?:业绩|进度|已完成金额|完成情况)/.test(flat);
+  const storeMatch = /(?:和|与|以及|跟|及|、|，|,|对比)[^，,。；;]{0,6}?(?:(?:门店\s*)?([\w.-]+(?!店)|(?:(?!店|和|与|及)[\p{Script=Han}A-Za-z0-9]){1,20}店))\s*的?\s*(?:今天|今日|本月|这个月|这月)?(?:的)?(?:全店的?)?(?:业绩|汇总|经营汇总|进度)/u.exec(request)
+    ?? /(本店|全店|我们店|门店)(?:今天|今日|本月|这个月|这月)?(?:的)?(?:全店的?)?(?:业绩|汇总|经营汇总|进度)/.exec(flat);
+  if (!hasSelf || !storeMatch) return null;
+  const rawStore = storeMatch[1];
+  if (!rawStore || /^(?:本店|全店|我们店|门店)$/.test(rawStore)) return {};
+  return { store: rawStore };
+}
+
 /** A complete read-only question. Discard only framing and explicit negative clauses. */
-export type BusinessRead = { kind: 'self' | 'identity' | 'unsupported' } | { kind: 'summary'; store?: string } | { kind: 'managed' | 'existing'; command: string };
-export function businessRead(text: string): BusinessRead | undefined {
+export type BusinessRead =
+  | { kind: 'self' | 'identity' | 'unsupported' | 'historical' }
+  | { kind: 'summary'; store?: string; withTarget?: boolean }
+  | { kind: 'self_and_summary'; store?: string }
+  | { kind: 'managed' | 'existing'; command: string };
+
+export function businessRead(text: string, businessDay?: string): BusinessRead | undefined {
   const request = text.normalize('NFKC').trim()
     .replace(/^[A-Za-z]+-[A-Za-z]*\d+\s*:\s*/, '')
     .replace(/^我(?:现在)?自称[^。！？!?\n]+[。！？!?]\s*/, '')
     .replace(/^只读(?:查询|核对)\s*:?\s*/, '')
-    .replace(/^(?:我)?(?:先|暂)?不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布)(?:[、，,]\s*(?:我)?(?:先|暂)?不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布))*[，,。；;\s]+(?=\S)/, '')
-    .replace(/[?？。;；，,]\s*不(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布)(?:[、，,]\s*不(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布))*[。.!！]?$/, '')
+    .replace(/^(?:我)?(?:先|暂)?不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单)(?:[、，,]\s*(?:我)?(?:先|暂)?不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单))*[，,。；;\s]+(?=\S)/, '')
+    .replace(/[?？。;；，,]\s*(?:我)?(?:先|暂)?(?:不是补报|不是补录|不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单))(?:[、，,]\s*(?:不是补报|不是补录|不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单)))*[。.!！]?$/, '')
     .replace(/[?？。;；]+$/, '').trim();
   if (isIdentityScopeQuery(request)) return { kind: 'identity' };
+  const flatReq = flatOf(request);
+  if (hasUnsupportedHistoricalPeriod(request, businessDay)
+      && !/\d{2,}|\d+(?:\.\d+)?[kKwW千万元块]/.test(flatReq)
+      && /(?:业绩|进度|汇总|完成率|目标|经营)/.test(flatReq)
+      && !/(?:报单|报数|记账|改账|预约|设目标|定目标|改目标|撤回|确认入账|文案|小红书|朋友圈|海报)/.test(flatReq)) {
+    return { kind: 'historical' };
+  }
+  const selfAndStore = parseSelfAndStoreQuery(request);
+  if (selfAndStore) return { kind: 'self_and_summary', ...(selfAndStore.store ? { store: selfAndStore.store } : {}) };
   if (isSelfProgressQuery(request) || /^我(?:本月|今天)?的?(?:个人)?(?:业绩(?:进度)?|进度)(?:是多少|多少)?$/.test(request)) return { kind: 'self' };
   const query = request.replace(/^(?:请|帮我|给我)?(?:只(?:想|是|要)?)?(?:查一下|查询|查看|核对|看看|查|看)\s*/, '');
-  const named = /^(?:(?:[\p{Script=Han}]{1,12}的)?门店\s*)?([\w.-]+(?!店)|[\p{Script=Han}A-Za-z0-9]{1,20}?店)\s*的?\s*(?:本月|这个月|这月|今日|今天)?(?:全店的?)?(?:业绩(?:汇总)?|汇总|进度)(?:是多少|多少)?$/u.exec(query);
+  const withTarget = /目标|完成率|差额|还差/.test(flatReq);
+  const named = /^(?:(?:[\p{Script=Han}]{1,12}的)?门店\s*)?([\w.-]+(?!店)|(?:(?!店|和|与|及)[\p{Script=Han}A-Za-z0-9]){1,20}店)\s*的?\s*(?:本月|这个月|这月|今日|今天)?(?:全店的?)?(?:业绩(?:汇总|小计)?|汇总|小计|进度|目标|完成率)(?:是多少|多少)?$/u.exec(query);
   const command = /^(?:经营汇总|门店汇总|本店汇总|本月汇总)(?:\s+([^\s]+))?$/.exec(request);
-  if (isStorePerfQuery(request) && !command?.[1]) return { kind: 'summary' };
+  if (isStorePerfQuery(request) && !command?.[1]) return { kind: 'summary', ...(withTarget ? { withTarget: true } : {}) };
   if (named) {
     const target = named[1]!;
-    return /^(?:本店|全店)$/.test(target) ? { kind: 'summary' } : { kind: 'summary', store: target };
+    return /^(?:本店|全店)$/.test(target)
+      ? { kind: 'summary', ...(withTarget ? { withTarget: true } : {}) }
+      : { kind: 'summary', store: target, ...(withTarget ? { withTarget: true } : {}) };
   }
   if (otherProgressCommand.test(request) || missingReportsCommand.test(request) || storeRankingCommand.test(request)) return { kind: 'managed', command: request };
   if (command) return command[1] ? { kind: 'summary', store: command[1] } : { kind: 'summary' };
@@ -451,7 +578,7 @@ export function businessRead(text: string): BusinessRead | undefined {
       && !/报单|报数|记账|改账|预约|设目标|撤回|确认入账/.test(request)) {
     const targets = labelledStoreTargets(request);
     if (!targets || targets.length > 1) return { kind: 'unsupported' };
-    if (targets[0]) return { kind: 'summary', store: targets[0] };
+    if (targets[0]) return { kind: 'summary', store: targets[0], ...(withTarget ? { withTarget: true } : {}) };
   }
   if (existingReadCommand(request)) return { kind: 'existing', command: request };
   if (/^(?:[A-Za-z]+-[A-Za-z]*\d+[：:]\s*)?只读(?:查询|核对)/.test(text.trim())) return { kind: 'unsupported' };

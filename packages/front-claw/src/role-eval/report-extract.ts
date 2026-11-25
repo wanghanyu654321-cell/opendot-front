@@ -43,7 +43,8 @@ const CORRECTION = /改成|改为|改到|改下|改一下|改个|更正|写错|�
 const TARGET = /目标/;
 const MARKETING = /文案|小红书|朋友圈|海报|种草|推广|营销|宣传|标语|口号|推文|公众号|抖音|短视频|脚本|活动方案|广告|话术|标题/;
 const REPORT_CUE = /(?<![别不])(?:记|报|登|入账|核对|清单|算我|业绩)/;
-const NEG_REPORT = /别(?:报|记)|不要(?:报|记)|不用(?:报|记)|不是报数/;
+const NEG_REPORT = /别(?:报|记|入账|登)|不要(?:报|记|入账|登)|不用(?:报|记|入账|登)|不是报数/;
+const NOT_CLOSED = /最后没做|没做成|未成交|没成交|黄了|没买了|没买|白忙活|白忙|没做了|不做了|没搞成|没约成/;
 const OTHER_DAY = /昨天|昨儿|昨日|昨晚|前天|前儿|大前天|明天|明日|明儿|后天|大后天|下周|下星期|上周|上星期|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号](?!码)|(20\d{2})[-/年]\d{1,2}[-/月]\d{1,2}/;
 const TOTAL = /(?:一共|总共|合计|共计|总计|总额|加起来)$/;
 const COUNT = /(?<![\d.])(\d|[一两二三四五六七八九十])\s*(?:笔|单)(?!价)/;
@@ -213,6 +214,27 @@ export function moneyIssueOf(raw: string): { issue: AmountIssue; text: string } 
   return null;
 }
 
+/**
+ * 与 extractReport 共用同一套未成交/否定报单语义：
+ * 只剥掉明确的非报单复合分句（如「先别预约」），避免模型兜底或候选改写擦除原句里的「没成交 / 别记」。
+ */
+export function nonClosingReportReason(raw: string): 'not_closed' | 'negation' | null {
+  if (typeof raw !== 'string') return null;
+  let normalized = normalizeReportText(raw).trim();
+  if (!normalized || normalized.length > 300) return null;
+  const tail = compoundTail(normalized);
+  const head = compoundHead(normalized);
+  if (tail && clauseKind(tail) && clauseKind(tail) !== 'report' && (clauseKind(head) === 'report' || mentionsOf(maskIdentifiers(maskQuotes(head))).some(m => m.kind === 'amount'))) {
+    normalized = head.trim();
+  }
+  const text = maskIdentifiers(maskQuotes(normalized));
+  const flat = text.replace(/\s+/g, '');
+  if (!mentionsOf(text).some(m => m.kind === 'amount')) return null;
+  if (NOT_CLOSED.test(flat)) return 'not_closed';
+  if (NEG_REPORT.test(flat)) return 'negation';
+  return null;
+}
+
 export function extractReport(raw: string): ExtractResult {
   if (typeof raw !== 'string') return { status: 'none' };
   let normalized = normalizeReportText(raw).trim();
@@ -251,7 +273,6 @@ export function extractReport(raw: string): ExtractResult {
   const headForDay = maskNegatedPastDay(headFlat);
   if (CORRECTION.test(headFlat) || TARGET.test(headFlat) || OTHER_DAY.test(headForDay)) return { status: 'none' };
   // 未成交/没做成：不出可确认报数（金额只是在说「当时的报价」）。
-  const NOT_CLOSED = /最后没做|没做成|未成交|没成交|黄了|没买了|没买|白忙活|白忙|没做了|不做了|没搞成|没约成/;
   if (NOT_CLOSED.test(flat) && amounts.length) return { status: 'unclear', reason: 'not_closed' };
   if (MARKETING.test(flat) && (!REPORT_CUE.test(flat) || NEG_REPORT.test(flat))) return { status: 'none' };
   if (NEG_REPORT.test(flat)) return { status: 'none' };

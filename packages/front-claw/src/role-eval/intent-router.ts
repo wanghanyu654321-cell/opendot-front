@@ -190,8 +190,14 @@ function interpret(output: Record<string, unknown>): { label: Intent; fields?: R
 }
 export async function classifyWithSemantic(text: string, options: {
   businessDay?: string; semantic?: SemanticClassifier | undefined; signal?: AbortSignal | undefined; deadline?: number | undefined; now?: () => number;
+  /** 入口层启用：明确的跨类多意图（店务 + 营销/软岗位）不交语义分类器压成单一意图。 */
+  preserveCrossDomainMultiIntent?: boolean;
 }): Promise<Classification> {
   const rule = classifyIntent(text, options);
+  if (options.preserveCrossDomainMultiIntent && rule.reason === 'multi-intent'
+      && rule.intents.some(isStoreIntent) && rule.intents.includes('marketing')) {
+    return rule;
+  }
   if (rule.label !== 'clarify' || (rule.reason !== 'no-signal' && rule.reason !== 'multi-intent') || !options.semantic) return rule;
   const now = options.now ?? (() => performance.now());
   const remaining = Math.floor((options.deadline ?? now() + 3000) - now());

@@ -1,9 +1,11 @@
 import { sealDraftAmounts, formatYuan } from './amount-guard.js';
 import { validateModelChain } from './model-classify.js';
 import type { Person } from './performance-store.js';
+import { nonClosingReportReason } from './report-extract.js';
 
 /** Extraction only: the resulting line still needs the standard draft gate and employee confirmation. */
 export function modelReportCandidate(text: string, output: unknown, actor: Person, today: string): string | null {
+  if (nonClosingReportReason(text)) return null;
   const chain = validateModelChain({ text, output });
   if (!chain.ok || chain.classification.intent !== 'report' || chain.classification.action !== 'report' || chain.amountCents === undefined) return null;
   const c = chain.classification;
