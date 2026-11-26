@@ -89,6 +89,7 @@ export type ReadQuerySpec =
       readonly day?: AppointmentDay;
       readonly target?: string;
       readonly detailMode: 'count' | 'list';
+      readonly explicitStoreWide?: boolean;
     }
   | {
       readonly kind: 'entry_result';
@@ -338,6 +339,7 @@ export function parseRuleReadQuery(text: string, businessDay?: string): ReadQuer
       ...(appt.day ? { day: appt.day } : {}),
       ...(appt.target ? { target: appt.target } : {}),
       detailMode: appt.countOnly ? 'count' : 'list',
+      ...(appt.explicitStoreWide ? { explicitStoreWide: true } : {}),
     };
   }
 
@@ -396,12 +398,25 @@ export function parseRuleReadQuery(text: string, businessDay?: string): ReadQuer
   const returningSummary = parseReturningCustomerSummaryQuery(positive, constraints, wantsTarget);
   if (returningSummary) return returningSummary;
 
-  // 8. 本人业绩 / 目标 / 完成率 / 差额查询
+  // 8. 本人业绩 / 目标 / 完成率 / 差额查询（含条件式目标/差额读，但严拒含赋值/金额的写目标请求）
+  const isConditionalSelfTargetRead = ((): boolean => {
+    if (!/目标/.test(flatPos)) return false;
+    if (!/(?:我|本人|自己)/.test(flatPos) || /(?:本店|全店|门店|我们店|他|她|同事|全员)/.test(flatPos)) return false;
+    if (/(?:报单|报数|记账|改账|预约|撤回|撤销|作废|确认入账|文案|小红书|朋友圈|海报|话术|复盘)/.test(flatPos)) return false;
+    // 含数字/中文金额或写目标赋值动作（如「如果没设就帮我设成一万」「帮我定成3万」）绝不归为只读！
+    if (/\d|[一二两三四五六七八九十百千万]+[元块万千]|(?:帮我|给我|替我|帮|给|替)(?:定|设|改|调|设置|设定)|(?:定|设|改|调|设置|设定)(?:成|为|到|一个|新)/.test(flatPos)) {
+      return false;
+    }
+    const hasUnsetCondition = /(?:还没设|未设置|未设定|未设|没有设|没设|有没有设|设了没|是否设|如果|要是|若)/.test(flatPos);
+    const hasReadGoal = /(?:差额|还差|完成率|已完成|进度|告诉我|说明|就说|提示|告知|查|看|多少)/.test(flatPos);
+    return hasUnsetCondition && hasReadGoal;
+  })();
   if (
-    isSelfProgressQuery(positive)
+    isConditionalSelfTargetRead
+    || isSelfProgressQuery(positive)
     || /^我(?:本月|今天)?的?(?:个人)?(?:业绩(?:进度)?|进度)(?:是多少|多少)?$/.test(positive)
   ) {
-    return { kind: 'self_progress', source: 'rule', wantsTarget };
+    return { kind: 'self_progress', source: 'rule', wantsTarget: wantsTarget || isConditionalSelfTargetRead };
   }
 
   // 9. 本店 / 点名门店汇总与目标查询
@@ -560,6 +575,7 @@ export function fromModelReadQuery(
         ...(ruleAppt.day ? { day: ruleAppt.day } : {}),
         ...(ruleAppt.target ? { target: ruleAppt.target } : {}),
         detailMode: c.slots.countOnly === true || ruleAppt.countOnly ? 'count' : 'list',
+        ...(ruleAppt.explicitStoreWide ? { explicitStoreWide: true } : {}),
       };
     }
     const periodFlat = flatOf(c.slots.period ?? '');
@@ -605,13 +621,14 @@ export function fromModelReadQuery(
         detailMode,
       };
     }
-    const storeScope = /(?:本店|全店|门店|店里)/.test(flatText) && !/(?:我|本人|名下)/.test(flatText);
+    const explicitStoreWide = /(?:本店|全店|门店|店里|全体|全员|全部|所有|大家)/.test(flatText) && !/(?:我|本人|自己|名下)/.test(flatText);
     return {
       kind: 'appointment',
       source: 'model',
-      scope: storeScope ? 'store' : 'own',
+      scope: explicitStoreWide ? 'store' : 'own',
       ...(day ? { day } : {}),
       detailMode,
+      ...(explicitStoreWide ? { explicitStoreWide: true } : {}),
     };
   }
 

@@ -500,6 +500,8 @@ export interface AppointmentReadSpec {
   day?: 'today' | 'tomorrow' | 'day_after_tomorrow';
   target?: string;
   countOnly?: boolean;
+  /** 显式要求看本店/全店/全体预约（与裸「预约列表」「今天的预约」区分，无 appointment_receive 时明确拒答）。 */
+  explicitStoreWide?: boolean;
 }
 
 const IDENTITY_ROLE_CLAUSE = /^(?:我|本人)?(?:当前|目前|现在)?(?:实际)?(?:在系统里|在店里|在本店|系统里)?(?:的)?(?:(?:是什么|属于什么)(?:业务身份|身份|岗位|角色|职级)|(?:业务身份|身份|岗位|角色|职级)(?:是什么|是啥))$/;
@@ -529,9 +531,21 @@ export function isIdentityScopeQuery(text: string): boolean {
 export function parseAppointmentReadQuery(text: string): AppointmentReadSpec | null {
   const rawFlat = flatOf(text);
   if (!rawFlat.includes('预约')) return null;
-  const guardAtom = '(?:我)?(?:先|暂)?(?:不是(?:来|要)?(?:登记|新建|新)?(?:预约|报单|报数|报业绩)|(?:不(?:要|用|想)?|别)(?:再)?(?:帮我|给我)?(?:新建|新)?(?:登记|改单|预约|报单|报数|报业绩|改账)|只(?:问|看|要|查)(?:数量|条数|个数|预约)|不(?:要|用)?(?:列|看)?明细)';
-  const cleaned = text.normalize('NFKC').trim()
-    .replace(/^只读(?:查询|核对)\s*:?\s*/, '')
+  if (/\d{1,2}[:：点时号日月]|\d{2,}|\d+(?:\.\d+)?[kKwW千万元块]/.test(rawFlat)) return null;
+  const guardAtom = '(?:我)?(?:先|暂)?(?:(?:刚才|刚刚|之前|上一?笔?)?(?:那笔|这笔|当前)?(?:待确认|未确认)?(?:的)?(?:草稿|报单|单子?)?(?:先放着|放着|先不管|先不处理|暂不处理|先别管|先别动|先不确认|先别确认|放一放)|不是(?:来|要)?(?:登记|新建|新)?(?:预约|报单|报数|报业绩)|(?:不(?:要|用|想)?|别)(?:再)?(?:帮我|给我)?(?:新建|新)?(?:登记(?:或|和|及|、)?改单|登记|改单|预约|报单|报数|报业绩|改账)(?:也?(?:不(?:要|用)?|别)(?:登记|改单|预约|报单|改账))?|只(?:问|看|要|查)(?:数量|条数|个数|预约)|不(?:要|用)?(?:列|看)?明细|直接告诉我)';
+  const guardClauseRe = new RegExp(`^(?:${guardAtom})(?:[、，,；;\\s]*(?:${guardAtom}))*[。.!！?？]*$`);
+  const normalized = text.normalize('NFKC').trim().replace(/^只读(?:查询|核对)\s*:?\s*/, '');
+  // 若按标点切分后，除目标预约子句外其余全为前置/后置保留状态约束（如「刚才那笔待确认的先放着，我只查自己今天有几条预约」「不用登记或改单，只问未来有几条预约」），仅解析预约子句本身。
+  let candidateText = normalized;
+  const clauses = normalized.split(/[，,。；;！!？?\n]+/).map(s => s.trim()).filter(Boolean);
+  if (clauses.length > 1) {
+    const apptClauses = clauses.filter(c => flatOf(c).includes('预约'));
+    const otherClauses = clauses.filter(c => !flatOf(c).includes('预约'));
+    if (apptClauses.length === 1 && otherClauses.every(c => guardClauseRe.test(flatOf(c)))) {
+      candidateText = apptClauses[0]!;
+    }
+  }
+  const cleaned = candidateText
     .replace(new RegExp(`^${guardAtom}(?:[、，,；;\\s]+${guardAtom})*[，,。；;？?\\s]+(?=\\S)`), '')
     .replace(new RegExp(`[?？。;；，,\\s]+${guardAtom}(?:[、，,；;\\s]+${guardAtom})*[。.!！?？]*$`), '');
   const flat = flatOf(cleaned).replace(/[?？。！!;；]+$/g, '');
@@ -549,23 +563,39 @@ export function parseAppointmentReadQuery(text: string): AppointmentReadSpec | n
     ...(day ? { day } : {}),
     ...(countOnly ? { countOnly: true } : {}),
   });
-  if (/^(?:我的预约|本人预约|我名下的?预约|预约结果|我登记的预约)$/.test(flat)) return finish({ scope: 'own' });
-  if (/^(?:预约列表|(?:今天|今日|明天|明日|后天|本店)的?预约|本店(?:今天|今日|明天|明日|后天)的?预约)$/.test(flat)) {
+  if (/^(?:我的预约|本人预约|自己(?:的)?预约|我名下的?预约|预约结果|我登记的预约)$/.test(flat)) return finish({ scope: 'own' });
+  if (/^(?:预约列表|(?:今天|今日|明天|明日|后天)的?预约)$/.test(flat)) {
     return finish({ scope: 'store' });
   }
-  const dayToken = '(?:今天|今日|明天|明日|后天|接下来|后续|之后|近期)';
+  if (/^(?:(?:本店|全店|门店|店里)(?:的)?(?:全体|全员|全部|所有|大家)?(?:员工|同事|人)?(?:的)?(?:今天|今日|明天|明日|后天|未来|接下来|后续|之后|以后|近期)?(?:的)?预约|(?:全体|全员|全部|所有)(?:员工|同事|人)?(?:今天|今日|明天|明日|后天|未来|接下来|后续|之后|以后|近期)?(?:的)?预约)$/.test(flat)) {
+    return finish({ scope: 'store', explicitStoreWide: true });
+  }
+  const dayToken = '(?:今天|今日|明天|明日|后天|未来|以后|之后|后续|接下来|近期)';
   const regToken = '(?:(?:已(?:经)?)?(?:登记|有|约)的?)?';
-  const ownQual = new RegExp(`^(?:(?:我|本人)(?:名下|自己)?(?:的)?${dayToken}?(?:的)?${regToken}|${dayToken}(?:我|本人)(?:名下|自己)?(?:的)?${regToken}|(?:接下来|后续|之后|近期)(?:的)?${regToken})$`);
-  const storeQual = new RegExp(`^(?:本店|全店|门店|店里)(?:的)?${dayToken}?(?:的)?${regToken}$`);
+  const selfActor = '(?:(?:我|本人)(?:名下|自己)?|自己)';
+  const ownQual = new RegExp(`^(?:${selfActor}(?:的)?${dayToken}?(?:的)?${regToken}|${dayToken}${selfActor}(?:的)?${regToken}|(?:未来|以后|之后|后续|接下来|近期)(?:的)?${regToken})$`);
+  const storeGroup = '(?:全体|全员|全部|所有|大家)(?:员工|同事|人)?';
+  const storeQual = new RegExp(`^(?:(?:本店|全店|门店|店里)(?:的)?(?:${storeGroup}(?:的)?)?${dayToken}?(?:的)?${regToken}|(?:本店|全店|门店|店里)(?:的)?${dayToken}(?:的)?(?:${storeGroup}(?:的)?)?${regToken}|${storeGroup}(?:的)?${dayToken}?(?:的)?${regToken}|${dayToken}(?:的)?${storeGroup}(?:的)?${regToken})$`);
   const bareDayQual = new RegExp(`^${dayToken}(?:的)?${regToken}$`);
   const cleanTarget = (qual: string) =>
     qual.replace(new RegExp(`${dayToken}?(?:的)?${regToken}$`), '').replace(/的$/, '') || qual;
-  const resolveQual = (qual: string, defaultScope: 'own' | 'store'): AppointmentReadSpec => {
+  const looksLikeEntityTarget = (target: string): boolean => {
+    if (!target) return false;
+    if (/(?:放着|待确认|草稿|刚才|刚刚|先不|先别|不用|不要|不改单|不是|只查|只问|只能)/.test(target)) return false;
+    if (otherStoreShortNames(target, '').length > 0) return true;
+    if (/店$/.test(target) && target.length <= 20) return true;
+    if (/^[A-Za-z0-9][A-Za-z0-9._-]{1,32}$/.test(target)) return true;
+    if (/^[\u4e00-\u9fa5]{2,4}$/.test(target)) return true;
+    return false;
+  };
+  const resolveQual = (qual: string, defaultScope: 'own' | 'store'): AppointmentReadSpec | null => {
     if (!qual) return finish({ scope: defaultScope });
     if (ownQual.test(qual)) return finish({ scope: 'own' });
-    if (storeQual.test(qual)) return finish({ scope: 'store' });
+    if (storeQual.test(qual)) return finish({ scope: 'store', explicitStoreWide: true });
     if (bareDayQual.test(qual)) return finish({ scope: defaultScope });
-    return finish({ scope: 'other', target: cleanTarget(qual) });
+    const target = cleanTarget(qual);
+    if (!looksLikeEntityTarget(target)) return null;
+    return finish({ scope: 'other', target });
   };
   const matchClause = (body: string, allowBareSuffix: boolean): { qual: string } | null => {
     const pre = /^(.*?)(?:一共|总共|共)?(?:有没有|有哪些|有什么|是哪些|有几[个条笔]|多少[个条笔]?|几[个条笔])(?:已(?:经)?(?:登记|有|约)的?)?预约(?:记录|列表|结果|明细)?$/u.exec(body);
@@ -576,7 +606,7 @@ export function parseAppointmentReadQuery(text: string): AppointmentReadSpec | n
     if (suf) return { qual: suf[1]! };
     return null;
   };
-  const prefixed = /^(?:请)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查一下|看一下|看下|查|看|列一下|列出|数一下|数下|统计)(?:一?下)?(.+)$/u.exec(flat);
+  const prefixed = /^(?:请)?(?:(?:我|本人)(?:自己)?)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查一下|看一下|看下|查|看|问|问一下|问下|列一下|列出|数一下|数下|统计)(?:一?下)?(.+)$/u.exec(flat);
   if (prefixed) {
     const hit = matchClause(prefixed[1]!, true);
     if (!hit) return null;
@@ -593,10 +623,17 @@ export function parseSelfAndStoreQuery(request: string): { store?: string } | nu
   if (/(?:报单|报数|记账|改账|预约|设目标|撤回|确认入账|文案|小红书|朋友圈|海报|话术|复盘)/.test(flat)) return null;
   const hasSelf = /(?:我|本人)(?:自己|个人)?(?:的)?(?:今天|今日|本月|这个月|这月)?(?:的)?(?:个人)?(?:业绩|进度|已完成金额|完成情况|做了多少|多少)/.test(flat)
     || /(?:我|本人)(?:自己|个人)?(?:和|与|以及|跟|及|、)/.test(flat);
-  const storeMatch = /(?:和|与|以及|跟|及|、|，|,|对比)[^，,。；;]{0,8}?(?:(?:门店\s*)?([\w.-]+(?!店)|(?:(?!店|和|与|及|的)[\p{Script=Han}A-Za-z0-9]){1,20}店))\s*的?\s*(?:今天|今日|本月|这个月|这月)?(?:的)?(?:全店的?)?(?:业绩|汇总|经营汇总|进度|做了多少|多少)/u.exec(positive)
+  const storeLead = '(?:和|与|以及|跟|及|、|，|,|；|;|对比)\\s*(?:(?:再|顺便|同时|然后|另外|并|并且|还有)\\s*)?(?:(?:给我|帮我|给|查一下|看一下|看下|查查|看看|查询|查看|列出|列一下|报一下|查|看|列)\\s*)?(?:(?:一下|下)\\s*)?';
+  const storeMatch = new RegExp(
+    `${storeLead}(?:(?:门店\\s*)?([\\w.-]+(?!店)|(?:(?!店|和|与|及|的|给|查|看|列|再|顺|报)[\\p{Script=Han}A-Za-z0-9]){1,20}店))\\s*的?\\s*(?:今天|今日|本月|这个月|这月)?(?:的)?(?:全店的?)?(?:业绩|汇总|经营汇总|进度|做了多少|多少)`,
+    'u',
+  ).exec(positive)
     ?? /(本店|全店|我们店|门店)(?:今天|今日|本月|这个月|这月)?(?:的)?(?:全店的?)?(?:业绩|汇总|经营汇总|进度|做了多少|多少)/.exec(flat);
   if (!hasSelf || !storeMatch) return null;
-  const rawStore = storeMatch[1];
+  const rawStore = storeMatch[1]?.trim()
+    .replace(/^(?:再|顺便|同时|然后|另外|并|并且|还有)+/, '')
+    .replace(/^(?:给我|帮我|给|查一下|看一下|看下|查查|看看|查询|查看|列出|列一下|报一下|查|看|列)+/, '')
+    .trim();
   if (!rawStore || /^(?:本店|全店|我们店|门店)$/.test(rawStore)) return {};
   return { store: rawStore };
 }

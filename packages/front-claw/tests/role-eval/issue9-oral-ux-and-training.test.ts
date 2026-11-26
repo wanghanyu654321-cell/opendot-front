@@ -56,8 +56,8 @@ async function setup({
   return { ...w, send, say };
 }
 
-describe('Issue #9 口语确认', () => {
-  it.each(['确认入账', '确认认账', '全部确认', '确认'])('插话后单字「对」拦截，「%s」入账一次', async command => {
+describe('Issue #9 / Issue #20 口语确认', () => {
+  it.each(['确认入账', '确认认账', '全部确认'])('插话后单字「对」与裸「确认」均拦截，「%s」入账一次', async command => {
     const { base, say, send } = await setup({ grantMarketing: true });
     // 这个用例用已有档案标记隔离 D175 与本 Issue 的营销角色变更。
     const person = (await base.getPerson(personId))!;
@@ -70,6 +70,9 @@ describe('Issue #9 口语确认', () => {
 
     expect(await say('对')).toContain(D175_INTERLEAVED_GUIDANCE);
     expect(await base.listEntries()).toEqual(before);
+    expect(await say('确认')).toContain(D175_INTERLEAVED_GUIDANCE);
+    expect(await base.listEntries()).toEqual(before);
+    expect((await base.listDrafts({ status: 'pending' }))[0]?.draftId).toBe(draft!.draftId);
     expect(await say(command)).toContain('已入账 1 笔');
     const confirmed = await base.listEntries();
     expect(confirmed).toHaveLength(before.length + 1);

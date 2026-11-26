@@ -47,7 +47,10 @@ import {
   type TargetAgentProfileSnapshot,
   type WeComFrontClawBridge,
   type WeComFrontClawBridgeOptions,
+  type WeComStoreClockContext,
+  buildWeComStoreClockContext,
   createWeComFrontClawBridge,
+  formatWeComStoreClockPromptBlock,
 } from './wecom-front-claw-bridge.js';
 import {
   WECOM_ROLE_SKILL_IDS,
@@ -458,6 +461,54 @@ export interface WeComFrontClawRuntimeDeps {
   readonly userSkillsDir?: string;
 }
 
+const activeWorkspaceClockResolvers = new Set<
+  (workspaceJid: string) => WeComStoreClockContext | undefined
+>();
+
+export function resolveActiveWeComWorkspaceStoreClock(
+  workspaceJid: string | undefined,
+): WeComStoreClockContext | undefined {
+  if (!workspaceJid) return undefined;
+  for (const resolver of activeWorkspaceClockResolvers) {
+    const found = resolver(workspaceJid);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function computeDefaultWeComStoreClock(now: Date): WeComStoreClockContext {
+  const timeZone = 'Asia/Shanghai';
+  const base = buildWeComStoreClockContext(now, timeZone, '');
+  const [hourText, minuteText] = base.localTime.split(':');
+  const minutes = Number(hourText) * 60 + Number(minuteText);
+  let businessDay = base.localDate;
+  if (Number.isFinite(minutes) && minutes >= 23 * 60) {
+    const [year, month, day] = base.localDate.split('-').map(Number);
+    businessDay = new Date(Date.UTC(year!, month! - 1, day! + 1))
+      .toISOString()
+      .slice(0, 10);
+  }
+  return {
+    ...base,
+    businessDay,
+  };
+}
+
+export function prependWeComStoreClockToPrompt(
+  prompt: string,
+  storeClock?: WeComStoreClockContext,
+  fallbackNow: Date = new Date(),
+): string {
+  if (
+    !prompt ||
+    prompt.includes('【门店当地时间锚点（只读，不含账本数据）】')
+  ) {
+    return prompt;
+  }
+  const clock = storeClock ?? computeDefaultWeComStoreClock(fallbackNow);
+  return `${formatWeComStoreClockPromptBlock(clock)}\n\n${prompt}`;
+}
+
 export interface WeComFrontClawRuntimeHandle {
   readonly botId: string;
   readonly ownerUserId: string;
@@ -468,6 +519,9 @@ export interface WeComFrontClawRuntimeHandle {
   readonly roleSkillIds: Readonly<Record<WeComSoftRole, readonly string[]>>;
   readonly bridge: WeComFrontClawBridge;
   readonly dispatchStatus: 'started' | 'disabled' | 'already';
+  getWorkspaceStoreClock(
+    workspaceJid: string,
+  ): WeComStoreClockContext | undefined;
   isConnected(): boolean;
   close(): Promise<void>;
 }
@@ -980,6 +1034,11 @@ export async function startWeComFrontClawRuntime(
       targetRole?: WeComSoftRole;
     }
   >();
+  const workspaceStoreClocks = new Map<string, WeComStoreClockContext>();
+  const resolveLocalWorkspaceStoreClock = (
+    targetWorkspaceJid: string,
+  ): WeComStoreClockContext | undefined =>
+    workspaceStoreClocks.get(targetWorkspaceJid);
 
   const bridgeOptions: WeComFrontClawBridgeOptions = {
     ...deps.bridgeOptions,
@@ -1011,6 +1070,13 @@ export async function startWeComFrontClawRuntime(
         ...(record.tier ? { tier: record.tier } : {}),
         ...(record.targetRole ? { targetRole: record.targetRole } : {}),
       });
+      if (record.workspaceJid && record.storeClock) {
+        if (workspaceStoreClocks.size >= 512) {
+          const oldest = workspaceStoreClocks.keys().next().value;
+          if (oldest !== undefined) workspaceStoreClocks.delete(oldest);
+        }
+        workspaceStoreClocks.set(record.workspaceJid, record.storeClock);
+      }
       deps.bridgeOptions?.onPrecheckAudit?.(record);
     },
     resolveWorkspaceJid:
@@ -1343,6 +1409,7 @@ export async function startWeComFrontClawRuntime(
   );
 
   if (!connected) {
+    workspaceStoreClocks.clear();
     logger.warn(
       { botId, driver: bridge.driver, leaseHeld: bridge.leaseHeld() },
       'WeCom channel failed to connect; closing Front Claw bridge',
@@ -1392,6 +1459,8 @@ export async function startWeComFrontClawRuntime(
     'WeCom Front Claw native runtime started',
   );
 
+  activeWorkspaceClockResolvers.add(resolveLocalWorkspaceStoreClock);
+
   let closing = false;
   return {
     botId,
@@ -1403,11 +1472,14 @@ export async function startWeComFrontClawRuntime(
     roleSkillIds,
     bridge,
     dispatchStatus,
+    getWorkspaceStoreClock: resolveLocalWorkspaceStoreClock,
     isConnected: () =>
       deps.imManager.isChannelAccountConnected(ownerUserId, 'wecom', botId),
     async close(): Promise<void> {
       if (closing) return;
       closing = true;
+      activeWorkspaceClockResolvers.delete(resolveLocalWorkspaceStoreClock);
+      workspaceStoreClocks.clear();
       bridge.stopNotificationDispatch();
       await bridge.close();
     },

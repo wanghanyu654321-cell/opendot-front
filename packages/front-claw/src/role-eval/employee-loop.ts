@@ -120,7 +120,7 @@ export const ALREADY_SETTLED_REPLY = (_id?: string) => ALREADY_CONFIRMED_TEXT;
 const d160Key = (personId: string, sessionId: string) => `employee-loop:d160-last-confirm:${personId}:${sessionId}`;
 export const d175InterleavedKey = (personId: string, sessionId: string) => `employee-loop:d175-interleaved:${personId}:${sessionId}`;
 export const D175_INTERLEAVED_GUIDANCE =
-  '刚才穿插了其他对话，为避免误入账，单字「对」暂不直接确认；请回复「确认入账」或「全部确认」入账，或回复「取消」。';
+  '刚才穿插了其他对话，为避免误入账，单字「对」或裸「确认」暂不直接确认；请回复「确认入账」或「全部确认」入账，或回复「取消」。';
 export const isExplicitConfirmCommand = (text: string): boolean => text === '确认入账' || text === '确认认账' || text === '全部确认';
 const isConfirmCommand = (text: string): boolean => text === '对' || isExplicitConfirmCommand(text);
 export const DENIED = 'Front Claw：仅支持本人或同店同事的报数、本人确认与进度；当前身份或对象不符合要求（跨店不能代报），没有写入。';
@@ -622,6 +622,7 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         ...(parsed.day ? { day: parsed.day } : {}),
         ...(parsed.target ? { target: parsed.target } : {}),
         detailMode: parsed.countOnly ? 'count' as const : 'list' as const,
+        ...(parsed.explicitStoreWide ? { explicitStoreWide: true } : {}),
       };
     })();
     if (!readSpec) return undefined;
@@ -633,6 +634,10 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
     if (!policyMode) return 'Front Claw：预约登记当前未开放，没有读取或写入。';
     const today = businessDate(now(), cutoff, timeZone);
     const wantStore = storeList && await can(actor, 'appointment_receive', actor.storeId);
+    if (readSpec.explicitStoreWide && !wantStore) {
+      auditDecision('denied');
+      return cannot('你没有权限查看全店/全体预约，这个需要店长来查；查自己的请发「我的预约」');
+    }
     if (!wantStore && !await can(actor, 'appointment_submit', actor.storeId)) return ACCESS_DENIED;
     auditTarget(actor.storeId, actor.storeId);
     const day = readSpec.day === 'day_after_tomorrow'
@@ -1892,8 +1897,8 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
           return `${resultText(draft)}
 请回复「新增一笔」或「改 N」，或回「取消」。不要直接回「对」。`;
         }
-        // D175：穿插软对话后的 pending 草稿，禁止单字「对」直接落账，要求「确认入账」或「全部确认」。
-        if (text === '对' && interleaved) return interleavedConfirmGuardReply(draft);
+        // D175 / Issue #20 方案A：穿插软对话/否定报单后的 pending 草稿，禁止单字「对」与裸「确认」直接落账，统一要求显式长口令（「确认入账」「确认认账」「全部确认」）。
+        if ((text === '对' || text === '确认') && interleaved) return interleavedConfirmGuardReply(draft);
         const next = { ...draft, status: text === '取消' ? 'void' : 'confirming',
           closedAt: text === '取消' ? now().toISOString() : null,
           payload: { ...draft.payload, employeeContext: {

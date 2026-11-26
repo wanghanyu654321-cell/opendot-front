@@ -179,4 +179,97 @@ describe('Pure Core ReadQuerySpec: 规则与模型产出统一结构且保留范
       store: '试点测试B店',
     });
   });
+
+  it('Issue #20 Pure Core：条件查目标(Q37)、并列店名边界(Q55)、预约前缀/全体范围/未来数量(Q10/11/13/35)', () => {
+    // 1. Q37：条件查本人目标与差额 → self_progress (wantsTarget: true)
+    expect(
+      parseRuleReadQuery(
+        '我的本月目标如果还没设就说未设置，有目标再告诉我差额',
+        DAY,
+      ),
+    ).toMatchObject({
+      kind: 'self_progress',
+      wantsTarget: true,
+    });
+    // 写目标对照绝不能识别为只读查询
+    expect(
+      parseRuleReadQuery('我的本月目标如果还没设就帮我设成一万', DAY),
+    ).toBeUndefined();
+    expect(
+      parseRuleReadQuery('我的本月目标没设的话帮我定成3万', DAY),
+    ).toBeUndefined();
+
+    // 2. Q55：动词前缀不污染店名（不再抽成「再给试点测试B店」）
+    expect(
+      parseRuleReadQuery(
+        '先给我我自己的本月业绩，再给试点测试B店全店汇总，可以分两条答',
+        DAY,
+      ),
+    ).toMatchObject({
+      kind: 'self_and_summary',
+      store: '试点测试B店',
+    });
+    expect(
+      parseRuleReadQuery(
+        '先看我本人本月业绩，顺便查测试B店本月汇总',
+        DAY,
+      ),
+    ).toMatchObject({
+      kind: 'self_and_summary',
+      store: '测试B店',
+    });
+
+    // 3. Q35：先搁置待确认草稿再查自己今天预约数量
+    expect(
+      parseRuleReadQuery(
+        '刚才那笔待确认的先放着，我只查自己今天有几条预约',
+        DAY,
+      ),
+    ).toMatchObject({
+      kind: 'appointment',
+      scope: 'own',
+      day: 'today',
+      detailMode: 'count',
+    });
+
+    // 4. Q13：不用登记 + 只问未来/接下来有几条预约 → own count（不落 DONT_REGISTER）
+    expect(
+      parseRuleReadQuery('不用登记，只问未来有几条预约', DAY),
+    ).toMatchObject({
+      kind: 'appointment',
+      scope: 'own',
+      detailMode: 'count',
+    });
+    expect(
+      parseRuleReadQuery('不用登记或改单，查一下我以后有几条预约', DAY),
+    ).toMatchObject({
+      kind: 'appointment',
+      scope: 'own',
+      detailMode: 'count',
+    });
+
+    // 5. Q10/11：显式查本店/全店/全体预约标记 explicitStoreWide，而裸「预约列表」不标
+    expect(parseRuleReadQuery('查一下本店全体预约', DAY)).toMatchObject({
+      kind: 'appointment',
+      scope: 'store',
+      explicitStoreWide: true,
+      detailMode: 'list',
+    });
+    expect(parseRuleReadQuery('看全店今天有几条预约', DAY)).toMatchObject({
+      kind: 'appointment',
+      scope: 'store',
+      explicitStoreWide: true,
+      day: 'today',
+      detailMode: 'count',
+    });
+    const bareList = parseRuleReadQuery('预约列表', DAY);
+    expect(bareList).toMatchObject({
+      kind: 'appointment',
+      scope: 'store',
+      detailMode: 'list',
+    });
+    expect(
+      bareList?.kind === 'appointment' ? bareList.explicitStoreWide : true,
+    ).toBeUndefined();
+  });
 });

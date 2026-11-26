@@ -137,6 +137,7 @@ import {
   normalizeWeComObservationErrorCategory,
   normalizeWeComObservationGateReason,
   normalizeWeComObservationRoute,
+  resolveActiveWeComWorkspaceStoreClock,
   startWeComFrontClawRuntime,
 } from '../src/wecom-front-claw-runtime.js';
 import {
@@ -3696,6 +3697,14 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       } else {
         expect(storedText).toBe(spec.text);
       }
+
+      const workspaceClock = runtime!.getWorkspaceStoreClock(ws.jid);
+      expect(workspaceClock, spec.role).toBeDefined();
+      expect(workspaceClock!.timeZone, spec.role).toBe('Asia/Shanghai');
+      expect(workspaceClock!.businessDay, spec.role).toBe('2026-11-12');
+      expect(resolveActiveWeComWorkspaceStoreClock(ws.jid), spec.role).toEqual(
+        workspaceClock,
+      );
 
       const profile = db.getAgentProfileForWorkspace(ws.folder, 'admin-e2e');
       expect(profile).toBeDefined();

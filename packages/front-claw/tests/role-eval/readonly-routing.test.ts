@@ -1815,3 +1815,252 @@ describe('Issue #18 统一只读查询边界、三轮确认防错与业务口径
     expect(await w.call('m-zhao', '把我自己和测试B店本月的业绩都给我看看')).toBe(ACCESS_DENIED);
   });
 });
+
+describe('Issue #20 窄范围闭环：Q37 条件目标、Q55 并列店名、Q10/11/13/35 预约与方案 A 强确认门禁', () => {
+  it('Q37：条件只读查询覆盖未设置/零目标/已设目标三态，写目标对照严格拒绝且零写', async () => {
+    const w = await fixture();
+    const q37 = '我的本月目标如果还没设就说未设置，有目标再告诉我差额';
+
+    // 1. 未设置目标
+    const unsetReply = await w.call('m-zhao', q37);
+    expect(unsetReply).toContain('本月尚未设置个人目标');
+    expect(unsetReply).not.toContain('设置目标需要店长');
+
+    // 2. 目标为 0
+    await w.base.saveTarget({
+      storeId: 's-b',
+      personId: 'p-zhao',
+      periodMonth: '2026-11',
+      amount: 0,
+      updatedBy: 'p-wang-yj',
+      updatedAt: NOW.toISOString(),
+    });
+    const zeroReply = await w.call('m-zhao', q37);
+    expect(zeroReply).toContain('目标当前为 0');
+    expect(zeroReply).not.toContain('设置目标需要店长');
+
+    // 3. 已设正目标（10,000元）→ 输出双差额
+    await w.base.saveTarget({
+      storeId: 's-b',
+      personId: 'p-zhao',
+      periodMonth: '2026-11',
+      amount: 1000000,
+      updatedBy: 'p-wang-yj',
+      updatedAt: NOW.toISOString(),
+    });
+    const setReply = await w.call('m-zhao', q37);
+    expect(setReply).toContain('距全月目标还差');
+    expect(setReply).toContain('距今日应达进度');
+
+    // 4. 写目标反例对照：员工仍被拒绝，且数据库目标保持 1000000 零写入
+    for (const writeProbe of [
+      '我的本月目标如果还没设就帮我设成一万',
+      '我的本月目标没设的话帮我定成3万',
+    ]) {
+      const denied = await w.call('m-zhao', writeProbe);
+      expect(denied, writeProbe).toContain('你没有权限设或改目标');
+      const stored = await w.base.getTarget('s-b', 'p-zhao', '2026-11');
+      expect(stored?.amount, writeProbe).toBe(1000000);
+    }
+  });
+
+  it('Q55：本人＋同店并列查询正确剥离「再给」返回双段数据，跨店并列仍零读拒绝', async () => {
+    const w = await fixture();
+    // 测试B店店长（s-b）查询本人 + 同店（测试B店）
+    const sameStoreCombo = await w.call(
+      'm-wang-yj',
+      '先给我我自己的本月业绩，再给测试B店全店汇总，可以分两条答',
+    );
+    expect(sameStoreCombo).toContain('本人业绩（苏晓禾）');
+    expect(sameStoreCombo).toContain('本店汇总（测试B店）');
+    expect(sameStoreCombo).toContain('本月 1000');
+    expect(sameStoreCombo).not.toContain('查不到');
+
+    // 单店授权老板（主店为测试B店）同样通过
+    const membersSingle = membersM05();
+    membersSingle['p-boss'] = {
+      role: 'owner',
+      status: 'active',
+      storeIds: ['s-b'],
+      capabilities: ['progress_self', 'store_summary', 'stores_ranking', 'marketing'],
+    };
+    const wOwner = await worldM05({ policy: policyM05(1, membersSingle) });
+    const bossRow = (await wOwner.base.getPersonByMember('m-boss'))!;
+    await wOwner.base.savePerson({ ...bossRow, storeId: 's-b', storeName: '测试B店' });
+    const ownerSameStore = await wOwner.call(
+      'm-boss',
+      '先给我我自己的本月业绩，再给测试B店全店汇总，可以分两条答',
+    );
+    expect(ownerSameStore).toContain('本人业绩（老板）');
+    expect(ownerSameStore).toContain('本店汇总（测试B店）');
+
+    // 跨店并列（老板主店 s-a 问测试B店）保持原有边界：零读拒绝
+    w.reset();
+    const foreignCombo = await w.call(
+      'm-boss',
+      '先给我我自己的本月业绩，再给测试B店全店汇总，可以分两条答',
+    );
+    expect(foreignCombo).toBe('Front Claw：查不到，或你没有权限查看。');
+    expect(w.entryStores()).toEqual([]);
+  });
+
+  it('Q10/11/13/35/16：非空预约范围、前缀搁置不碰草稿、员工全店拒绝零读与不用登记不吞查询', async () => {
+    const w = await fixture();
+    // 预置非空预约：测试B店小赵 1 条今天 + 1 条明天，同事小王 1 条今天
+    await w.base.saveAppointment({
+      appointmentId: 'appt-zhao-today',
+      storeId: 's-b',
+      employeePersonId: 'p-zhao',
+      customerName: '王姐',
+      whenText: '2026-11-12 15:00',
+      note: '水光',
+      status: 'registered',
+      createdAt: NOW.toISOString(),
+    });
+    await w.base.saveAppointment({
+      appointmentId: 'appt-zhao-tomorrow',
+      storeId: 's-b',
+      employeePersonId: 'p-zhao',
+      customerName: '赵姐',
+      whenText: '2026-11-13 11:00',
+      note: '肩颈',
+      status: 'registered',
+      createdAt: NOW.toISOString(),
+    });
+    await w.base.saveAppointment({
+      appointmentId: 'appt-colleague-today',
+      storeId: 's-b',
+      employeePersonId: 'p-wang-yj',
+      customerName: '孙姐',
+      whenText: '2026-11-12 16:00',
+      note: '面部',
+      status: 'registered',
+      createdAt: NOW.toISOString(),
+    });
+
+    // 为小赵挂一笔活跃待确认报单草稿
+    expect(await w.call('m-zhao', '林姐 420')).toContain('还没入账');
+    const pendingBefore = (await w.base.listDrafts()).filter((d) => d.status === 'pending');
+    expect(pendingBefore).toHaveLength(1);
+    const pendingDraftId = pendingBefore[0]!.draftId;
+
+    // Q35：先放着待确认草稿 + 查自己今天有几条预约 → 返回本人 1 条数量、不泄客户名、草稿完全原样 pending
+    const q35 = await w.call(
+      'm-zhao',
+      '刚才那笔待确认的先放着，我只查自己今天有几条预约',
+    );
+    expect(q35).toBe('Front Claw：你今天共有 1 条已登记的预约。');
+    expect(q35).not.toContain('王姐');
+    expect(q35).not.toContain('孙姐');
+    const pendingAfterQ35 = (await w.base.listDrafts()).filter((d) => d.status === 'pending');
+    expect(pendingAfterQ35).toHaveLength(1);
+    expect(pendingAfterQ35[0]!.draftId).toBe(pendingDraftId);
+
+    // Q10/11：员工显式查本店/全店/全体预约 → 显式越权拒绝，不回本人预约、不读 appointment 表
+    let listApptCalls = 0;
+    const origListAppointments = w.base.listAppointments.bind(w.base);
+    w.base.listAppointments = async (...args) => {
+      listApptCalls += 1;
+      return origListAppointments(...args);
+    };
+    for (const storeApptQuery of [
+      '查一下本店全体预约',
+      '看全店今天有几条预约',
+      '本店今天所有预约有哪些',
+    ]) {
+      listApptCalls = 0;
+      const denied = await w.call('m-zhao', storeApptQuery);
+      expect(denied, storeApptQuery).toContain('没有权限查看全店/全体预约');
+      expect(denied, storeApptQuery).not.toContain('王姐');
+      expect(listApptCalls, storeApptQuery).toBe(0);
+    }
+
+    // 兼容对照：员工发裸「预约列表」仍返回本人预约；店长查全店拿到本人+同事共 2 条今天预约
+    const empBare = await w.call('m-zhao', '预约列表');
+    expect(empBare).toContain('王姐');
+    expect(empBare).not.toContain('孙姐');
+
+    const mgrStore = await w.call('m-wang-yj', '查一下本店今天全体预约');
+    expect(mgrStore).toContain('王姐');
+    expect(mgrStore).toContain('孙姐');
+
+    // Q13：不用登记 + 只问未来有几条预约 → 返回本人 2 条（今天+明天），不落 DONT_REGISTER
+    const q13 = await w.call('m-zhao', '不用登记，只问未来有几条预约');
+    expect(q13).toBe('Front Claw：你今天及以后共有 2 条已登记的预约。');
+    expect(q13).not.toContain('王姐');
+
+    // 真正否定新建预约对照 → 零写且不创建新预约
+    const apptsBeforeNeg = (await origListAppointments({ storeId: 's-b' })).length;
+    const negBooking = await w.call('m-zhao', '明天下午3点不用帮我约张姐');
+    expect(negBooking).toContain('没有登记');
+    expect((await origListAppointments({ storeId: 's-b' })).length).toBe(apptsBeforeNeg);
+
+    // Q16：缺少日期的预约纠错仍短澄清、不触发写单
+    const q16 = await w.call('m-zhao', '我刚才问的是预约查询，不是要报业绩');
+    expect(q16).toContain('不报业绩');
+    expect(q16).toContain('今天');
+  });
+
+  it('Confirm-Gate 方案 A：活跃草稿插话后独立验证「对」「确认」「确认入账」「取消」四路径终态', async () => {
+    async function setupInterleavedDraft() {
+      const w = await worldM05({ policy: policyM05(1, membersM05()) });
+      const beforeEntries = (await w.base.listEntries({})).length;
+      expect(await w.call('m-zhao', '张姐 380')).toContain('还没入账');
+      const drafts = (await w.base.listDrafts()).filter((d) => d.status === 'pending');
+      expect(drafts).toHaveLength(1);
+      const draftId = drafts[0]!.draftId;
+
+      const neg = await w.call('m-zhao', '这单没有做成，别按680入账');
+      expect(neg).toContain('没有成交');
+      expect(neg).not.toContain('还在等你回「对」确认');
+      return { w, draftId, beforeEntries };
+    }
+
+    // 1. 裸「对」→ 拦截且草稿保持 pending、账本零新增
+    {
+      const { w, draftId, beforeEntries } = await setupInterleavedDraft();
+      const reply = await w.call('m-zhao', '对');
+      expect(reply).toContain('张姐');
+      expect(reply).toContain('380');
+      expect(reply).toContain('确认入账');
+      const draft = (await w.base.listDrafts()).find((d) => d.draftId === draftId);
+      expect(draft?.status).toBe('pending');
+      expect((await w.base.listEntries({})).length).toBe(beforeEntries);
+    }
+
+    // 2. 裸「确认」→ 方案 A 同样拦截，草稿保持 pending、账本零新增
+    {
+      const { w, draftId, beforeEntries } = await setupInterleavedDraft();
+      const reply = await w.call('m-zhao', '确认');
+      expect(reply).toContain('张姐');
+      expect(reply).toContain('380');
+      expect(reply).toContain('确认入账');
+      expect(reply).not.toContain('已入账 1 笔');
+      const draft = (await w.base.listDrafts()).find((d) => d.draftId === draftId);
+      expect(draft?.status).toBe('pending');
+      expect((await w.base.listEntries({})).length).toBe(beforeEntries);
+    }
+
+    // 3. 显式「确认入账」→ 确认原张姐 380 草稿并精准入账 1 笔
+    {
+      const { w, draftId, beforeEntries } = await setupInterleavedDraft();
+      const reply = await w.call('m-zhao', '确认入账');
+      expect(reply).toContain('已入账 1 笔');
+      const draft = (await w.base.listDrafts()).find((d) => d.draftId === draftId);
+      expect(draft?.status).toBe('confirmed');
+      const entries = await w.base.listEntries({});
+      expect(entries.length).toBe(beforeEntries + 1);
+      expect(entries[entries.length - 1]!.amount).toBe(38000);
+    }
+
+    // 4. 「取消」→ 作废原张姐 380 草稿且账本零新增
+    {
+      const { w, draftId, beforeEntries } = await setupInterleavedDraft();
+      const reply = await w.call('m-zhao', '取消');
+      expect(reply).toContain('已取消');
+      const draft = (await w.base.listDrafts()).find((d) => d.draftId === draftId);
+      expect(draft?.status).toBe('void');
+      expect((await w.base.listEntries({})).length).toBe(beforeEntries);
+    }
+  });
+});

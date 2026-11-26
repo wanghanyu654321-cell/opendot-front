@@ -506,6 +506,8 @@ import {
   type WeComFrontClawRuntimeHandle,
   deliverWeComTextViaOutbox,
   isWeComManagedWorkspaceFolder,
+  prependWeComStoreClockToPrompt,
+  resolveActiveWeComWorkspaceStoreClock,
   startWeComFrontClawRuntime,
 } from './wecom-front-claw-runtime.js';
 import { WECOM_READONLY_CONTEXT_MARKER } from './wecom.js';
@@ -1643,6 +1645,25 @@ function armCodingMemoryDelivery(
   }
 }
 
+function applyWeComStoreClockToPrompt(
+  prompt: string,
+  chatJid: string,
+  groupFolder?: string,
+  targetMainJid?: string,
+): string {
+  if (
+    !prompt ||
+    (!isWeComManagedWorkspaceFolder(groupFolder) &&
+      !chatJid.startsWith('wecom:'))
+  ) {
+    return prompt;
+  }
+  const storeClock =
+    resolveActiveWeComWorkspaceStoreClock(chatJid) ??
+    resolveActiveWeComWorkspaceStoreClock(targetMainJid);
+  return prependWeComStoreClockToPrompt(prompt, storeClock);
+}
+
 function injectPreparedFollowUp(
   item: QueuedFollowUp,
   prepared: PreparedFollowUp,
@@ -1659,11 +1680,17 @@ function injectPreparedFollowUp(
     knownMessageIds: knownReferencedMessageIds,
   });
   const runtime = resolveFollowUpRuntime(item.chat_jid);
-  const result = queue.sendMessage(
-    item.chat_jid,
+  const formattedFollowUp = applyWeComStoreClockToPrompt(
     formatMessages(prepared.messages, {
       knownMessageIds: knownReferencedMessageIds,
     }),
+    item.chat_jid,
+    runtime?.effectiveGroup.folder,
+    runtime?.effectiveGroup.target_main_jid,
+  );
+  const result = queue.sendMessage(
+    item.chat_jid,
+    formattedFollowUp,
     images.length > 0 ? images : undefined,
     (receipt) => {
       if (runtime && receipt) {
@@ -6020,11 +6047,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const knownReferencedMessageIds = historyContext
     ? new Set(historyContext.messageIds)
     : activeSessionReferencedMessageIds;
-  let prompt =
+  let prompt = applyWeComStoreClockToPrompt(
     (historyContext?.context ?? '') +
-    formatMessages(missedMessages, {
-      knownMessageIds: knownReferencedMessageIds,
-    });
+      formatMessages(missedMessages, {
+        knownMessageIds: knownReferencedMessageIds,
+      }),
+    chatJid,
+    effectiveGroup.folder,
+    effectiveGroup.target_main_jid,
+  );
 
   const images = collectMessageImages(chatJid, missedMessages, {
     knownMessageIds: activeSessionReferencedMessageIds,
@@ -14873,11 +14904,15 @@ async function processAgentConversation(
   const knownReferencedMessageIds = historyContext
     ? new Set(historyContext.messageIds)
     : activeSessionReferencedMessageIds;
-  let prompt =
+  let prompt = applyWeComStoreClockToPrompt(
     (historyContext?.context ?? '') +
-    formatMessages(missedMessages, {
-      knownMessageIds: knownReferencedMessageIds,
-    });
+      formatMessages(missedMessages, {
+        knownMessageIds: knownReferencedMessageIds,
+      }),
+    chatJid,
+    effectiveGroup.folder,
+    effectiveGroup.target_main_jid,
+  );
   const images = collectMessageImages(virtualChatJid, missedMessages, {
     knownMessageIds: activeSessionReferencedMessageIds,
   });
@@ -18138,9 +18173,14 @@ async function startMessageLoop(): Promise<void> {
 
           const knownReferencedMessageIds =
             collectPersistedReferencedMessageIds(chatJid, messagesToSend);
-          const formatted = formatMessages(messagesToSend, {
-            knownMessageIds: knownReferencedMessageIds,
-          });
+          const formatted = applyWeComStoreClockToPrompt(
+            formatMessages(messagesToSend, {
+              knownMessageIds: knownReferencedMessageIds,
+            }),
+            chatJid,
+            group.folder,
+            group.target_main_jid,
+          );
 
           const images = collectMessageImages(chatJid, messagesToSend, {
             knownMessageIds: knownReferencedMessageIds,

@@ -6,6 +6,7 @@ import {
   classifyWeComSoftRole,
   createModelClassifierFromOpenDotConfig,
   createWeComFrontClawBridge,
+  formatWeComStoreClockPromptBlock,
   resolveOpenDotClassifierConfig,
   SAFE_MARKETING_DISALLOWED_TOOLS,
   validateTargetAgentProfile,
@@ -13,7 +14,10 @@ import {
   type WeComOutboundAuthRequest,
   type WeComOutboundAuthResult,
   type WeComPrecheckPort,
+  type WeComStoreClockContext,
 } from '../src/wecom-front-claw-bridge.js';
+import { prependWeComStoreClockToPrompt } from '../src/wecom-front-claw-runtime.js';
+import { WECOM_READONLY_CONTEXT_MARKER } from '../src/wecom.js';
 import {
   CLARIFY_REPLY,
   MARKETING_UNAVAILABLE,
@@ -1674,6 +1678,120 @@ describe('Issue #11 企微按档位授权与软岗位路由', () => {
           a.targetRole === 'manager_ops',
       ),
     ).toBe(true);
+  });
+
+  it('Issue #20 (Q28): 四个企微软岗统一获得门店当地时钟与独立业务日，且不污染 marketing/reception_ads 只读块契约', async () => {
+    const audits: Array<{
+      messageId: string;
+      storeId?: string;
+      tier?: string;
+      targetRole?: string;
+      workspaceJid?: string;
+      storeClock?: WeComStoreClockContext;
+    }> = [];
+    const policy = cleanPolicy(1);
+    policy.members['p-wang'].role = 'manager';
+    // 2026-11-25T16:03:00.000Z = 2026-11-26 00:03 (+08:00, Asia/Shanghai)，与 UTC 日期跨天
+    const midnightUtc = new Date('2026-11-25T16:03:00.000Z');
+    const fx = await createBridgeFixture({
+      initialPolicy: policy,
+      wangTier: 'manager',
+      now: () => midnightUtc,
+      bridgeOptions: {
+        modelClassify,
+        resolveWorkspaceJid: (ctx) =>
+          `web:wecom-front-claw:${ctx.targetRole ?? 'marketing'}:test`,
+        onPrecheckAudit: (record) => audits.push(record),
+      },
+    });
+    cleanups.push(() => fx.bridge.close());
+
+    const cases = [
+      {
+        role: 'marketing' as const,
+        text: '给我排一个明天早晚小红书文案发布时间表',
+        expectReadonlyContext: false,
+      },
+      {
+        role: 'reception_ads' as const,
+        text: '美团团购投流效果不好，给我一个明天的投放复盘排期',
+        expectReadonlyContext: false,
+      },
+      {
+        role: 'training' as const,
+        text: '帮我安排家访五步法带教新人的明天早会练习节奏',
+        expectReadonlyContext: false,
+      },
+      {
+        role: 'manager_ops' as const,
+        text: reviewQuery,
+        expectReadonlyContext: true,
+      },
+    ];
+
+    for (const item of cases) {
+      const res = await fx.send('m-wang', item.text);
+      expect(res, item.role).toMatchObject({
+        kind: 'pass',
+        targetRole: item.role,
+      });
+      if (item.expectReadonlyContext) {
+        expect(res, item.role).toHaveProperty('readonlyContext');
+      } else {
+        expect(res, item.role).not.toHaveProperty('readonlyContext');
+      }
+      const matched = audits.find(
+        (a) => a.targetRole === item.role && a.storeClock !== undefined,
+      );
+      expect(matched?.workspaceJid, item.role).toBe(
+        `web:wecom-front-claw:${item.role}:test`,
+      );
+      expect(matched?.storeClock, item.role).toEqual({
+        localDate: '2026-11-26',
+        localTime: '00:03',
+        utcOffset: '+08:00',
+        timeZone: 'Asia/Shanghai',
+        businessDay: '2026-11-26',
+        localDateTimeLabel: '2026-11-26 00:03 (+08:00, Asia/Shanghai)',
+      });
+    }
+
+    // 校验 23:30 营业日切换边界：自然日历 2026-11-25 与业务日 2026-11-26 清晰分离
+    const cutoffPrompt = prependWeComStoreClockToPrompt(
+      '<messages><message time="2026-11-25T15:30:00.000Z">明天排期</message></messages>',
+      undefined,
+      new Date('2026-11-25T15:30:00.000Z'),
+    );
+    expect(cutoffPrompt).toContain(
+      '门店当前当地日期与时间：2026-11-25 23:30 (+08:00, Asia/Shanghai)',
+    );
+    expect(cutoffPrompt).toContain('门店当前业务日：2026-11-26');
+    expect(cutoffPrompt).toContain('不得早于当前当地时间');
+    expect(cutoffPrompt).not.toContain(WECOM_READONLY_CONTEXT_MARKER);
+    // 幂等保护：重复包装不双写
+    expect(
+      prependWeComStoreClockToPrompt(
+        cutoffPrompt,
+        undefined,
+        new Date('2026-11-25T15:30:00.000Z'),
+      ),
+    ).toBe(cutoffPrompt);
+
+    // 显式时钟块格式也保持无账本/无只读上下文标记
+    const midnightBlock = formatWeComStoreClockPromptBlock(
+      audits.find((a) => a.targetRole === 'marketing' && a.storeClock)!
+        .storeClock!,
+    );
+    expect(midnightBlock).toContain('2026-11-26 00:03 (+08:00, Asia/Shanghai)');
+    expect(midnightBlock).not.toContain(WECOM_READONLY_CONTEXT_MARKER);
+
+    // 员工在午夜依然无权访问 manager_ops 经营复盘
+    const empFx = await createBridgeFixture({
+      now: () => midnightUtc,
+      bridgeOptions: { modelClassify },
+    });
+    cleanups.push(() => empFx.bridge.close());
+    expect(await empFx.send('m-wang', reviewQuery)).toEqual(reviewDenied);
   });
 
   it('把软岗位传给两个解析器，且仅培训传入培训只读块', async () => {

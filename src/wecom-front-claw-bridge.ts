@@ -34,6 +34,69 @@ export type WeComSoftRole =
   | 'reception_ads';
 
 /**
+ * Issue #20：门店当地时钟与业务日锚点（只读、不含账本数据），统一供 4 个企微软岗排期与日期换算使用。
+ */
+export interface WeComStoreClockContext {
+  readonly localDate: string;
+  readonly localTime: string;
+  readonly utcOffset: string;
+  readonly timeZone: string;
+  readonly businessDay: string;
+  readonly localDateTimeLabel: string;
+}
+
+export function buildWeComStoreClockContext(
+  date: Date,
+  timeZone: string,
+  businessDay: string,
+): WeComStoreClockContext {
+  const dtParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const get = (t: string) => dtParts.find((p) => p.type === t)?.value ?? '';
+  const hour = get('hour') === '24' ? '00' : get('hour');
+  const offsetName =
+    new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      timeZoneName: 'longOffset',
+    })
+      .formatToParts(date)
+      .find((p) => p.type === 'timeZoneName')?.value ?? 'GMT+00:00';
+  const match = /GMT([+-]\d{2}:?\d{2})/.exec(offsetName);
+  let utcOffset = match?.[1] ?? '+00:00';
+  if (utcOffset.length === 5) {
+    utcOffset = `${utcOffset.slice(0, 3)}:${utcOffset.slice(3)}`;
+  }
+  const localDate = `${get('year')}-${get('month')}-${get('day')}`;
+  const localTime = `${hour}:${get('minute')}`;
+  return {
+    localDate,
+    localTime,
+    utcOffset,
+    timeZone,
+    businessDay,
+    localDateTimeLabel: `${localDate} ${localTime} (${utcOffset}, ${timeZone})`,
+  };
+}
+
+export function formatWeComStoreClockPromptBlock(
+  clock: WeComStoreClockContext,
+): string {
+  return [
+    '【门店当地时间锚点（只读，不含账本数据）】',
+    `门店当前当地日期与时间：${clock.localDateTimeLabel}`,
+    `门店当前业务日：${clock.businessDay}`,
+    `排期与时间换算规则：涉及“今天/明天/今晚/午夜后/接下来”的日期和排期，一律以上述门店当地日期（${clock.localDate}）与当前时间（${clock.localTime}）为准，不得早于当前当地时间，也不得以消息头 UTC 时间或门店业务日代替自然日历日期。`,
+  ].join('\n');
+}
+
+/**
  * Issue #2 / #3 共享企微前置拦截三态输出（与 docs/OPENDOT-FRONT-MASTER-PLAN.md 对齐）。
  * 放行态仅携带路由身份和脱敏文本，绝不暴露 Front Claw PG store 或数据库连接串。
  */
@@ -263,12 +326,14 @@ export interface WeComFrontClawBridgeOptions {
     modelMs: number;
     errorCategory: string;
   }) => void;
-  /** 旁路脱敏审计回调：为快通道、拒绝与放行路径统一透出可信身份 tier / storeId（不改变 precheck 返回契约）。 */
+  /** 旁路脱敏审计回调：为快通道、拒绝与放行路径统一透出可信身份 tier / storeId 与门店时钟锚点（不改变 precheck 返回契约）。 */
   readonly onPrecheckAudit?: (record: {
     readonly messageId: string;
     readonly storeId?: string;
     readonly tier?: BridgePerson['tier'];
     readonly targetRole?: WeComSoftRole;
+    readonly workspaceJid?: string;
+    readonly storeClock?: WeComStoreClockContext;
   }) => void;
   readonly onRoute?: (record: unknown) => void;
   readonly platformCapabilitiesRaw?: string;
@@ -1938,45 +2003,30 @@ export async function createWeComFrontClawBridge(
 
   const employeeQueues = new Map<string, Promise<void>>();
 
-  function formatStoreLocalDateTime(date: Date, timeZone: string): string {
-    const dtParts = new Intl.DateTimeFormat('en-CA', {
-      timeZone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).formatToParts(date);
-    const get = (t: string) => dtParts.find((p) => p.type === t)?.value ?? '';
-    const hour = get('hour') === '24' ? '00' : get('hour');
-    const offsetName =
-      new Intl.DateTimeFormat('en-US', {
-        timeZone,
-        timeZoneName: 'longOffset',
-      })
-        .formatToParts(date)
-        .find((p) => p.type === 'timeZoneName')?.value ?? 'GMT+00:00';
-    const match = /GMT([+-]\d{2}:?\d{2})/.exec(offsetName);
-    let offset = match?.[1] ?? '+00:00';
-    if (offset.length === 5)
-      offset = `${offset.slice(0, 3)}:${offset.slice(3)}`;
-    return `${get('year')}-${get('month')}-${get('day')} ${hour}:${get('minute')} (${offset}, ${timeZone})`;
+  function buildStoreClock(
+    storeId: string,
+    rawHours: string | null,
+    currentNow: Date = now(),
+  ): WeComStoreClockContext | undefined {
+    const hours = mods.storeHours.resolveStoreHours(rawHours, storeId);
+    if (!hours) return undefined;
+    const businessDay = mods.metrics.businessDate(
+      currentNow,
+      hours.cutoff,
+      hours.timeZone,
+    );
+    return buildWeComStoreClockContext(currentNow, hours.timeZone, businessDay);
   }
 
   async function readManagerSnapshot(
     actor: BridgePerson,
     rawHours: string | null,
+    clock?: WeComStoreClockContext,
   ): Promise<string> {
-    const hours = mods.storeHours.resolveStoreHours(rawHours, actor.storeId);
-    if (!hours || !boot.store.listEntries)
+    const resolvedClock = clock ?? buildStoreClock(actor.storeId, rawHours);
+    if (!resolvedClock || !boot.store.listEntries)
       throw new Error('store_snapshot_unavailable');
-    const currentNow = now();
-    const today = mods.metrics.businessDate(
-      currentNow,
-      hours.cutoff,
-      hours.timeZone,
-    );
+    const today = resolvedClock.businessDay;
     const month = today.slice(0, 7);
     const rows = await boot.store.listEntries({ storeId: actor.storeId });
     let todayAmount = 0;
@@ -1996,7 +2046,7 @@ export async function createWeComFrontClawBridge(
     }
     return [
       '【本店只读经营快照（供复盘参考，严禁声称可改账）】',
-      `当前当地时间：${formatStoreLocalDateTime(currentNow, hours.timeZone)}`,
+      `当前当地时间：${resolvedClock.localDateTimeLabel}`,
       `业务日：${today}`,
       `今日已确认业绩：${mods.money.formatYuan(todayAmount)}元（${todayCount}笔）`,
       `本月累计已确认业绩：${mods.money.formatYuan(monthAmount)}元（${monthCount}笔）`,
@@ -2042,6 +2092,10 @@ export async function createWeComFrontClawBridge(
     const emitPrecheckAudit = (
       candidate: BridgePerson,
       targetRole?: WeComSoftRole,
+      extra?: {
+        workspaceJid?: string;
+        storeClock?: WeComStoreClockContext;
+      },
     ) => {
       try {
         options.onPrecheckAudit?.({
@@ -2049,6 +2103,8 @@ export async function createWeComFrontClawBridge(
           storeId: candidate.storeId,
           tier: candidate.tier,
           ...(targetRole ? { targetRole } : {}),
+          ...(extra?.workspaceJid ? { workspaceJid: extra.workspaceJid } : {}),
+          ...(extra?.storeClock ? { storeClock: extra.storeClock } : {}),
         });
       } catch {
         /* 观测回调不得影响业务主链路 */
@@ -2198,6 +2254,9 @@ export async function createWeComFrontClawBridge(
         }
       }
 
+      const arrivalHours = (await pendingArrival).hours;
+      const storeClock = buildStoreClock(actor.storeId, arrivalHours);
+
       let readonlyContext: string | undefined;
       if (
         targetRole === 'manager_ops' ||
@@ -2223,7 +2282,8 @@ export async function createWeComFrontClawBridge(
         if (targetRole === 'manager_ops') {
           readonlyContext = await readManagerSnapshot(
             current,
-            (await pendingArrival).hours,
+            arrivalHours,
+            storeClock,
           );
         } else {
           const context = await options.resolveTrainingContext?.({
@@ -2252,6 +2312,8 @@ export async function createWeComFrontClawBridge(
       if (!(await fenceStillHolds(activeFence)) || closing || closed) {
         return { kind: 'failed', replies: [mods.loop.STALE_CONSUMER] };
       }
+
+      emitPrecheckAudit(latest, targetRole, { workspaceJid, storeClock });
 
       return {
         kind: 'pass',
