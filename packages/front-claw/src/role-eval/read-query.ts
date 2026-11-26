@@ -102,13 +102,15 @@ const flatOf = (text: string) => text.normalize('NFKC').replace(/\s+/g, '');
 
 const WRITE_OR_SOFT_BLOCK = /(?:报单|报数|记账|改账|设目标|定目标|改目标|撤回|撤销|作废|确认入账|文案|小红书|朋友圈|海报|话术|复盘|带教|演练|课件|投流|美团|大众点评)/;
 
-const TARGET_METRIC_HINT = /目标|完成率|差额|还差/;
+const TARGET_METRIC_HINT = /目标|完成率|差额|差距|还差/;
 const RETURNING_CUSTOMER_HINT = /老客户|老顾客|老客(?:消费|业绩|明细|占比)?/;
 
 const NON_PERSON_TARGET = /^(?:我|本人|自己|我们|大家|所有人|全部人|本店|全店|门店|我们店|店里|老客|老客户|老顾客|老板|小计|小红书|小红|小程序|今天|今日|本月|这个月|这月|上个月|上月|昨天|明天|后天|预约|入账|操作|系统|当前|目前|这里|这个|那个|最近|最新|业绩|进度|汇总|排名|目标|名单|员工|同事)$/;
 
 /** 剥离题号、自称与显式否定写动作外框，保留正向查询与范围约束原文。 */
 function stripReadFraming(text: string): string {
+  const negWriteAtom = '(?:我)?(?:先|暂)?(?:不是补报|不是补录|不是报单|不是要报业绩|不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|改目标|设目标|定目标|调目标|发布|登记|改单|入账|改排班|外发|发给客户))';
+  const trailingAtom = `(?:${negWriteAtom}|查不到就直接说|没有就直接说)`;
   return text
     .normalize('NFKC')
     .trim()
@@ -116,11 +118,11 @@ function stripReadFraming(text: string): string {
     .replace(/^我(?:现在)?自称[^。！？!?\n]+[。！？!?]\s*/, '')
     .replace(/^只读(?:查询|核对)\s*:?\s*/, '')
     .replace(
-      /^(?:我)?(?:先|暂)?不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单)(?:[、，,]\s*(?:我)?(?:先|暂)?不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单))*[，,。；;\s]+(?=\S)/,
+      new RegExp(`^${negWriteAtom}(?:(?:[、，,\\s]*也?|[、，,\\s]+)${negWriteAtom})*[，,。；;\\s]+(?=\\S)`),
       '',
     )
     .replace(
-      /[?？。;；，,]\s*(?:(?:我)?(?:先|暂)?(?:不是补报|不是补录|不是报单|不是要报业绩|不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单))|查不到就直接说|没有就直接说)(?:[、，,]\s*(?:(?:不是补报|不是补录|不是报单|不是要报业绩|不(?:要|用|想)?(?:报单|报数|创建门店|改权限|扩权|预约|改账|发布|登记|改单))|查不到就直接说|没有就直接说))*[。.!！?？]*$/,
+      new RegExp(`[?？。;；，,]\\s*${trailingAtom}(?:(?:[、，,\\s]*也?|[、，,\\s]+)${trailingAtom})*[。.!！?？]*$`),
       '',
     )
     .replace(/[?？。;；]+$/, '')
@@ -398,17 +400,20 @@ export function parseRuleReadQuery(text: string, businessDay?: string): ReadQuer
   const returningSummary = parseReturningCustomerSummaryQuery(positive, constraints, wantsTarget);
   if (returningSummary) return returningSummary;
 
-  // 8. 本人业绩 / 目标 / 完成率 / 差额查询（含条件式目标/差额读，但严拒含赋值/金额的写目标请求）
+  // 8. 本人业绩 / 目标 / 完成率 / 差额查询（含条件式目标/差额读，允许条件提及「或是0」，但严拒赋值动词或金额写目标）
   const isConditionalSelfTargetRead = ((): boolean => {
     if (!/目标/.test(flatPos)) return false;
     if (!/(?:我|本人|自己)/.test(flatPos) || /(?:本店|全店|门店|我们店|他|她|同事|全员)/.test(flatPos)) return false;
     if (/(?:报单|报数|记账|改账|预约|撤回|撤销|作废|确认入账|文案|小红书|朋友圈|海报|话术|复盘)/.test(flatPos)) return false;
-    // 含数字/中文金额或写目标赋值动作（如「如果没设就帮我设成一万」「帮我定成3万」）绝不归为只读！
-    if (/\d|[一二两三四五六七八九十百千万]+[元块万千]|(?:帮我|给我|替我|帮|给|替)(?:定|设|改|调|设置|设定)|(?:定|设|改|调|设置|设定)(?:成|为|到|一个|新)/.test(flatPos)) {
+    // 含写目标赋值动作（如「如果没设就帮我设成一万」「帮我定成0」）或正金额数字绝不归为只读！
+    if (/(?:帮我|给我|替我|帮|给|替)(?:定|设|改|调|设置|设定)|(?:定|设|改|调|设置|设定)(?:成|为|到|一个|新)|[1-9]\d*(?:\.\d+)?\s*(?:元|块|[kKwW千万])|[1-9]\d{2,}|[一二两三四五六七八九十百千万]+[元块万千]/.test(flatPos)) {
       return false;
     }
+    // 除条件判零（如「是0/为0/等于0/或是0」）外的其他阿拉伯数字同样拒绝
+    const withoutConditionalZero = flatPos.replace(/(?:或是|还是|是|为|等于)0(?=$|[^\d])/g, '');
+    if (/\d/.test(withoutConditionalZero)) return false;
     const hasUnsetCondition = /(?:还没设|未设置|未设定|未设|没有设|没设|有没有设|设了没|是否设|如果|要是|若)/.test(flatPos);
-    const hasReadGoal = /(?:差额|还差|完成率|已完成|进度|告诉我|说明|就说|提示|告知|查|看|多少)/.test(flatPos);
+    const hasReadGoal = /(?:差额|差距|还差|完成率|已完成|进度|口径|说清楚|告诉我|说明|就说|提示|告知|查|看|多少)/.test(flatPos);
     return hasUnsetCondition && hasReadGoal;
   })();
   if (
@@ -510,7 +515,30 @@ export function fromModelReadQuery(
   if (!explicit || explicit.length > 1 || (explicit[0] && c.slots.store && explicit[0] !== c.slots.store)) {
     return { kind: 'denied_scope', source: 'model' };
   }
-  const named = explicit[0] ?? normalizeStoreCandidate(c.slots.store);
+  const shortStores = otherStoreShortNames(positive, '');
+  const positiveBody = positive.replace(
+    /^(?:请|麻烦|帮我|给我)?(?:只(?:想|是|要)?)?(?:查一下|查询|查看|核对|看看|拉一下|拉下|拉出|问一下|问下|统计|想了解|了解|查|看|拉)\s*/,
+    '',
+  );
+  const namedInTextMatch = /(?:^|[\s，,；;和与及的下看查拉])((?:(?!店|和|与|及|的|把|将|看|查|给|在|本|全|门|我|咱|这|该|想|了|解|麻|烦|拉|下|问|统|计|列|出|找|有|没|是|要|能|会|去|到|来|进)[\p{Script=Han}A-Za-z0-9]){1,16}店)(?!里|内|中|长|员|务|铺|面|外)/u.exec(positiveBody);
+  const namedInText = normalizeStoreCandidate(namedInTextMatch?.[1]);
+  const normalizedSlotStore = normalizeStoreCandidate(c.slots.store);
+  const named = explicit[0] ?? normalizedSlotStore ?? shortStores[0] ?? namedInText;
+  const storesCompatible = (slotStore: string, textStore: string): boolean => {
+    const s = slotStore.toLowerCase().replace(/^测试/, '');
+    const t = textStore.toLowerCase().replace(/^测试/, '');
+    return s.includes(t) || t.includes(s);
+  };
+  if (
+    explicit[0] === undefined
+    && normalizedSlotStore
+    && (
+      shortStores.some((short) => !storesCompatible(normalizedSlotStore, short))
+      || (namedInText && !storesCompatible(normalizedSlotStore, namedInText))
+    )
+  ) {
+    return { kind: 'denied_scope', source: 'model' };
+  }
   const wantsTarget = object === 'target' || object === 'completion' || TARGET_METRIC_HINT.test(flatText);
 
   if (object === 'identity') {
@@ -568,14 +596,15 @@ export function fromModelReadQuery(
   if (object === 'appointment') {
     const ruleAppt = parseAppointmentReadQuery(text) ?? parseAppointmentReadQuery(positive);
     if (ruleAppt) {
+      const forceStore = ruleAppt.scope !== 'other' && c.slots.scope === 'store';
       return {
         kind: 'appointment',
         source: 'model',
-        scope: ruleAppt.scope,
+        scope: forceStore ? 'store' : ruleAppt.scope,
         ...(ruleAppt.day ? { day: ruleAppt.day } : {}),
         ...(ruleAppt.target ? { target: ruleAppt.target } : {}),
         detailMode: c.slots.countOnly === true || ruleAppt.countOnly ? 'count' : 'list',
-        ...(ruleAppt.explicitStoreWide ? { explicitStoreWide: true } : {}),
+        ...(forceStore || ruleAppt.explicitStoreWide ? { explicitStoreWide: true } : {}),
       };
     }
     const periodFlat = flatOf(c.slots.period ?? '');
@@ -621,7 +650,8 @@ export function fromModelReadQuery(
         detailMode,
       };
     }
-    const explicitStoreWide = /(?:本店|全店|门店|店里|全体|全员|全部|所有|大家)/.test(flatText) && !/(?:我|本人|自己|名下)/.test(flatText);
+    const explicitStoreWide = c.slots.scope === 'store'
+      || (c.slots.scope !== 'self' && /(?:本店|全店|门店|店里|全体|全员|全部|所有|大家)/.test(flatText) && !/(?:我|本人|自己|名下)/.test(flatText));
     return {
       kind: 'appointment',
       source: 'model',
@@ -653,8 +683,25 @@ export function fromModelReadQuery(
       wantsTarget,
     };
   }
+  // 原文明确点名同事查个人业绩而模型粗分成了 summary/progress 且省略 employee 时，保留精确同事目标。
+  const explicitOther = parseOtherProgressQuery(positive, wantsTarget);
+  if (explicitOther) {
+    return { ...explicitOther, source: 'model' };
+  }
 
-  const wantsSelfScope = /(?:我|本人|自己)/.test(flatText) && !/(?:本店|全店|门店|店里|我们店)/.test(flatText);
+  if (c.slots.scope === 'store' && object !== 'progress') {
+    return {
+      kind: 'store_summary',
+      source: 'model',
+      wantsTarget,
+      ...(RETURNING_CUSTOMER_HINT.test(flatText) ? { mentionsReturningCustomer: true } : {}),
+      ...(constraints.ownStoreOnly ? { ownStoreOnly: true } : {}),
+      ...(constraints.excludedOtherStores.length ? { excludedOtherStores: constraints.excludedOtherStores } : {}),
+    };
+  }
+
+  const wantsSelfScope = c.slots.scope === 'self'
+    || (c.slots.scope !== 'store' && /(?:我|本人|自己)/.test(flatText) && !/(?:本店|全店|门店|店里|我们店)/.test(flatText));
   if (object === 'progress' || (wantsSelfScope && (object === 'target' || object === 'completion' || object === 'performance'))) {
     return { kind: 'self_progress', source: 'model', wantsTarget };
   }

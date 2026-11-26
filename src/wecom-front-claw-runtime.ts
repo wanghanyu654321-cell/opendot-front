@@ -1024,6 +1024,9 @@ export async function startWeComFrontClawRuntime(
       gateReason: string;
       modelMs: number;
       errorCategory: string;
+      triageVersion?: string;
+      routeLayer?: string;
+      finalIntent?: string;
     }
   >();
   const recentPrecheckAudits = new Map<
@@ -1032,6 +1035,9 @@ export async function startWeComFrontClawRuntime(
       storeId?: string;
       tier?: 'employee' | 'manager' | 'owner';
       targetRole?: WeComSoftRole;
+      triageVersion?: string;
+      routeLayer?: string;
+      finalIntent?: string;
     }
   >();
   const workspaceStoreClocks = new Map<string, WeComStoreClockContext>();
@@ -1055,6 +1061,11 @@ export async function startWeComFrontClawRuntime(
         errorCategory: normalizeWeComObservationErrorCategory(
           record.errorCategory,
         ),
+        ...(record.triageVersion
+          ? { triageVersion: record.triageVersion }
+          : {}),
+        ...(record.routeLayer ? { routeLayer: record.routeLayer } : {}),
+        ...(record.finalIntent ? { finalIntent: record.finalIntent } : {}),
       });
       deps.bridgeOptions?.onObservation?.(record);
     },
@@ -1069,6 +1080,11 @@ export async function startWeComFrontClawRuntime(
         ...(record.storeId ? { storeId: record.storeId } : {}),
         ...(record.tier ? { tier: record.tier } : {}),
         ...(record.targetRole ? { targetRole: record.targetRole } : {}),
+        ...(record.triageVersion
+          ? { triageVersion: record.triageVersion }
+          : {}),
+        ...(record.routeLayer ? { routeLayer: record.routeLayer } : {}),
+        ...(record.finalIntent ? { finalIntent: record.finalIntent } : {}),
       });
       if (record.workspaceJid && record.storeClock) {
         if (workspaceStoreClocks.size >= 512) {
@@ -1183,6 +1199,9 @@ export async function startWeComFrontClawRuntime(
         outcome.kind === 'pass'
           ? Boolean(outcome.readonlyContext?.trim())
           : undefined;
+      const resolvedTriageVersion = audit?.triageVersion ?? obs?.triageVersion;
+      const resolvedRouteLayer = audit?.routeLayer ?? obs?.routeLayer;
+      const resolvedFinalIntent = audit?.finalIntent ?? obs?.finalIntent;
       observeWeComPrecheck({
         correlationId,
         botId: event.botId,
@@ -1193,6 +1212,11 @@ export async function startWeComFrontClawRuntime(
         ...(readonlyContextInjected === undefined
           ? {}
           : { readonlyContextInjected }),
+        ...(resolvedTriageVersion
+          ? { triageVersion: resolvedTriageVersion }
+          : {}),
+        ...(resolvedRouteLayer ? { routeLayer: resolvedRouteLayer } : {}),
+        ...(resolvedFinalIntent ? { finalIntent: resolvedFinalIntent } : {}),
         route,
         gateReason,
         modelMs,
@@ -1214,6 +1238,13 @@ export async function startWeComFrontClawRuntime(
             ...(readonlyContextInjected === undefined
               ? {}
               : { readonlyContextInjected }),
+            ...(resolvedTriageVersion
+              ? { triageVersion: resolvedTriageVersion }
+              : {}),
+            ...(resolvedRouteLayer ? { routeLayer: resolvedRouteLayer } : {}),
+            ...(resolvedFinalIntent
+              ? { finalIntent: resolvedFinalIntent }
+              : {}),
             route,
             gateReason,
             modelMs: Math.max(0, Math.round(modelMs)),

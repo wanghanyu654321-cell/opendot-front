@@ -2667,7 +2667,8 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     expect(chunk1RejRes.error).toContain('wecom_rejected:sdk_ack_rejected');
     expect(getChannelOutboxItem(chunk1RejRes.itemId)?.status).toBe('failed');
 
-    // Also emit a rule-matched fast-path marketing message to verify fast_path telemetry
+    // Route A (v2): natural-language marketing goes through unified model triage,
+    // while strict commands like '我的进度' stay on deterministic fast_path telemetry.
     offline.emitInboundText({
       reqId: 'req-outbox-fast-1',
       msgid: 'msg-outbox-fast-1',
@@ -2681,14 +2682,29 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         .some((m) => m.id === 'msg-outbox-fast-1'),
     );
 
+    offline.emitInboundText({
+      reqId: 'req-outbox-fast-read-1',
+      msgid: 'msg-outbox-fast-read-1',
+      userid: 'm-zhao',
+      corpid: CORP_ID,
+      content: '我的进度',
+    });
+    await waitUntil(() =>
+      offline.sent.some((f) => f.headers.req_id === 'req-outbox-fast-read-1'),
+    );
+
     // Verify 4 correlated dot.wecom.* spans sharing msg-outbox-1 correlation_ref with zero plaintext leakage
     await observer.flush();
     const expectedRef = createHash('sha256')
       .update('msg-outbox-1')
       .digest('hex')
       .slice(0, 24);
-    const expectedFastRef = createHash('sha256')
+    const expectedModelRef = createHash('sha256')
       .update('msg-outbox-fast-1')
+      .digest('hex')
+      .slice(0, 24);
+    const expectedFastRef = createHash('sha256')
+      .update('msg-outbox-fast-read-1')
       .digest('hex')
       .slice(0, 24);
     const allSpans = spanExporter.getFinishedSpans();
@@ -2711,8 +2727,54 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
       JSON.parse(
         String(precheckSpan.attributes['langfuse.observation.metadata.route']),
       ),
-    ).toBe('clarify');
+    ).toBe('model');
+    expect(
+      JSON.parse(
+        String(
+          precheckSpan.attributes[
+            'langfuse.observation.metadata.triage_version'
+          ],
+        ),
+      ),
+    ).toBe('v2');
+    expect(
+      JSON.parse(
+        String(
+          precheckSpan.attributes['langfuse.observation.metadata.route_layer'],
+        ),
+      ),
+    ).toBe('model');
+    expect(
+      JSON.parse(
+        String(
+          precheckSpan.attributes['langfuse.observation.metadata.final_intent'],
+        ),
+      ),
+    ).toBe('soft_role');
     expect(precheckAttrStr).not.toContain('"redacted"');
+
+    const modelPrecheckSpan = allSpans.find(
+      (s) =>
+        s.name === 'dot.wecom.precheck' &&
+        JSON.stringify(s.attributes).includes(expectedModelRef),
+    )!;
+    expect(modelPrecheckSpan).toBeDefined();
+    expect(
+      JSON.parse(
+        String(
+          modelPrecheckSpan.attributes['langfuse.observation.metadata.route'],
+        ),
+      ),
+    ).toBe('model');
+    expect(
+      JSON.parse(
+        String(
+          modelPrecheckSpan.attributes[
+            'langfuse.observation.metadata.route_layer'
+          ],
+        ),
+      ),
+    ).toBe('model');
 
     const fastPrecheckSpan = allSpans.find(
       (s) =>
@@ -2727,6 +2789,15 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
         ),
       ),
     ).toBe('fast_path');
+    expect(
+      JSON.parse(
+        String(
+          fastPrecheckSpan.attributes[
+            'langfuse.observation.metadata.route_layer'
+          ],
+        ),
+      ),
+    ).toBe('fast_path');
     expect(JSON.stringify(fastPrecheckSpan.attributes)).not.toContain(
       '"redacted"',
     );
@@ -2735,11 +2806,13 @@ describe('OpenDot × Front Claw E2E Convergence & Hard Gates', () => {
     for (const secret of [
       'msg-outbox-1',
       'msg-outbox-fast-1',
+      'msg-outbox-fast-read-1',
       'm-zhao',
       BOT_ID,
       'sk-e2e-never-export',
       '我想吸引附近新客进店体验项目',
       '帮我写秋季护理推广文案',
+      '我的进度',
       '秋季护理文案草稿正文',
       '超时未确认文案',
       'AAAA',

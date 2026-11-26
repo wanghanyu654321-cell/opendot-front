@@ -13,16 +13,20 @@ import { centsFromModelSlot, guardUtteranceAmounts, guardIssueToReason, type Amo
 import { clarifyQuestion } from './clarify.js';
 import type { UnclearReason } from './report-extract.js';
 
-export const MODEL_INTENTS = ['report', 'query', 'amend', 'withdraw', 'appointment', 'target', 'chitchat', 'marketing', 'unknown'] as const;
+export const MODEL_INTENTS = ['report', 'query', 'amend', 'withdraw', 'appointment', 'target', 'chitchat', 'marketing', 'hold_pending', 'multi_intent', 'unknown'] as const;
 export const MODEL_OBJECTS = ['performance', 'target', 'completion', 'entry', 'appointment', 'progress', 'ranking', 'summary', 'unreported', 'identity', 'self_and_summary'] as const;
 export const MODEL_ACTIONS = ['query', 'report', 'amend', 'cancel', 'delete'] as const;
 export const MODEL_ENTRY_MODES = ['latest_operation', 'latest_confirmed', 'by_ref'] as const;
-export const MODEL_SLOT_KEYS = ['amountText', 'customer', 'employee', 'index', 'period', 'store', 'ref', 'countOnly', 'entryMode'] as const;
+export const MODEL_SOFT_ROLES = ['marketing', 'reception_ads', 'training', 'manager_ops'] as const;
+export const MODEL_SCOPES = ['self', 'store', 'other'] as const;
+export const MODEL_SLOT_KEYS = ['amountText', 'customer', 'employee', 'index', 'period', 'store', 'ref', 'countOnly', 'entryMode', 'scope', 'holdPending'] as const;
 
 export type ModelIntent = (typeof MODEL_INTENTS)[number];
 export type ModelObject = (typeof MODEL_OBJECTS)[number];
 export type ModelAction = (typeof MODEL_ACTIONS)[number];
 export type ModelEntryMode = (typeof MODEL_ENTRY_MODES)[number];
+export type ModelSoftRole = (typeof MODEL_SOFT_ROLES)[number];
+export type ModelScope = (typeof MODEL_SCOPES)[number];
 
 /** 槽位只收原始文本或纯只读标志。金额必须是字符串，由金额校验函数换成分数；模型不得直接给分。 */
 export interface ModelSlots {
@@ -35,19 +39,45 @@ export interface ModelSlots {
   ref?: string;
   countOnly?: boolean;
   entryMode?: ModelEntryMode;
+  scope?: ModelScope;
+  holdPending?: boolean;
 }
 
 export interface ModelClassification {
   intent: ModelIntent;
   object: ModelObject | null;
   action: ModelAction | null;
+  softRole?: ModelSoftRole | null;
   slots: ModelSlots;
   /** 0..1；低于阈值或 uncertain=true 都视为拿不准。 */
   confidence: number;
   uncertain: boolean;
 }
 
-export type ModelClassifier = (input: { text: string; signal: AbortSignal }) => Promise<unknown>;
+/** 传给分诊模型的最小脱敏会话提示（严禁含客户名、金额、账本或权限明细）。 */
+export interface ModelClassifierContext {
+  readonly hasActivePendingDraft?: boolean;
+  readonly pendingDraftKind?: 'report' | 'appointment' | 'target' | 'correction' | null;
+  readonly hasPendingAppointmentTimeAsk?: boolean;
+}
+
+export type ModelClassifier = (input: {
+  text: string;
+  signal: AbortSignal;
+  context?: ModelClassifierContext;
+}) => Promise<unknown>;
+
+export function formatClassifierUserInput(text: string, context?: ModelClassifierContext): string {
+  if (!context || (!context.hasActivePendingDraft && !context.hasPendingAppointmentTimeAsk)) {
+    return text;
+  }
+  const flags = [
+    `hasActivePendingDraft=${context.hasActivePendingDraft === true}`,
+    `pendingDraftKind=${context.pendingDraftKind ?? 'none'}`,
+    `hasPendingAppointmentTimeAsk=${context.hasPendingAppointmentTimeAsk === true}`,
+  ];
+  return `[会话状态提示（仅用于语义理解，不含账本与授权）: ${flags.join(', ')}]\n[员工原文]\n${text}`;
+}
 
 export const MODEL_MIN_CONFIDENCE = 0.8;
 
@@ -69,6 +99,8 @@ const INTENT_SET = new Set<string>(MODEL_INTENTS);
 const OBJECT_SET = new Set<string>(MODEL_OBJECTS);
 const ACTION_SET = new Set<string>(MODEL_ACTIONS);
 const ENTRY_MODE_SET = new Set<string>(MODEL_ENTRY_MODES);
+const SOFT_ROLE_SET = new Set<string>(MODEL_SOFT_ROLES);
+const SCOPE_SET = new Set<string>(MODEL_SCOPES);
 const SLOT_KEYS = new Set<string>(MODEL_SLOT_KEYS);
 
 /**
@@ -77,12 +109,13 @@ const SLOT_KEYS = new Set<string>(MODEL_SLOT_KEYS);
 export function parseModelClassification(output: unknown): ModelClassification | null {
   if (!output || typeof output !== 'object' || Array.isArray(output)) return null;
   const o = output as Record<string, unknown>;
-  if (Object.keys(o).some(key => !['intent', 'object', 'action', 'slots', 'confidence', 'uncertain'].includes(key))) return null;
+  if (Object.keys(o).some(key => !['intent', 'object', 'action', 'softRole', 'slots', 'confidence', 'uncertain'].includes(key))) return null;
   if (typeof o.intent !== 'string' || !INTENT_SET.has(o.intent)) return null;
   if (typeof o.confidence !== 'number' || !Number.isFinite(o.confidence) || o.confidence < 0 || o.confidence > 1) return null;
   if (typeof o.uncertain !== 'boolean') return null;
   if (o.object !== null && o.object !== undefined && (typeof o.object !== 'string' || !OBJECT_SET.has(o.object))) return null;
   if (o.action !== null && o.action !== undefined && (typeof o.action !== 'string' || !ACTION_SET.has(o.action))) return null;
+  if (o.softRole !== null && o.softRole !== undefined && (typeof o.softRole !== 'string' || !SOFT_ROLE_SET.has(o.softRole))) return null;
   const slotsIn = o.slots;
   if (slotsIn === undefined) {
     // slots 可缺省，视为空。
@@ -132,10 +165,19 @@ export function parseModelClassification(output: unknown): ModelClassification |
     if (typeof rawSlots.entryMode !== 'string' || !ENTRY_MODE_SET.has(rawSlots.entryMode)) return null;
     slots.entryMode = rawSlots.entryMode as ModelEntryMode;
   }
+  if (rawSlots.scope !== undefined) {
+    if (typeof rawSlots.scope !== 'string' || !SCOPE_SET.has(rawSlots.scope)) return null;
+    slots.scope = rawSlots.scope as ModelScope;
+  }
+  if (rawSlots.holdPending !== undefined) {
+    if (typeof rawSlots.holdPending !== 'boolean') return null;
+    slots.holdPending = rawSlots.holdPending;
+  }
   return {
     intent: o.intent as ModelIntent,
     object: (o.object ?? null) as ModelObject | null,
     action: (o.action ?? null) as ModelAction | null,
+    ...(o.softRole !== undefined ? { softRole: (o.softRole ?? null) as ModelSoftRole | null } : {}),
     slots,
     confidence: o.confidence,
     uncertain: o.uncertain,
@@ -224,8 +266,9 @@ export async function runModelClassifier(
   deadline?: number,
   timeoutMs?: number,
   observe?: (diagnostic: { modelMs: number; errorCategory: string }) => void,
+  context?: ModelClassifierContext,
 ): Promise<unknown> {
-  if (!classifier) return stubModelClassifier({ text, signal: signal ?? new AbortController().signal });
+  if (!classifier) return stubModelClassifier({ text, signal: signal ?? new AbortController().signal, ...(context ? { context } : {}) });
   const cap = (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0)
     ? timeoutMs : DEFAULT_MODEL_TIMEOUT_MS;
   const untilDeadline = deadline !== undefined ? Math.floor(deadline - performance.now()) : cap;
@@ -243,7 +286,11 @@ export async function runModelClassifier(
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => { reject(new Error('model_classify_timeout')); child.abort(); }, remaining);
     });
-    return await Promise.race([classifier({ text, signal: child.signal }), timeout, aborted]);
+    return await Promise.race([
+      classifier({ text, signal: child.signal, ...(context ? { context } : {}) }),
+      timeout,
+      aborted,
+    ]);
   } catch (error) {
     const failure = error as { message?: string; status?: number };
     errorCategory = failure.message === 'model_classify_timeout' ? 'timeout' : failure.message === 'model_cancelled' ? 'cancelled'

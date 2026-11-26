@@ -43,6 +43,13 @@ import { advancePendingSlot, expiredPendingView, pendingConfirmationReminder, pe
 import { validateModelChain, isReadOnlyQuery, type ModelClassification } from './model-classify.js';
 import { modelReportCandidate } from './model-report-candidate.js';
 import { oralProjectReportLine } from './intent-router.js';
+import {
+  HOLD_PENDING_EMPTY_REPLY,
+  HOLD_PENDING_KEEP_REPLY,
+  hasPendingDeferralClause,
+  isStandalonePendingDeferral,
+  type TriageDecision,
+} from './triage.js';
 
 
 export const EMPLOYEE_LOOP_CONFIG = 'employee-loop:m01';
@@ -62,6 +69,8 @@ export interface EmployeeMessage {
   fence?: Fence;
   /** R7：入口分类接口已通过 schema 的结果；循环内再过校验链。默认桩不会把执行结果送到这里。 */
   modelClassification?: ModelClassification;
+  /** Issue #21（路线 A）：统一分诊层产出的唯一业务决定；存在时循环直接消费，不再二次覆盖意图。 */
+  triageDecision?: TriageDecision;
 }
 /** 仅入口内部使用：新消息已完成挂起位迁移，才可启动后续非店务工作。 */
 export type PreflightReply = string | { text: string; kind: 'ask' | 'reply'; markInterleaved?: boolean };
@@ -1511,20 +1520,81 @@ function createLoopCore(options: WecomBotHandlerOptions, cutoff: string, timeZon
         expiredPendingReminder = expiredSlot.expiredReminder;
         return reply;
       };
-      const ruleReadSpec = preflightReply === undefined ? parseRuleReadQuery(text, businessDayNow) : undefined;
-      if (onlyNegatedAppointment(text) && !ruleReadSpec) return 'Front Claw：没有登记预约。';
-      if (ruleReadSpec) {
-        return finalizeReadQuery(ruleReadSpec, await executeReadQuery(ruleReadSpec, actor, input, tag, businessDayNow, readHooks));
+      const lockActivePendingInterleaved = async (): Promise<boolean> => {
+        if (!input.sessionId) return false;
+        const draftsNow = structuredClone(await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
+          .filter(d => owned(d, actor, input));
+        const activePending = draftsNow.filter(d => d.status === 'pending' && !pendingExpired(d.expiresAt, now()));
+        if (activePending.length === 1) {
+          await writesFor(input).putOperationRecord(d175InterleavedKey(actor.personId, input.sessionId), activePending[0]!.draftId);
+          return true;
+        }
+        return activePending.length > 0;
+      };
+      const handleStandaloneHoldPending = async (): Promise<string> => {
+        let draftsNow = structuredClone(await store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId }))
+          .filter(d => owned(d, actor, input));
+        const expiredSlot = await advance(actor, draftsNow, undefined, true);
+        if (expiredSlot.blocked) return 'Front Claw：请求已取消或草稿版本已变化，请查原操作结果。';
+        draftsNow = expiredSlot.drafts;
+        if (expiredSlot.expired.length > 0 && active()) await clearInterleaved(actor);
+        const activePending = draftsNow.filter(d => d.status === 'pending' && !pendingExpired(d.expiresAt, now()));
+        if (activePending.length > 0) {
+          if (activePending.length === 1 && input.sessionId) {
+            await writesFor(input).putOperationRecord(d175InterleavedKey(actor.personId, input.sessionId), activePending[0]!.draftId);
+          }
+          return HOLD_PENDING_KEEP_REPLY;
+        }
+        return HOLD_PENDING_EMPTY_REPLY;
+      };
+      if (preflightReply !== undefined && onlyNegatedAppointment(text)) {
+        return typeof preflightReply === 'string' ? preflightReply : preflightReply.text;
       }
-      if (input.modelClassification?.intent === 'query') {
-        if (!isReadOnlyQuery(input.modelClassification)) return 'Front Claw：暂不支持这项只读查询。';
-        const chain = validateModelChain({ text, output: input.modelClassification });
-        if (!chain.ok) return askReply(chain.ask);
-        const modelSpec = fromModelReadQuery(chain.classification, text, businessDayNow);
-        const reply = modelSpec
-          ? await executeReadQuery(modelSpec, actor, input, tag, businessDayNow, readHooks)
-          : ACCESS_DENIED;
-        return finalizeReadQuery(modelSpec, reply);
+      if (preflightReply === undefined) {
+        const decision = input.triageDecision;
+        if (decision) {
+          if (decision.kind === 'hold_pending') {
+            if (decision.readQuery) {
+              const reply = await executeReadQuery(decision.readQuery, actor, input, tag, businessDayNow, readHooks);
+              await lockActivePendingInterleaved();
+              return finalizeReadQuery(decision.readQuery, reply);
+            }
+            return handleStandaloneHoldPending();
+          }
+          if (decision.kind === 'read_query') {
+            const reply = await executeReadQuery(decision.spec, actor, input, tag, businessDayNow, readHooks);
+            if (decision.holdPending || hasPendingDeferralClause(text)) {
+              await lockActivePendingInterleaved();
+            }
+            return finalizeReadQuery(decision.spec, reply);
+          }
+        } else {
+          if (isStandalonePendingDeferral(text)) {
+            return handleStandaloneHoldPending();
+          }
+          const ruleReadSpec = parseRuleReadQuery(text, businessDayNow);
+          if (onlyNegatedAppointment(text) && !ruleReadSpec) return 'Front Claw：没有登记预约。';
+          if (ruleReadSpec) {
+            const reply = await executeReadQuery(ruleReadSpec, actor, input, tag, businessDayNow, readHooks);
+            if (hasPendingDeferralClause(text)) {
+              await lockActivePendingInterleaved();
+            }
+            return finalizeReadQuery(ruleReadSpec, reply);
+          }
+          if (input.modelClassification?.intent === 'query') {
+            if (!isReadOnlyQuery(input.modelClassification)) return 'Front Claw：暂不支持这项只读查询。';
+            const chain = validateModelChain({ text, output: input.modelClassification });
+            if (!chain.ok) return askReply(chain.ask);
+            const modelSpec = fromModelReadQuery(chain.classification, text, businessDayNow);
+            const reply = modelSpec
+              ? await executeReadQuery(modelSpec, actor, input, tag, businessDayNow, readHooks)
+              : ACCESS_DENIED;
+            if (input.modelClassification.slots.holdPending === true || hasPendingDeferralClause(text)) {
+              await lockActivePendingInterleaved();
+            }
+            return finalizeReadQuery(modelSpec, reply);
+          }
+        }
       }
       // D179 统一过期收尾：先生成本请求私有快照并关闭过期项，所有正常分支共用；
       // 回复只在循环出口追加。expireOnly 不消费有效追问，正常确认仍复用这一次 config 读取。

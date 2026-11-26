@@ -1,4 +1,15 @@
-import { createModelClassifier, loadModelRuntimeConfig, MODEL_ACTIONS, MODEL_INTENTS, MODEL_OBJECTS, stubModelClassifier, type ModelClassifier } from '../role-eval/model-classify.js';
+import {
+  createModelClassifier,
+  formatClassifierUserInput,
+  loadModelRuntimeConfig,
+  MODEL_ACTIONS,
+  MODEL_INTENTS,
+  MODEL_OBJECTS,
+  MODEL_SCOPES,
+  MODEL_SOFT_ROLES,
+  stubModelClassifier,
+  type ModelClassifier,
+} from '../role-eval/model-classify.js';
 
 /** Captured at assembly. Only classification JSON is returned; the model receives no tools or stores. */
 export function standaloneModelClassifier(env: Readonly<Record<string, string | undefined>>, request: typeof fetch = fetch): ModelClassifier {
@@ -12,15 +23,34 @@ export function standaloneModelClassifier(env: Readonly<Record<string, string | 
     endpoint = new URL(base.replace(/\/+$/, '') + '/chat/completions');
     if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || !key || !model) throw Error();
   } catch { throw Error('invalid_model_configuration'); }
-  const schema = { intent: MODEL_INTENTS, object: MODEL_OBJECTS, action: MODEL_ACTIONS,
-    slots: { amountText: 'original amount text only', customer: 'string', employee: 'string', index: 'integer', period: 'string', store: 'string', ref: 'operation/entry id string', countOnly: 'boolean', entryMode: 'latest_operation|latest_confirmed|by_ref' }, confidence: 'number 0..1', uncertain: 'boolean' };
+  const schema = {
+    intent: MODEL_INTENTS,
+    object: MODEL_OBJECTS,
+    action: MODEL_ACTIONS,
+    softRole: MODEL_SOFT_ROLES,
+    slots: {
+      amountText: 'original amount text only',
+      customer: 'string',
+      employee: 'string',
+      index: 'integer',
+      period: 'string',
+      store: 'string',
+      ref: 'operation/entry id string',
+      countOnly: 'boolean',
+      entryMode: 'latest_operation|latest_confirmed|by_ref',
+      scope: MODEL_SCOPES,
+      holdPending: 'boolean',
+    },
+    confidence: 'number 0..1',
+    uncertain: 'boolean',
+  };
   const system = 'Classify this employee message. Return one JSON object with only these fields and enum values: ' + JSON.stringify(schema)
-    + '. Optional object and action may be null; slots may be empty. Do not invent amounts or missing facts. When uncertain use intent unknown, confidence 0, uncertain true. Never execute actions.';
+    + '. Optional object, action, softRole may be null; slots may be empty. Do not invent amounts or missing facts. When uncertain use intent unknown, confidence 0, uncertain true. Never execute actions.';
   const url = endpoint.href;
-  return async ({ text, signal }) => {
+  return async ({ text, signal, context }) => {
     const response = await request(url, { method: 'POST', signal,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: text }], response_format: { type: 'json_object' }, temperature: 0 }) });
+      body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: formatClassifierUserInput(text, context) }], response_format: { type: 'json_object' }, temperature: 0 }) });
     if (!response.ok) throw Object.assign(Error('model_http_failure'), { status: response.status });
     const body = await response.json() as { choices?: { message?: { content?: unknown } }[] };
     const content = body?.choices?.[0]?.message?.content;

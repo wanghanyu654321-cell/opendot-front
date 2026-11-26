@@ -47,6 +47,9 @@ export interface WeComPrecheckTelemetry {
     | 'reception_ads';
   readonly tier?: 'employee' | 'manager' | 'owner';
   readonly readonlyContextInjected?: boolean;
+  readonly triageVersion?: string;
+  readonly routeLayer?: string;
+  readonly finalIntent?: string;
 }
 
 export interface WeComAgentTurnTelemetry {
@@ -908,6 +911,15 @@ export class HostObservability {
                   input.readonlyContextInjected,
                 ),
               }),
+          ...(input.triageVersion
+            ? { triage_version: sanitizeCode(input.triageVersion) }
+            : {}),
+          ...(input.routeLayer
+            ? { route_layer: sanitizeCode(input.routeLayer) }
+            : {}),
+          ...(input.finalIntent
+            ? { final_intent: sanitizeCode(input.finalIntent) }
+            : {}),
         };
       },
       input.modelMs,

@@ -24,7 +24,7 @@ const questions = [
   ['MULTI', '写护理营销文案，再报数'],
   ['decision.ask', '郗姨：28.67（小赵）'],
 ] as const;
-describe('R22 D182 所有不占挂起位的追问走统一出口', () => {
+describe('R22 D182 所有不占挂起位的追问走统一出口（Issue #21：未知/多意图对活跃草稿自动升级强确认保护）', () => {
   for (const ask of [false, true]) for (const [label, question] of questions) it(`${ask ? '追问' : '草稿'} × ${label}`, async () => {
     const { w, call } = await setup();
     const customer = ask ? '郗霁' : '郗姨';
@@ -32,10 +32,21 @@ describe('R22 D182 所有不占挂起位的追问走统一出口', () => {
     const before = await w.snapshot(); const raw = await w.base.getConfig(key);
     const reply = await call(question);
     if (label === 'MULTI') expect(reply).toContain('这条里有好几件事');
-    expect(reply.endsWith(`上一笔「${customer} 3917元」还在等你回「对」确认。`)).toBe(true);
+    // Issue #21 Phase 0：活跃草稿遇到「没太明白(unknown)」或「MULTI」时强制进入强确认保护，不再劝用户回裸「对」。
+    const strongConfirmLocked = !ask && (label === '没太明白' || label === 'MULTI');
+    const expectedTail = strongConfirmLocked
+      ? `上一笔「${customer} 3917元」还在等你回「确认入账」或「全部确认」确认。`
+      : `上一笔「${customer} 3917元」还在等你回「对」确认。`;
+    expect(reply.endsWith(expectedTail)).toBe(true);
     expect(await w.snapshot()).toEqual(before); expect(await w.base.getConfig(key)).toBe(raw);
     if (ask) await call('是');
-    await call('对');
+    if (strongConfirmLocked) {
+      expect(await call('对')).toContain('确认入账');
+      expect((await w.base.listEntries()).filter(e => e.customerName)).toEqual([]);
+      await call('确认入账');
+    } else {
+      await call('对');
+    }
     expect((await w.base.listEntries()).filter(e => e.customerName).map(e => [e.customerName, e.amount])).toEqual([[customer, 391700]]);
   });
   for (const [label, question] of questions) it(`无挂起项 × ${label}`, async () => {

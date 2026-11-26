@@ -81,7 +81,7 @@ function cnNumber(raw: string): number | null {
   return null;
 }
 const NUM = '[一二两三四五六七八九]?十[一二三四五六七八九]?|[零〇一二两三四五六七八九]|\\d{1,2}';
-const MARKETING_HINT = /文案|小红书|朋友圈|海报|种草|推广|营销|宣传|标语|口号|推文|公众号|抖音|短视频|脚本|广告/;
+const MARKETING_HINT = /文案|小红书|朋友圈|海报|种草|推广|营销|宣传|标语|口号|推文|公众号|抖音|短视频|脚本|广告|话术|欢迎语|欢迎词|接待欢迎|接待话术|客诉|安抚|培训|带教|演练|课件|复盘|诊断|排班|投流|美团|大众点评|团购|草稿|口播|选题/;
 const GUEST = /客人|顾客|客户|有客|到店|来店|预约|约了|约一下|约个|帮我约|帮.{0,4}约|登记|给我登/;
 const NAMED = /([\u4e00-\u9fa5])(先生|女士|小姐|阿姨|老师|姐|哥|叔|总)/g;
 const NOT_SURNAME = /[有个位的约点是给和跟来去要请半刻号日月天午晚早上下今后期拜客]/;
@@ -133,7 +133,7 @@ const COMMON_SURNAME = /[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高�
 const NEGATED_BOOKING = /(?:不(?:要|用|想|需要)?|别)(?:再)?(?:(?:帮|给|为|替)[\p{Script=Han}]{1,8}?)?(?:安排|登记)?(?:预约|约(?:一下|个|了)?)/u;
 const APPOINTMENT_CREATE_VERB = /帮我约|帮.{0,4}约|给我约|替.{0,4}约|安排预约/;
 const APPOINTMENT_READ_QUERY =
-  /^(?:请)?(?:(?:我|本人)(?:自己)?)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查一下|看一下|看下|查|看|问|问一下|问下|列一下|列出|数一下|数下|统计).{0,24}预约|预约.{0,10}(?:查询|有哪些|有什么|是哪些|有几[个条笔]|一共几[个条笔]|总共几[个条笔]|共有?几[个条笔]|多少[个条笔]?|几[个条笔]|数量|条数|个数)|(?:有哪些|有什么|是哪些|有几[个条笔]|一共几[个条笔]|总共几[个条笔]|共有?几[个条笔]|多少[个条笔]?|几[个条笔]).{0,8}预约|(?:本店|全店|门店|店里)(?:的)?(?:全体|全员|全部|所有|大家)(?:员工|同事|人)?(?:的)?(?:今天|今日|明天|明日|后天|未来|接下来|后续|之后|以后|近期)?(?:的)?预约|已(?:经)?(?:登记|有|约)的?预约|预约(?:查询|记录|列表|结果|明细|数量|条数|个数)/;
+  /^(?:请)?(?:(?:我|本人)(?:自己)?)?(?:帮我|给我)?(?:只(?:想|是|要)?)?(?:查询|查看|查查|看看|查一下|看一下|看下|查|看|问|问一下|问下|列一下|列出|数一下|数下|统计).{0,24}预约|把.{0,24}预约.{0,12}(?:列出来|列一下|列出|查出来|查一下|发出来|发我|给我)|预约.{0,10}(?:查询|有哪些|有什么|是哪些|有几[个条笔]|一共几[个条笔]|总共几[个条笔]|共有?几[个条笔]|多少[个条笔]?|几[个条笔]|数量|条数|个数)|(?:有哪些|有什么|是哪些|有几[个条笔]|一共几[个条笔]|总共几[个条笔]|共有?几[个条笔]|多少[个条笔]?|几[个条笔]).{0,8}预约|(?:本店|全店|门店|店里)(?:今天|今日|明天|明日|后天|未来|接下来|后续|之后|以后|近期)?(?:的)?(?:全体|全员|全部|所有|大家)(?:员工|同事|人)?(?:的)?(?:今天|今日|明天|明日|后天|未来|接下来|后续|之后|以后|近期)?(?:的)?预约|已(?:经)?(?:登记|有|约)的?预约|预约(?:查询|记录|列表|结果|明细|数量|条数|个数)/;
 const APPOINTMENT_CUE = /预约|约了|约一下|约个|帮我约|帮.{0,4}约|给我约|登记预约/;
 const APPOINTMENT_COACHING = /预约\s*(?:(?:客户|顾客|客人)\s*)?(?:(?:接待|沟通|流程|登记|咨询)\s*)?(?:话术|带教|演练|课件)/g;
 export const withoutAppointmentCoaching = (text: string): string => text.replace(APPOINTMENT_COACHING, '');
@@ -149,9 +149,12 @@ export function onlyNegatedAppointment(text: string): boolean {
 export function looksLikeAppointment(text: string): boolean {
   const raw = typeof text === 'string' ? positiveAppointmentText(withoutAppointmentCoaching(text)).trim() : '';
   const flat = raw.replace(/\s+/g, '');
-  if (!flat || flat.length > 200 || MARKETING_HINT.test(flat)) return false;
+  if (!flat || flat.length > 200) return false;
   if (parseAppointmentUtterance(raw)) return true;
   if (APPOINTMENT_READ_QUERY.test(flat) && !APPOINTMENT_CREATE_VERB.test(flat)) return false;
+  // 显式带钟点与预约动词（例如「明天下午3点预约王姐做客诉演练」）属于预约硬意图；其余含软岗/内容词一律排除。
+  const explicitTimedBooking = TIME_RE.test(flat) && APPOINTMENT_CUE.test(flat);
+  if (MARKETING_HINT.test(flat) && !explicitTimedBooking) return false;
   const named = [...flat.matchAll(NAMED)].some(m => !NOT_SURNAME.test(m[1]!)) && /来|约|到/.test(flat);
   if (!GUEST.test(flat) && !named && !APPOINTMENT_CUE.test(flat)) return false;
   // 有钟点（三点 / 15:00）的来店说法仍是预约（M05 既有路径）。

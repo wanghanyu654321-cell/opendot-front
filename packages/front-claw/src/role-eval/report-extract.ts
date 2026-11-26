@@ -232,7 +232,8 @@ export function nonClosingReportReason(
   }
   const text = maskIdentifiers(maskQuotes(normalized));
   const flat = text.replace(/\s+/g, '');
-  if (options.requireAmount !== false && !mentionsOf(text).some(m => m.kind === 'amount')) return null;
+  const amountCheckText = text.replace(/(?:或是|还是|是|为|等于)\s*0(?=$|[^\d])/g, '　');
+  if (options.requireAmount !== false && !mentionsOf(amountCheckText).some(m => m.kind === 'amount')) return null;
   if (NOT_CLOSED.test(flat)) return 'not_closed';
   if (NEG_REPORT.test(flat)) return 'negation';
   return null;

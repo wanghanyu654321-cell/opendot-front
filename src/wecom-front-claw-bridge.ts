@@ -142,11 +142,25 @@ export type ModelIntent =
   | 'target'
   | 'chitchat'
   | 'marketing'
+  | 'hold_pending'
+  | 'multi_intent'
   | 'unknown';
+
+export interface ModelClassifierContext {
+  readonly hasActivePendingDraft?: boolean;
+  readonly pendingDraftKind?:
+    | 'report'
+    | 'appointment'
+    | 'target'
+    | 'correction'
+    | null;
+  readonly hasPendingAppointmentTimeAsk?: boolean;
+}
 
 export type ModelClassifier = (input: {
   text: string;
   signal: AbortSignal;
+  context?: ModelClassifierContext;
 }) => Promise<unknown>;
 
 export interface BridgePerson {
@@ -325,6 +339,10 @@ export interface WeComFrontClawBridgeOptions {
     pendingSequence: string | null;
     modelMs: number;
     errorCategory: string;
+    triageVersion?: string;
+    routeLayer?: string;
+    finalIntent?: string;
+    softRole?: WeComSoftRole;
   }) => void;
   /** 旁路脱敏审计回调：为快通道、拒绝与放行路径统一透出可信身份 tier / storeId 与门店时钟锚点（不改变 precheck 返回契约）。 */
   readonly onPrecheckAudit?: (record: {
@@ -334,7 +352,12 @@ export interface WeComFrontClawBridgeOptions {
     readonly targetRole?: WeComSoftRole;
     readonly workspaceJid?: string;
     readonly storeClock?: WeComStoreClockContext;
+    readonly triageVersion?: string;
+    readonly routeLayer?: string;
+    readonly finalIntent?: string;
   }) => void;
+  /** Issue #21 分诊入口回退开关覆盖（v2 | legacy，默认取 FC_TRIAGE_MODE 或 v2）。 */
+  readonly triageMode?: 'v2' | 'legacy';
   readonly onRoute?: (record: unknown) => void;
   readonly platformCapabilitiesRaw?: string;
   readonly open?: () => Promise<BridgeOpenedStore>;
@@ -468,23 +491,32 @@ const FORBIDDEN_SECRET_ENV_KEYS = new Set([
 ]);
 
 const MODEL_CLASSIFIER_SYSTEM_PROMPT = [
-  '你是美容门店助手 Front Claw 的前置意图分类器。',
+  '你是美容门店助手 Front Claw 的前置意图分诊器。',
   '只输出一个合法 JSON 对象，不要包含 Markdown 代码块、解释或多余文本。',
-  '顶层仅允许这 6 个键：intent, object, action, slots, confidence, uncertain。',
-  'intent 仅可为：report | query | amend | withdraw | appointment | target | chitchat | marketing | unknown。',
+  '顶层仅允许这 7 个键：intent, object, action, softRole, slots, confidence, uncertain（softRole 可省略或为 null）。',
+  'intent 仅可为：report | query | amend | withdraw | appointment | target | chitchat | marketing | hold_pending | multi_intent | unknown。',
   'object 仅可为：null | performance | target | completion | entry | appointment | progress | ranking | summary | unreported | identity | self_and_summary。',
   'action 仅可为：null | query | report | amend | cancel | delete。',
-  'slots 仅允许这 9 个键：amountText, customer, employee, index, period, store, ref, countOnly, entryMode（禁止输出 customerName、projectName、amount、cents 等未定义键）。',
+  'softRole 仅可为：null | marketing | reception_ads | training | manager_ops（仅当 intent="marketing" 时填写）。',
+  'slots 仅允许这 11 个键：amountText, customer, employee, index, period, store, ref, countOnly, entryMode, scope, holdPending（禁止输出 customerName、projectName、amount、cents 等未定义键）。',
+  'slots.scope 仅可为：self | store | other；slots.holdPending 为布尔值。',
   '映射规则：',
-  '- 员工报业绩：intent="report", object="performance", action="report"，客户称呼放入 slots.customer（须为原文子串），金额原文放入 slots.amountText（绝不猜数字或换算）。明确未成交或否定报单不要判为 report。',
-  '- 查本人业绩/进度：intent="query", object="progress", action="query"；查同事进度同样用 object="progress" 并将姓名放入 slots.employee。',
-  '- 查全店汇总：object="summary", action="query"；同时查本人与本店：object="self_and_summary", action="query"；查今天谁没报/未报名单：object="unreported", action="query"；查排名：object="ranking", action="query"；查当前岗位/授权门店：object="identity", action="query"。',
+  '- 员工报业绩：intent="report", object="performance", action="report"，客户称呼放入 slots.customer（须为原文子串），金额原文放入 slots.amountText（绝不猜数字或换算）。明确未成交或否定报单（如「没做成」「别入账」）不要判为 report。',
+  '- 暂搁置待确认草稿（如「刚才那笔待确认的先放着」「先不处理」）：若仅表达先放着，设 intent="hold_pending", object=null, action=null；若同时附带只读查询（如「先放着，查我今天有几条预约」），按查询 intent="query" 分类并设 slots.holdPending=true。',
+  '- 查本人业绩/进度/目标/差距（含「如果目标没设或是0，不要报单也不要改目标」类条件只读）：intent="query", object="target"|"progress"|"completion", action="query", slots.scope="self"；查同事进度用 object="progress", slots.scope="other" 并将姓名放入 slots.employee。',
+  '- 查全店汇总：object="summary", action="query", slots.scope="store"；同时查本人与本店：object="self_and_summary", action="query"；查今天谁没报/未报名单：object="unreported", action="query"；查排名：object="ranking", action="query"；查当前岗位/授权门店：object="identity", action="query"。',
   '- 查入账结果或指定操作号/单号：intent="query", object="entry", action="query"，如有单号放入 slots.ref，区分最近已入账（slots.entryMode="latest_confirmed"）与最近一次操作结果（slots.entryMode="latest_operation"）。',
   '- 改账：intent="amend", object="entry", action="amend"；撤回/作废：intent="withdraw", object="entry", action="cancel"。',
-  '- 预约：新建/取消用 intent="appointment", object="appointment", action="report"|"cancel"；查已有预约用 intent="query", object="appointment", action="query"（只问数量设 slots.countOnly=true，日期放 slots.period）。目标设置用 intent="target", object="target", action="report"|"amend"，查目标/完成率用 intent="query", object="target"|"completion", action="query"。',
+  '- 预约：新建/取消用 intent="appointment", object="appointment", action="report"|"cancel"；查已有预约用 intent="query", object="appointment", action="query"（问全店/全体/店里全部预约设 slots.scope="store"，问本人设 slots.scope="self"，只问数量设 slots.countOnly=true，日期放 slots.period）。目标设置用 intent="target", object="target", action="report"|"amend"。',
+  '- 跨类多意图（同一句既要查账/报数又要写营销文案或复盘建议）：intent="multi_intent", object=null, action=null, slots={}。',
   '- 客套闲聊：intent="chitchat", object=null, action=null, slots={}。',
-  '- 营销文案、教学培训/家访带教、客服接待/异议话术、投流团购诊断/投流复盘、店长经营复盘建议等非账本咨询：intent="marketing", object=null, action=null, slots={}。纯查账、报数、改账、预约、设目标仍按上面的店务规则分类。',
-  'confidence 为 0..1 数值，uncertain 为布尔值；若拿不准或含糊请设为 {"intent":"unknown","object":null,"action":null,"slots":{},"confidence":0,"uncertain":true}。',
+  '- 非账本软岗咨询统一用 intent="marketing", object=null, action=null, slots={} 并标明 softRole：',
+  '  * marketing：朋友圈/小红书/短视频文案、选题、内容排期；',
+  '  * reception_ads：接待欢迎话术、顾客异议/嫌贵/客诉安抚、美团/大众点评团购与投流诊断/投流复盘；',
+  '  * training：培训带教、家访五步法、新人演练、课件/排练节奏；',
+  '  * manager_ops：店长经营复盘、门店经营诊断、挂零管理、业绩拆解建议。',
+  '注意：写接待欢迎话术草稿（即使提到「今天下午到店客人」）属于 intent="marketing", softRole="reception_ads"，不是新建预约！',
+  'confidence 为 0..1 数值，uncertain 为布尔值；若拿不准或含糊请设为 {"intent":"unknown","object":null,"action":null,"softRole":null,"slots":{},"confidence":0,"uncertain":true}。',
 ].join('\n');
 
 export function classifyWeComSoftRole(text: string): WeComSoftRole {
@@ -504,9 +536,9 @@ export function classifyWeComSoftRole(text: string): WeComSoftRole {
   ) {
     return 'manager_ops';
   }
-  // 3. 客户接待话术/客诉/质检与平台投流团购诊断/复盘（例如「美团团购投流效果不好，做个只读复盘」→ reception_ads）。
+  // 3. 客户接待/欢迎话术/客诉/质检与平台投流团购诊断/复盘（例如「美团团购投流效果不好，做个只读复盘」「接待欢迎话术草稿」→ reception_ads）。
   if (
-    /接待话术|怎么接待|客诉|嫌贵|异议|怎么回复客户|退卡安抚|质检|投流|美团|大众点评|团购|\bROI\b|点击率|线索转化/i.test(
+    /接待.{0,4}话术|欢迎话术|欢迎语|欢迎词|怎么接待|到店.{0,4}接待|客诉|嫌贵|异议|怎么回复客户|退卡安抚|质检|投流|美团|大众点评|团购|\bROI\b|点击率|线索转化/i.test(
       text,
     )
   ) {
@@ -842,6 +874,13 @@ interface RoutedResult {
     | 'clarify';
   duplicate?: boolean;
   pass?: true;
+  softRole?: WeComSoftRole;
+  triageAudit?: {
+    triageVersion: string;
+    routeLayer: string;
+    finalIntent: string;
+    softRole?: WeComSoftRole;
+  };
   expiredReminder?: string;
   actor?: BridgePerson;
 }
@@ -1252,9 +1291,29 @@ function uncertainModelOutput() {
   };
 }
 
+const CLASSIFIER_MAX_INPUT_CHARS = 2000;
+
+function formatOpenDotClassifierUserMessage(
+  text: string,
+  context?: ModelClassifierContext,
+): string {
+  if (
+    !context ||
+    (!context.hasActivePendingDraft && !context.hasPendingAppointmentTimeAsk)
+  ) {
+    return text;
+  }
+  const flags = [
+    `hasActivePendingDraft=${context.hasActivePendingDraft === true}`,
+    `pendingDraftKind=${context.pendingDraftKind ?? 'none'}`,
+    `hasPendingAppointmentTimeAsk=${context.hasPendingAppointmentTimeAsk === true}`,
+  ];
+  return `[会话状态提示（仅用于语义理解，不含账本与授权）: ${flags.join(', ')}]\n[员工原文]\n${text}`;
+}
+
 /**
  * 基于 OpenDot 运行时配置构造 R7 分类器。
- * 任何非 JSON、超时或网络异常均交由 runModelClassifier / validateModelChain 兜底成 uncertain（追问澄清），绝不放行。
+ * 任何非 JSON、超长截断风险、超时或网络异常均交由 runModelClassifier / validateModelChain 兜底成 uncertain（追问澄清），绝不放行。
  */
 export function createModelClassifierFromOpenDotConfig(
   runtime: OpenDotClassifierRuntimeConfig,
@@ -1263,10 +1322,13 @@ export function createModelClassifierFromOpenDotConfig(
   if (runtime.mode !== 'live') return undefined;
 
   if (customComplete) {
-    return async ({ text, signal }) => {
+    return async ({ text, signal, context }) => {
+      if (text.trim().length > CLASSIFIER_MAX_INPUT_CHARS) {
+        return uncertainModelOutput();
+      }
       const raw = await customComplete({
         system: MODEL_CLASSIFIER_SYSTEM_PROMPT,
-        user: text.slice(0, 2000),
+        user: formatOpenDotClassifierUserMessage(text, context),
         signal,
         config: runtime,
       });
@@ -1280,7 +1342,10 @@ export function createModelClassifierFromOpenDotConfig(
   }
 
   const url = buildAnthropicMessagesUrl(runtime.baseUrl);
-  return async ({ text, signal }) => {
+  return async ({ text, signal, context }) => {
+    if (text.trim().length > CLASSIFIER_MAX_INPUT_CHARS) {
+      return uncertainModelOutput();
+    }
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       accept: 'application/json',
@@ -1300,7 +1365,12 @@ export function createModelClassifierFromOpenDotConfig(
         max_tokens: parseClassifierMaxTokens(runtime.maxTokens),
         temperature: 0,
         system: MODEL_CLASSIFIER_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: text.slice(0, 2000) }],
+        messages: [
+          {
+            role: 'user',
+            content: formatOpenDotClassifierUserMessage(text, context),
+          },
+        ],
       }),
     });
     if (!res.ok) throw new Error(`opendot_model_http_${res.status}`);
@@ -1506,6 +1576,11 @@ export async function createWeComFrontClawBridge(
       passthroughMarketing: true,
       budgetMs,
       modelClassifyTimeoutMs: effectiveModelTimeoutMs,
+      ...(options.triageMode
+        ? { triageMode: options.triageMode }
+        : env.FC_TRIAGE_MODE === 'legacy' || env.FC_TRIAGE_MODE === 'v2'
+          ? { triageMode: env.FC_TRIAGE_MODE }
+          : {}),
       ...(resolvedModelClassifier
         ? { modelClassify: resolvedModelClassifier }
         : {}),
@@ -2095,6 +2170,7 @@ export async function createWeComFrontClawBridge(
       extra?: {
         workspaceJid?: string;
         storeClock?: WeComStoreClockContext;
+        triageAudit?: RoutedResult['triageAudit'];
       },
     ) => {
       try {
@@ -2105,6 +2181,13 @@ export async function createWeComFrontClawBridge(
           ...(targetRole ? { targetRole } : {}),
           ...(extra?.workspaceJid ? { workspaceJid: extra.workspaceJid } : {}),
           ...(extra?.storeClock ? { storeClock: extra.storeClock } : {}),
+          ...(extra?.triageAudit
+            ? {
+                triageVersion: extra.triageAudit.triageVersion,
+                routeLayer: extra.triageAudit.routeLayer,
+                finalIntent: extra.triageAudit.finalIntent,
+              }
+            : {}),
         });
       } catch {
         /* 观测回调不得影响业务主链路 */
@@ -2185,8 +2268,9 @@ export async function createWeComFrontClawBridge(
           replies: [mods.unified.UNBOUND || BRIDGE_UNBOUND_REPLY],
         };
       }
-      const targetRole = classifyWeComSoftRole(event.text);
-      emitPrecheckAudit(actor, targetRole);
+      // Issue #21：优先消费分诊层产出的 softRole，不再由桥接层二次覆盖；经营快照授权仍严格走 M03。
+      const targetRole = result.softRole ?? classifyWeComSoftRole(event.text);
+      emitPrecheckAudit(actor, targetRole, { triageAudit: result.triageAudit });
       const canReview = async (candidate: BridgePerson): Promise<boolean> =>
         candidate.tier !== 'employee' &&
         decideManagerReview(await readPolicy(), candidate, candidate.storeId)
@@ -2313,7 +2397,11 @@ export async function createWeComFrontClawBridge(
         return { kind: 'failed', replies: [mods.loop.STALE_CONSUMER] };
       }
 
-      emitPrecheckAudit(latest, targetRole, { workspaceJid, storeClock });
+      emitPrecheckAudit(latest, targetRole, {
+        workspaceJid,
+        storeClock,
+        triageAudit: result.triageAudit,
+      });
 
       return {
         kind: 'pass',
@@ -2333,6 +2421,12 @@ export async function createWeComFrontClawBridge(
           ? { expiredReminder: result.expiredReminder }
           : {}),
       };
+    }
+
+    if (result.triageAudit) {
+      emitPrecheckAudit(person, result.triageAudit.softRole, {
+        triageAudit: result.triageAudit,
+      });
     }
 
     const proof = result.access && structuredClone(result.access);

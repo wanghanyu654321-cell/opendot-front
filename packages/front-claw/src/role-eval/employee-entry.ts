@@ -15,6 +15,7 @@ import { extractReport, nonClosingReportReason } from './report-extract.js';
 import { clarifyQuestion } from './clarify.js';
 import { parseRuleReadQuery } from './read-query.js';
 import { isStandardAmountLine } from './amount-guard.js';
+import { hasNonCustomerStandardLabel } from './standard-line.js';
 import { parseLooseReport, parseReportText } from './report-parse.js';
 import type { Person } from './performance-store.js';
 import { isDeterministicStub } from './intent-classifier.js';
@@ -23,6 +24,22 @@ import {
   createModelClassifier, loadModelRuntimeConfig,
   type ModelClassifier, type ModelClassification, type ModelRuntimeConfig,
 } from './model-classify.js';
+import {
+  classifySoftRoleRule,
+  decisionFromModelClassification,
+  hasCrossDomainStoreAndSoftRole,
+  hasPendingDeferralClause,
+  isStandalonePendingDeferral,
+  resolveTriageMode,
+  triageAuditOf,
+  tryFastPathTriage,
+  type TriageAuditInfo,
+  type TriageDecision,
+  type TriageMode,
+  type TriageSessionHint,
+  type TriageSoftRole,
+  type TriageSource,
+} from './triage.js';
 
 import { businessRead, courtesyReply, isManagedQueryPhrase, isSelfProgressQuery, isStorePerfQuery, NOT_TODAY_REPLY, otherStoreShortNames, pastDayReportPhrase, scopeRefusal } from './scope-refusal.js';
 import { stripNegatedMakeupPhrases } from './standard-line.js';
@@ -50,20 +67,27 @@ export interface EmployeeRouterOptions {
   /** 模型调用超时（毫秒），超时走追问、不执行。默认取配置或 DEFAULT_MODEL_TIMEOUT_MS（8 秒）。 */
   modelClassifyTimeoutMs?: number;
   marketing?: MarketingPort;
-  /**
-   * OpenDot 桥接模式：当决策为 marketing 且本人具备 marketing 授权时，
+  /** OpenDot 桥接模式：当决策为 marketing 且本人具备 marketing 授权时，
    * 在完成 loop(input, '') 身份与挂起项预检及 marketingActor 复核后返回 pass: true、expiredReminder 与 actor，
    * 交由外层桥接器转交 OpenDot 原生 Agent（不再强制要求 router.marketing）。
    */
   passthroughMarketing?: boolean;
+  /** Issue #21 仅切分诊入口的回退开关（v2 = 路线 A 单决策分诊台；legacy = 旧规则前置回退）。草稿强确认契约两模式一致。 */
+  triageMode?: TriageMode;
   onRoute?: (record: RouteLogRecord) => void;
 }
 export interface MessageObservation {
   route: '快通道' | '模型' | '追问'; gateReason: string; pendingSequence: string | null; modelMs: number; errorCategory: string;
+  triageVersion?: string;
+  routeLayer?: TriageSource;
+  finalIntent?: string;
+  softRole?: TriageSoftRole;
 }
 export interface RoutedHandleResult extends HandleResult {
   requestId: string; state: TerminalState; target: RouteDecision['target']; duplicate: boolean;
   pass?: true;
+  softRole?: TriageSoftRole;
+  triageAudit?: TriageAuditInfo;
   expiredReminder?: string;
   actor?: Person;
 }
@@ -83,8 +107,9 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
   loop: (input: EmployeeMessage, preflightReply?: PreflightReply) => Promise<EmployeeLoopResult>) {
   const router = { ...options.router };
   const passthroughMarketing = router.passthroughMarketing === true;
-  type EntryWorkResult = WorkResult & { pass?: true; expiredReminder?: string; actor?: Person };
-  type EntryTerminal = import('./request-budget.js').Terminal & { pass?: true; expiredReminder?: string; actor?: Person };
+  const triageMode: TriageMode = router.triageMode ?? resolveTriageMode();
+  type EntryWorkResult = WorkResult & { pass?: true; softRole?: TriageSoftRole; triageAudit?: TriageAuditInfo; expiredReminder?: string; actor?: Person };
+  type EntryTerminal = import('./request-budget.js').Terminal & { pass?: true; softRole?: TriageSoftRole; triageAudit?: TriageAuditInfo; expiredReminder?: string; actor?: Person };
   const modelRuntime = router.modelClassify ? { mode: 'stub' as const, timeoutMs: 8000 } : loadModelRuntimeConfig(router.modelConfig);
   const modelClassifier = router.modelClassify ?? createModelClassifier(modelRuntime);
   const modelClassifyTimeoutMs = router.modelClassifyTimeoutMs ?? modelRuntime.timeoutMs;
@@ -165,23 +190,309 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
     let decision: RouteDecision = { target: 'clarify', label: 'clarify', intents: [] };
     let modelCalled = false;
     let gateReason = 'not_applicable', modelMs = 0, errorCategory = 'none', modelAttempted = false;
+    let triageAudit: TriageAuditInfo | undefined;
     input = { ...input, onGate: reason => { gateReason = reason.split(':')[0]!; } };
     const run = await budget.run(requestId, fingerprint, { signal: input.signal, deadline: input.deadline }, async child => {
       await pendingArrival;
       if (child.signal.aborted || performance.now() >= child.deadline) throw Error('arrival_cancelled');
-      const preflightResponse = async (reply: string, kind: 'ask' | 'reply' = 'reply'): Promise<WorkResult> => {
-        const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline }, { text: reply, kind });
-        return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
+      const preflightResponse = async (reply: string, kind: 'ask' | 'reply' = 'reply', markInterleaved = false): Promise<EntryWorkResult> => {
+        const handled = await loop(
+          { ...input, signal: child.signal, deadline: child.deadline },
+          { text: reply, kind, ...(markInterleaved ? { markInterleaved: true } : {}) },
+        );
+        return {
+          reply: handled.replies.join('\n'),
+          target: 'store',
+          ...(handled.access ? { access: handled.access } : {}),
+          ...(triageAudit ? { triageAudit } : {}),
+        };
       };
       const today = businessDate(options.now(), cutoff, timeZone);
-      if (parseRuleReadQuery(input.text, today)) {
-        decision = { target: 'store', label: 'progress', intents: ['progress'] };
-        const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline });
-        return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
-      }
+      const marketing = router.marketing;
+      const marketingEnabled = Boolean(marketing?.enabled || passthroughMarketing);
+
+      const buildSessionHint = async (): Promise<{ hint: TriageSessionHint; askedCustomer: boolean }> => {
+        const actor = await options.store.getPersonByMember(input.memberId);
+        if (!actor?.active) {
+          return {
+            hint: { hasActivePendingDraft: false, pendingDraftKind: null, hasPendingAppointmentTimeAsk: false },
+            askedCustomer: false,
+          };
+        }
+        const drafts = await options.store.listDrafts({ reporterPersonId: actor.personId, storeId: actor.storeId });
+        const nowMs = options.now().getTime();
+        const activePending = drafts.find(d => d.status === 'pending' && Date.parse(d.expiresAt) > nowMs);
+        let hasPendingAppointmentTimeAsk = false;
+        let askedCustomer = false;
+        if (options.accessPolicy === true && input.sessionId) {
+          hasPendingAppointmentTimeAsk = Boolean((await options.store.getConfig(appointmentTimeAskKey(actor, input)))?.trim());
+          askedCustomer = Boolean((await options.store.getConfig(appointmentAskKey(actor, input)))?.trim());
+        }
+        return {
+          hint: {
+            hasActivePendingDraft: Boolean(activePending),
+            pendingDraftKind: activePending ? activePending.kind : null,
+            hasPendingAppointmentTimeAsk,
+          },
+          askedCustomer,
+        };
+      };
+
+      const executeTriageDecision = async (td: TriageDecision): Promise<EntryWorkResult> => {
+        triageAudit = triageAuditOf(td, triageMode);
+        if (td.kind === 'confirm_or_cancel' || td.kind === 'appointment_time_reply' || td.kind === 'choice_followup' || td.kind === 'hold_pending') {
+          decision = { target: 'store', label: 'followup', intents: ['followup'] };
+          const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline, triageDecision: td });
+          return {
+            reply: handled.replies.join('\n'),
+            ...(handled.ledgerSettled ? { ledgerSettled: true } : {}),
+            target: 'store',
+            ...(handled.access ? { access: handled.access } : {}),
+            triageAudit,
+          };
+        }
+        if (td.kind === 'read_query') {
+          decision = { target: 'store', label: 'progress', intents: ['progress'] };
+          const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline, triageDecision: td });
+          return {
+            reply: handled.replies.join('\n'),
+            target: 'store',
+            ...(handled.access ? { access: handled.access } : {}),
+            triageAudit,
+          };
+        }
+        if (td.kind === 'chitchat') {
+          decision = { target: 'chitchat', label: 'chitchat', intents: ['chitchat'] };
+          return preflightResponse(courtesyReply(input.text) ?? CHITCHAT_REPLY);
+        }
+        if (td.kind === 'multi_intent') {
+          decision = { target: 'clarify', label: 'clarify', intents: ['report', 'marketing'], ask: td.ask };
+          return preflightResponse(td.ask, 'ask', true);
+        }
+        if (td.kind === 'clarify') {
+          decision = { target: 'clarify', label: 'clarify', intents: [], ask: td.ask };
+          return preflightResponse(td.ask, td.suppressReminder ? 'reply' : 'ask', td.markInterleaved);
+        }
+        if (td.kind === 'soft_role') {
+          const granted = marketingEnabled ? await marketingActor(input.memberId) : null;
+          if (!marketingEnabled || !granted) {
+            gateReason = 'permission';
+            decision = { target: 'marketing-unavailable', label: 'marketing', intents: ['marketing'] };
+            return preflightResponse(MARKETING_UNAVAILABLE);
+          }
+          decision = { target: 'marketing', label: 'marketing', intents: ['marketing'] };
+          const prepared = await loop(
+            { ...input, signal: child.signal, deadline: child.deadline },
+            passthroughMarketing ? { text: '', kind: 'reply', markInterleaved: true } : '',
+          );
+          if (!prepared.newMessagePrepared) {
+            return {
+              reply: prepared.replies.join('\n'),
+              target: 'store',
+              ...(prepared.access ? { access: prepared.access } : {}),
+              triageAudit,
+            };
+          }
+          const finish = (reply: string) => prepared.expiredReminder ? `${reply}\n${prepared.expiredReminder}` : reply;
+          if (child.signal.aborted || performance.now() >= child.deadline) {
+            return { reply: finish(MARKETING_UNAVAILABLE), triageAudit };
+          }
+          const verifiedActor = await marketingActor(input.memberId, granted);
+          if (!verifiedActor) {
+            return {
+              reply: finish(MARKETING_UNAVAILABLE),
+              target: 'marketing',
+              access: { capability: 'marketing', storeIds: [granted.storeId] },
+              triageAudit,
+            };
+          }
+          if (passthroughMarketing) {
+            return {
+              reply: '',
+              target: 'marketing',
+              access: { capability: 'marketing', storeIds: [verifiedActor.storeId] },
+              pass: true,
+              softRole: td.softRole,
+              triageAudit,
+              actor: verifiedActor,
+              ...(prepared.expiredReminder ? { expiredReminder: prepared.expiredReminder } : {}),
+            };
+          }
+          modelCalled = true;
+          const text = await marketing!.handle({ memberId: input.memberId, text: input.text, signal: child.signal, deadline: child.deadline });
+          if (!await marketingActor(input.memberId, verifiedActor)) {
+            return {
+              reply: finish(MARKETING_UNAVAILABLE),
+              target: 'marketing',
+              access: { capability: 'marketing', storeIds: [verifiedActor.storeId] },
+              triageAudit,
+            };
+          }
+          return {
+            reply: finish(typeof text === 'string' && text.trim() ? text.trim() : `${F}：这次没有生成内容，没有写入任何账目。`),
+            target: 'marketing',
+            access: { capability: 'marketing', storeIds: [verifiedActor.storeId] },
+            triageAudit,
+          };
+        }
+        // td.kind === 'store_write'
+        const writeLabel = td.writeKind === 'report' ? 'report' as const
+          : td.writeKind === 'appointment' ? 'appointment' as const
+          : td.writeKind === 'target' ? 'target' as const
+          : 'correction' as const;
+        decision = { target: 'store', label: writeLabel, intents: [writeLabel] };
+        const impurity = td.writeKind === 'report' ? textLevelImpurity(input.text, today) : null;
+        if (!impurity) {
+          if (td.writeKind === 'report' && pastDayReportPhrase(input.text, today)) {
+            return preflightResponse(NOT_TODAY_REPLY, 'ask');
+          }
+          const refused = await refusalFor(input.memberId, input.text, false);
+          if (refused) return preflightResponse(refused);
+        }
+        const handled = await loop({
+          ...input,
+          signal: child.signal,
+          deadline: child.deadline,
+          triageDecision: td,
+          ...(td.classification ? { modelClassification: td.classification } : {}),
+        });
+        if (handled.replies.length === 1 && handled.replies[0] === REPORT_HINT && !handled.ledgerSettled) {
+          const refused = await refusalFor(input.memberId, input.text);
+          if (refused) return { reply: refused, triageAudit };
+        }
+        return {
+          reply: handled.replies.join('\n'),
+          ...(handled.ledgerSettled ? { ledgerSettled: true } : {}),
+          target: 'store',
+          ...(handled.access ? { access: handled.access } : {}),
+          triageAudit,
+        };
+      };
+
+      // 第 1 层（v2 与 legacy 共享）：超长输入防截断 + 独立挂起保护 + 待答钟点。
       const clockReply = parseStandaloneAppointmentTime(input.text);
       const clockActor = clockReply && options.accessPolicy === true ? await options.store.getPersonByMember(input.memberId) : null;
       const askedTime = clockActor && (await options.store.getConfig(appointmentTimeAskKey(clockActor, input)))?.trim();
+      const fastDecision = tryFastPathTriage(input.text, {
+        businessDay: today,
+        sessionHint: {
+          hasActivePendingDraft: false,
+          pendingDraftKind: null,
+          hasPendingAppointmentTimeAsk: Boolean(askedTime),
+        },
+      });
+      if (fastDecision) {
+        const fastLabel = fastDecision.kind === 'chitchat' ? 'chitchat'
+          : fastDecision.kind === 'store_write' ? fastDecision.writeKind
+          : fastDecision.kind === 'read_query' ? 'progress'
+          : fastDecision.kind === 'clarify' ? 'clarify'
+          : 'followup';
+        const fastTarget = fastDecision.kind === 'chitchat' ? 'chitchat'
+          : fastDecision.kind === 'clarify' ? 'clarify'
+          : 'store';
+        log.classify(requestId, { label: fastLabel, target: fastTarget, source: 'rule', reason: 'single' });
+        return executeTriageDecision(fastDecision);
+      }
+
+      // 路线 A（v2，存在真实或注入分类器时）：复杂自然长句不再被 8 层前置正则拦截，直接由统一分诊模型产出唯一决策。
+      if (triageMode === 'v2' && !isModelStub(modelClassifier)) {
+        const { hint: sessionHint, askedCustomer } = await buildSessionHint();
+        if (askedCustomer && input.text.trim().length <= 16 && !hasPendingDeferralClause(input.text) && !parseRuleReadQuery(input.text, today)) {
+          return executeTriageDecision({ kind: 'choice_followup', source: 'fast_path' });
+        }
+        modelAttempted = true;
+        const output = await runModelClassifier(
+          input.text,
+          modelClassifier,
+          child.signal,
+          child.deadline,
+          modelClassifyTimeoutMs,
+          diagnostic => { modelMs = diagnostic.modelMs; errorCategory = diagnostic.errorCategory; },
+          sessionHint,
+        );
+        modelCalled = true;
+        const chain = validateModelChain({ text: input.text, output });
+        if (chain.ok) {
+          let modelDecision = decisionFromModelClassification(input.text, chain.classification, today, {
+            multiReply: MULTI_REPLY,
+            clarifyReply: CLARIFY_REPLY,
+          });
+          if (modelDecision.kind === 'soft_role' && hasCrossDomainStoreAndSoftRole(input.text, today)) {
+            modelDecision = { kind: 'multi_intent', source: 'guard', ask: MULTI_REPLY };
+          }
+          if (modelDecision.kind !== 'clarify' && modelDecision.kind !== 'multi_intent') {
+            gateReason = 'accepted';
+          }
+          log.classify(requestId, {
+            label: modelDecision.kind === 'soft_role' ? 'marketing' : modelDecision.kind === 'chitchat' ? 'chitchat' : modelDecision.kind === 'clarify' || modelDecision.kind === 'multi_intent' ? 'clarify' : 'progress',
+            target: modelDecision.kind === 'soft_role' ? 'marketing' : modelDecision.kind === 'chitchat' ? 'chitchat' : modelDecision.kind === 'clarify' || modelDecision.kind === 'multi_intent' ? 'clarify' : 'store',
+            source: 'semantic',
+            reason: 'semantic',
+          });
+          return executeTriageDecision(modelDecision);
+        }
+        // 模型返回 unknown / 超时 / 畸形 JSON / 脏金额：绝不回退到猜预约或猜报单写流！
+        gateReason = chain.reason;
+        if (errorCategory === 'none') errorCategory = chain.reason;
+        if (chain.reason === 'amount') {
+          return executeTriageDecision({
+            kind: 'clarify',
+            source: 'guard',
+            reason: 'amount',
+            ask: chain.ask,
+            markInterleaved: true,
+          });
+        }
+        if (isStandalonePendingDeferral(input.text)) {
+          return executeTriageDecision({ kind: 'hold_pending', source: 'guard' });
+        }
+        const safeReadSpec = parseRuleReadQuery(input.text, today);
+        if (safeReadSpec) {
+          return executeTriageDecision({
+            kind: 'read_query',
+            source: 'rule_fallback',
+            spec: safeReadSpec,
+            ...(hasPendingDeferralClause(input.text) ? { holdPending: true } : {}),
+          });
+        }
+        const directDenied = nonClosingReportReason(input.text);
+        if (directDenied) {
+          return executeTriageDecision({
+            kind: 'clarify',
+            source: 'guard',
+            reason: 'non_closing',
+            ask: clarifyQuestion(directDenied),
+            markInterleaved: true,
+            suppressReminder: true,
+          });
+        }
+        if (hasCrossDomainStoreAndSoftRole(input.text, today)) {
+          return executeTriageDecision({ kind: 'multi_intent', source: 'guard', ask: MULTI_REPLY });
+        }
+        const refused = await refusalFor(input.memberId, input.text, isManagedQueryPhrase(input.text));
+        if (refused) {
+          triageAudit = { triageVersion: triageMode, routeLayer: 'guard', finalIntent: 'refusal' };
+          return preflightResponse(refused);
+        }
+        return executeTriageDecision({
+          kind: 'clarify',
+          source: 'model',
+          reason: chain.reason === 'schema' ? 'schema' : 'uncertain',
+          ask: CLARIFY_REPLY,
+          markInterleaved: true,
+        });
+      }
+
+      // 离线 stub 模式或 FC_TRIAGE_MODE=legacy 回退路径：仍收敛到同一 executeTriageDecision，且保持 Phase 0 强确认不变量。
+      const ruleReadSpec = parseRuleReadQuery(input.text, today);
+      if (ruleReadSpec) {
+        return executeTriageDecision({
+          kind: 'read_query',
+          source: 'rule_fallback',
+          spec: ruleReadSpec,
+          ...(hasPendingDeferralClause(input.text) ? { holdPending: true } : {}),
+        });
+      }
       const classified: Classification = askedTime
         ? { label: 'followup', intents: ['followup'], source: 'rule', reason: 'single' }
         : await classifyWithSemantic(input.text, {
@@ -189,8 +500,6 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
           preserveCrossDomainMultiIntent: true,
         });
       if ((classified.source === 'semantic' || classified.reason === 'semantic-rejected' || classified.reason === 'semantic-timeout') && !isDeterministicStub(router.semantic)) modelCalled = true;
-      const marketing = router.marketing;
-      const marketingEnabled = Boolean(marketing?.enabled || passthroughMarketing);
       let grantedActor = classified.label === 'marketing' && marketingEnabled ? await marketingActor(input.memberId) : null;
       decision = decideRoute(classified, { marketingEnabled, marketingGranted: !!grantedActor });
       log.classify(requestId, { label: decision.label, target: decision.target, source: classified.source, reason: classified.reason });
@@ -199,33 +508,30 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
         ? classified.unclear
         : nonClosingReportReason(input.text);
       if (nonClosingReason && (decision.target === 'clarify' || decision.target === 'store')) {
-        const handled = await loop(
-          { ...input, signal: child.signal, deadline: child.deadline },
-          { text: clarifyQuestion(nonClosingReason), kind: 'reply', markInterleaved: true },
-        );
-        return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
+        return executeTriageDecision({
+          kind: 'clarify',
+          source: 'guard',
+          reason: 'non_closing',
+          ask: clarifyQuestion(nonClosingReason),
+          markInterleaved: true,
+          suppressReminder: true,
+        });
       }
-      // R3（D81 已定口径）：非今天的报数说法 → 固定一句，不追问、不写。
-      // R15 / D146：没见过的否定补报（含带时间词前缀）先问，不走「只能报今天的单」，不出可确认草稿。
       {
-        // 先认形状，不读账本；只有确定走模型追问时才取本店已确认名单（D146 收紧，D139「对」入账）。
-        // R18 / 移交项 3：结论与措辞都来自单闸模块（与闸内同一个 textLevelImpurity），入口不自己判。
         const impurity = textLevelImpurity(input.text, today);
         if (impurity) {
-          // D175：用同一 D152 文本结论先问，保留挂起项；宿主全局指纹仍先于本入口，budget 覆盖整轮。
+          triageAudit = { triageVersion: triageMode, routeLayer: 'rule_fallback', finalIntent: 'write:report' };
           const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline });
-          return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
+          return { reply: handled.replies.join('\n'), target: 'store', ...(handled.access ? { access: handled.access } : {}), triageAudit };
         }
       }
       if ((decision.target === 'clarify' || decision.target === 'store') && pastDayReportPhrase(input.text, today)) return preflightResponse(NOT_TODAY_REPLY, 'ask');
-      // R3/R4：越权/跨店/设目标 等 → 直接「不能做」+原因（店务路径进循环前也判一次）。
       const managedQuery = isManagedQueryPhrase(input.text);
       const hasStoreShorthand = otherStoreShortNames(input.text, '').length > 0;
       if (hasStoreShorthand || (!managedQuery && (decision.target === 'clarify' || decision.target === 'store'))) {
         const refused = await refusalFor(input.memberId, input.text, managedQuery);
         if (refused) return preflightResponse(refused);
       }
-      // R4：待答的预约称呼、或「改 N」选笔 —— 分类器可能当成澄清，仍进店务循环，避免丢掉上下文。
       if (decision.target === 'clarify') {
         const actor = await options.store.getPersonByMember(input.memberId);
         const asked = actor ? (await options.store.getConfig(appointmentAskKey(actor, input)))?.trim() : '';
@@ -237,8 +543,6 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
           decision = { target: 'store', label: 'followup', intents: ['followup'] };
         }
       }
-      // R7：规则快路径只保留抽取完整/标准行报单、已能直接办的查询模板、改账/目标命令、预约与跟进。
-      // 仅关键词命中、入口实际办不成的，改走模型分类（不扩关键词表）。
       if (decision.target === 'store' && decision.label !== 'followup' && decision.label !== 'appointment') {
         const completeReport = oralProjectReportLine(input.text) !== null
           || extractReport(input.text).status === 'complete' || isStandardAmountLine(input.text)
@@ -257,87 +561,76 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
           decision = { target: 'clarify', label: 'clarify', intents: decision.intents };
         }
       }
-      let modelClassification: ModelClassification | undefined;
       const crossDomainMultiIntent = classified.reason === 'multi-intent'
         && classified.intents.some(isStoreIntent)
         && classified.intents.includes('marketing');
-      // 规则层已判定未成交/否定报单或明确跨类多意图时，不交模型分类器覆盖原判。
-      if (decision.target === 'clarify' && !nonClosingReason && !crossDomainMultiIntent) {
-        const classifier = modelClassifier;
+      if (decision.target === 'clarify' && !nonClosingReason && !crossDomainMultiIntent && !isModelStub(modelClassifier)) {
+        const { hint: sessionHint } = await buildSessionHint();
         modelAttempted = true;
-        const output = await runModelClassifier(input.text, classifier, child.signal, child.deadline, modelClassifyTimeoutMs, diagnostic => {
-          modelMs = diagnostic.modelMs; errorCategory = diagnostic.errorCategory;
-        });
-        if (!isModelStub(classifier)) modelCalled = true;
+        const output = await runModelClassifier(
+          input.text,
+          modelClassifier,
+          child.signal,
+          child.deadline,
+          modelClassifyTimeoutMs,
+          diagnostic => { modelMs = diagnostic.modelMs; errorCategory = diagnostic.errorCategory; },
+          sessionHint,
+        );
+        modelCalled = true;
         const chain = validateModelChain({ text: input.text, output });
         if (!chain.ok) {
           gateReason = chain.reason;
           if (errorCategory === 'none') errorCategory = chain.reason;
           if (chain.reason === 'amount') return preflightResponse(chain.ask, 'ask');
         } else {
-          modelClassification = chain.classification;
-          const label = chain.classification.intent === 'query' ? 'progress' as const
-            : chain.classification.intent === 'amend' || chain.classification.intent === 'withdraw' ? 'correction' as const
-            : chain.classification.intent === 'appointment' ? 'appointment' as const
-            : chain.classification.intent === 'report' ? 'report' as const
-            : chain.classification.intent === 'chitchat' ? 'chitchat' as const
-            : chain.classification.intent === 'marketing' ? 'marketing' as const
-            : 'progress' as const;
-          if (label === 'chitchat') decision = { target: 'chitchat', label: 'chitchat', intents: ['chitchat'] };
-          else if (label === 'marketing') {
-            if (hasSoftRoleWords(input.text) && classified.intents.some(isStoreIntent) && !classified.intents.includes('marketing')) {
-              return preflightResponse(MULTI_REPLY, 'ask');
-            }
-            if (!grantedActor && marketingEnabled) grantedActor = await marketingActor(input.memberId);
-            decision = decideRoute({ label: 'marketing', intents: ['marketing'], source: 'semantic', reason: 'semantic' }, { marketingEnabled, marketingGranted: !!grantedActor });
-          } else decision = { target: 'store', label, intents: [label === 'progress' ? 'progress' : label === 'correction' ? 'correction' : label === 'appointment' ? 'appointment' : 'report'] };
+          let modelDecision = decisionFromModelClassification(input.text, chain.classification, today, {
+            multiReply: MULTI_REPLY,
+            clarifyReply: CLARIFY_REPLY,
+          });
+          if (modelDecision.kind === 'soft_role' && hasCrossDomainStoreAndSoftRole(input.text, today)) {
+            modelDecision = { kind: 'multi_intent', source: 'guard', ask: MULTI_REPLY };
+          }
+          if (modelDecision.kind !== 'clarify' && modelDecision.kind !== 'multi_intent') {
+            gateReason = 'accepted';
+          }
+          return executeTriageDecision(modelDecision);
         }
       }
       switch (decision.target) {
         case 'store': {
-          const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline, ...(modelClassification ? { modelClassification } : {}) });
-          // R3：M01 入口没认出要办的事（通用提示、零写入）→ 再判一次越权/跨店，越权就直接「不能做」+原因。
+          triageAudit = { triageVersion: triageMode, routeLayer: 'rule_fallback', finalIntent: `store:${decision.label}` };
+          const handled = await loop({ ...input, signal: child.signal, deadline: child.deadline });
           if (handled.replies.length === 1 && handled.replies[0] === REPORT_HINT && !handled.ledgerSettled) {
             const refused = await refusalFor(input.memberId, input.text);
-            if (refused) return { reply: refused };
+            if (refused) return { reply: refused, triageAudit };
           }
-          return { reply: handled.replies.join('\n'), ...(handled.ledgerSettled ? { ledgerSettled: true } : {}), target: 'store', ...(handled.access ? { access: handled.access } : {}) };
+          return { reply: handled.replies.join('\n'), ...(handled.ledgerSettled ? { ledgerSettled: true } : {}), target: 'store', ...(handled.access ? { access: handled.access } : {}), triageAudit };
         }
-        // R3：客套话短答一句，不写账、不追问。
-        case 'chitchat': return preflightResponse(courtesyReply(input.text) ?? CHITCHAT_REPLY);
+        case 'chitchat': return executeTriageDecision({ kind: 'chitchat', source: 'rule_fallback' });
         case 'marketing-unavailable': return preflightResponse(MARKETING_UNAVAILABLE);
-        case 'marketing': {
-          // D175/D179：沿用循环身份预检，只消费过期项；有效挂起项保留。
-          const prepared = await loop(
-            { ...input, signal: child.signal, deadline: child.deadline },
-            passthroughMarketing ? { text: '', kind: 'reply', markInterleaved: true } : '',
-          );
-          if (!prepared.newMessagePrepared) return { reply: prepared.replies.join('\n'), target: 'store', ...(prepared.access ? { access: prepared.access } : {}) };
-          const finish = (reply: string) => prepared.expiredReminder ? `${reply}\n${prepared.expiredReminder}` : reply;
-          if (child.signal.aborted || performance.now() >= child.deadline) return { reply: finish(MARKETING_UNAVAILABLE) };
-          // R1（M03-05）：发出/放行前同一入口门再判；预检期间撤权/停用 → 拒绝。
-          const verifiedActor = await marketingActor(input.memberId, grantedActor!);
-          if (!verifiedActor) return { reply: finish(MARKETING_UNAVAILABLE), target: 'marketing', access: { capability: 'marketing', storeIds: [grantedActor!.storeId] } };
-          if (passthroughMarketing) {
-            const work: EntryWorkResult = {
-              reply: '',
-              target: 'marketing',
-              access: { capability: 'marketing', storeIds: [verifiedActor.storeId] },
-              pass: true,
-              actor: verifiedActor,
-              ...(prepared.expiredReminder ? { expiredReminder: prepared.expiredReminder } : {}),
-            };
-            return work;
+        case 'marketing': return executeTriageDecision({ kind: 'soft_role', source: 'rule_fallback', softRole: classifySoftRoleRule(input.text) });
+        default: {
+          const isD153StandardFormatAttempt = isStandardAmountLine(input.text)
+            || hasNonCustomerStandardLabel(input.text)
+            || /^[\u4e00-\u9fa5]{1,8}\s*[:：]\s*\d+(?:\.\d+)?(?:\s*[（(][^（）()]{1,16}[）)])?$/.test(input.text.trim());
+          if (decision.ask || isD153StandardFormatAttempt) {
+            // 格式/金额类或 D153/D171 标准行格式澄清保留原有 D182 提醒；未知或跨类多意图统一开启强确认保护。
+            triageAudit = { triageVersion: triageMode, routeLayer: 'rule_fallback', finalIntent: 'clarify:format' };
+            return preflightResponse(decision.ask ?? CLARIFY_REPLY, 'ask', false);
           }
-          modelCalled = true;
-          const text = await marketing!.handle({ memberId: input.memberId, text: input.text, signal: child.signal, deadline: child.deadline });
-          // R1（M03-05）：生成后发出前再判一次；生成期间撤权/停用 → 不发出生成结果。
-          if (!await marketingActor(input.memberId, verifiedActor)) return { reply: finish(MARKETING_UNAVAILABLE) };
-          return { reply: finish(typeof text === 'string' && text.trim() ? text.trim() : `${F}：这次没有生成内容，没有写入任何账目。`), target: 'marketing', access: { capability: 'marketing', storeIds: [verifiedActor.storeId] } };
+          if (decision.intents.length > 1) {
+            return executeTriageDecision({ kind: 'multi_intent', source: 'rule_fallback', ask: MULTI_REPLY });
+          }
+          return executeTriageDecision({
+            kind: 'clarify',
+            source: 'rule_fallback',
+            reason: 'no_signal',
+            ask: CLARIFY_REPLY,
+            markInterleaved: true,
+          });
         }
-        default: return preflightResponse(decision.ask ?? (decision.intents.length > 1 ? MULTI_REPLY : CLARIFY_REPLY), 'ask');
       }
-    }, (state): WorkResult => ({
+    }, (state): EntryWorkResult => ({
       reply: decision.target === 'store'
         ? `${F}：${state === 'cancelled' ? '请求已取消' : state === 'timeout' ? '这次没在时限内处理完' : '账本暂不可用'}，结果未知；请发「入账结果 ${requestId}」查原操作，不要另报一笔。`
         : `${F}：${state === 'timeout' ? '这次没在时限内处理完' : '这次没有处理成'}，没有写入任何账目，请稍后再发。`,
@@ -347,7 +640,7 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
     // R1（M03-04）：去重不等于授权。已完成结果被重复命中时，按当前权限复核原回复依赖的能力；不过则改回拒绝。
     if (duplicate && terminal.state === 'completed' && (terminal.target === 'store' || terminal.target === 'marketing') &&
       !await stillAllowed(input.memberId, terminal.access ?? { capability: null, storeIds: [] }).catch(() => false)) {
-      const { pass: _pass, expiredReminder: _exp, actor: _actor, ...rest } = terminal;
+      const { pass: _pass, softRole: _softRole, expiredReminder: _exp, actor: _actor, ...rest } = terminal;
       terminal = Object.freeze({ ...rest, reply: terminal.target === 'marketing' ? MARKETING_UNAVAILABLE : ACCESS_DENIED, ledgerSettled: false });
     }
     if (!duplicate) log.commit(requestId, { state: terminal.state, ...(terminal.ledgerSettled ? { ledgerSettled: true } : {}) });
@@ -355,8 +648,23 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
     log.deliver(requestId, { delivered: deliver, duplicate, state: terminal.state });
     // 投递与业务分开：投递失败不回滚已提交业务，异常照常抛给调用方；放行给外层 Agent 时不发空店务消息。
     if (deliver && !terminal.pass) options.onOutbound?.(terminal.reply);
-    try { router.onObservation?.({ requestId, route: gateReason !== 'accepted' && (modelAttempted || decision.target === 'clarify') ? '追问' : modelAttempted ? '模型' : '快通道',
-      gateReason, pendingSequence, modelMs, errorCategory }); } catch { /* No content is logged. */ }
+    const effectiveAudit = terminal.triageAudit ?? triageAudit;
+    try {
+      router.onObservation?.({
+        requestId,
+        route: gateReason !== 'accepted' && (modelAttempted || decision.target === 'clarify') ? '追问' : modelAttempted ? '模型' : '快通道',
+        gateReason,
+        pendingSequence,
+        modelMs,
+        errorCategory,
+        ...(effectiveAudit ? {
+          triageVersion: effectiveAudit.triageVersion,
+          routeLayer: effectiveAudit.routeLayer,
+          finalIntent: effectiveAudit.finalIntent,
+          ...(effectiveAudit.softRole ? { softRole: effectiveAudit.softRole } : {}),
+        } : {}),
+      });
+    } catch { /* No content is logged. */ }
     return {
       entry: 'unified',
       replies: terminal.pass ? [] : [terminal.reply],
@@ -369,9 +677,11 @@ export function createEmployeeEntry(options: WecomBotHandlerOptions & { router?:
       duplicate,
       ...(terminal.pass ? {
         pass: true as const,
+        ...(terminal.softRole ? { softRole: terminal.softRole } : {}),
         ...(terminal.expiredReminder ? { expiredReminder: terminal.expiredReminder } : {}),
         ...(terminal.actor ? { actor: terminal.actor } : {}),
       } : {}),
+      ...(effectiveAudit ? { triageAudit: effectiveAudit } : {}),
     };
   };
 }

@@ -451,7 +451,7 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     if (plainTimedOut.kind !== 'handled') throw new Error('expected handled');
     expect(plainTimedOut.replies).toEqual([CLARIFY_REPLY]);
 
-    // 先挂起一笔正常草稿，确保超时的模糊消息既不误确认也不漏成 pass，且保留原草稿提醒
+    // 先挂起一笔正常草稿，确保超时的模糊消息既不误确认也不漏成 pass，且进入 Issue #21 强确认保护（绝不劝回裸「对」）
     const staged = await fx.send('m-wang', '12号测试A店\n320（王姐）');
     expect(staged.kind).toBe('handled');
 
@@ -459,7 +459,8 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     expect(timedOut.kind).toBe('handled');
     if (timedOut.kind !== 'handled') throw new Error('expected handled');
     expect(timedOut.replies.join('\n')).toContain(CLARIFY_REPLY);
-    expect(timedOut.replies.join('\n')).toContain('还在等你回「对」确认');
+    expect(timedOut.replies.join('\n')).toContain('确认入账');
+    expect(timedOut.replies.join('\n')).not.toContain('还在等你回「对」确认');
 
     // 模糊报数金额同样走澄清，不放行
     const vagueReport = await fx.send('m-wang', '12号测试A店 几百块（王姐）');
@@ -467,8 +468,14 @@ describe('WeCom ⇄ Front Claw ⇄ OpenDot 前置三态桥接器', () => {
     if (vagueReport.kind !== 'handled') throw new Error('expected handled');
     expect(vagueReport.replies.join('\n')).toContain('没有写入');
 
-    // 原草稿依然完整保留，随后可确认入账
-    const confirmed = await fx.send('m-wang', '对');
+    // 经历超时不确定态后，裸「对」严禁入账；必须显式「确认入账」才落账
+    const bareBlocked = await fx.send('m-wang', '对');
+    expect(bareBlocked.kind).toBe('handled');
+    if (bareBlocked.kind !== 'handled') throw new Error('expected handled');
+    expect(bareBlocked.replies.join('\n')).toContain('确认入账');
+    expect(await fx.store.listEntries()).toHaveLength(0);
+
+    const confirmed = await fx.send('m-wang', '确认入账');
     expect(confirmed.kind).toBe('handled');
     expect(await fx.store.listEntries()).toHaveLength(1);
   });
@@ -1792,6 +1799,96 @@ describe('Issue #11 企微按档位授权与软岗位路由', () => {
     });
     cleanups.push(() => empFx.bridge.close());
     expect(await empFx.send('m-wang', reviewQuery)).toEqual(reviewDenied);
+  });
+
+  it('Issue #21 (路线 A): 桥接层直接消费分诊 softRole（Q28-RCP / 投流复盘不二次覆写），数据授权与审计字段独立可控', async () => {
+    const audits: Array<{
+      messageId: string;
+      storeId?: string;
+      tier?: string;
+      targetRole?: string;
+      triageVersion?: string;
+      routeLayer?: string;
+      finalIntent?: string;
+    }> = [];
+    const triageModel = vi.fn(async ({ text }: { text: string }) => {
+      if (text.includes('接待欢迎话术') || text.includes('美团团购')) {
+        return {
+          intent: 'marketing',
+          object: null,
+          action: null,
+          softRole: 'reception_ads',
+          slots: {},
+          confidence: 0.97,
+          uncertain: false,
+        };
+      }
+      if (text.includes('经营复盘')) {
+        return {
+          intent: 'marketing',
+          object: null,
+          action: null,
+          softRole: 'manager_ops',
+          slots: {},
+          confidence: 0.97,
+          uncertain: false,
+        };
+      }
+      return {
+        intent: 'unknown',
+        object: null,
+        action: null,
+        slots: {},
+        confidence: 0,
+        uncertain: true,
+      };
+    });
+
+    // 普通员工：接待欢迎话术草稿与美团团购复盘均直接按模型 softRole 进 reception_ads，无经营快照泄露；manager_ops 仍被拒
+    const empFx = await createBridgeFixture({
+      bridgeOptions: {
+        modelClassify: triageModel,
+        onPrecheckAudit: (record) => audits.push(record),
+      },
+    });
+    cleanups.push(() => empFx.bridge.close());
+
+    const rcpRes = await empFx.send(
+      'm-wang',
+      '按门店当地今天的日期和时间，写两句今天下午到店客人可用的接待欢迎话术草稿，先不要发给客户。',
+    );
+    expect(rcpRes).toMatchObject({
+      kind: 'pass',
+      targetRole: 'reception_ads',
+    });
+    expect(rcpRes).not.toHaveProperty('readonlyContext');
+
+    const adsRes = await empFx.send(
+      'm-wang',
+      '美团团购最近点击率低，帮我做一下复盘建议，不改预算',
+    );
+    expect(adsRes).toMatchObject({
+      kind: 'pass',
+      targetRole: 'reception_ads',
+    });
+    expect(adsRes).not.toHaveProperty('readonlyContext');
+
+    // 普通员工发店长经营复盘：模型给 manager_ops，M03 权限门禁严格拒绝，零账本读取
+    expect(await empFx.send('m-wang', '帮我做门店经营复盘')).toEqual(
+      reviewDenied,
+    );
+
+    // 审计回调透出 triageVersion / routeLayer / finalIntent 且不改 precheck 返回契约
+    expect(
+      audits.some(
+        (a) =>
+          a.tier === 'employee' &&
+          a.targetRole === 'reception_ads' &&
+          a.triageVersion === 'v2' &&
+          a.routeLayer === 'model' &&
+          a.finalIntent === 'soft_role',
+      ),
+    ).toBe(true);
   });
 
   it('把软岗位传给两个解析器，且仅培训传入培训只读块', async () => {
